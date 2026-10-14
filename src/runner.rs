@@ -516,6 +516,22 @@ fn prepare_monitor(
     }
 }
 
+fn start_monitor(
+    monitor: &mut Option<TargetMonitor>,
+    unavailable: &mut Option<String>,
+    start_at: &str,
+    cancelled: &AtomicBool,
+) {
+    let error = monitor
+        .as_mut()
+        .and_then(|observer| observer.start(start_at, cancelled).err());
+    if let Some(error) = error {
+        eprintln!("Target telemetry unavailable: {error}");
+        *unavailable = Some(error.to_string());
+        *monitor = None;
+    }
+}
+
 fn network_hosts(generators: &Value, target: &Value) -> Value {
     let mut hosts = BTreeMap::<String, Value>::new();
     let reports = generators
@@ -1168,9 +1184,12 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                 (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
                 // All SSH sessions are ready before any generator starts.
                 let start_at = (Utc::now().timestamp_millis() + 5000).to_string();
-                if let Some(observer) = monitor.as_mut() {
-                    observer.start(&start_at, &cancelled)?;
-                }
+                start_monitor(
+                    &mut monitor,
+                    &mut target_unavailable,
+                    &start_at,
+                    &cancelled,
+                );
                 let publications = thread::scope(|scope| {
                     let mut handles = Vec::new();
                     for (ip, dir) in &controls {
@@ -1218,9 +1237,12 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         let log = File::create(dir.join("output.log"))?;
         (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
         let start_at = (Utc::now().timestamp_millis() + 1000).to_string();
-        if let Some(observer) = monitor.as_mut() {
-            observer.start(&start_at, &cancelled)?;
-        }
+        start_monitor(
+            &mut monitor,
+            &mut target_unavailable,
+            &start_at,
+            &cancelled,
+        );
         let status = execute(
             Command::new(&binary)
                 .args(options)
