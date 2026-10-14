@@ -1,5 +1,5 @@
 use super::{
-    ENDPOINTS, Samples, config, connections, destinations, errors::ErrorDetails, load_tokens,
+    Samples, config, connections, destinations, errors::ErrorDetails, load_tokens,
     parse_source_ips, passes,
 };
 use chrono::{DateTime, Utc};
@@ -24,6 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use twelve_dollar_benchmark::{ENDPOINTS, control};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -170,30 +171,8 @@ fn wait_child(
     }
 }
 
-pub(super) fn wait_start(control: &Path) -> Result<i64> {
-    fs::write(control.with_extension("ready"), "ready\n")?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !control.with_extension("start").exists() {
-        if control.exists() || Instant::now() >= deadline {
-            fs::write(control.with_extension("done"), "not started\n")?;
-            return Err("coordinated start cancelled or timed out".into());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let start_at: i64 = fs::read_to_string(control.with_extension("start"))?
-        .trim()
-        .parse()?;
-    if Utc::now().timestamp_millis() - start_at > 250 {
-        fs::write(control.with_extension("done"), "missed start\n")?;
-        return Err(
-            "missed coordinated start; check SSH delay and host clock synchronization".into(),
-        );
-    }
-    Ok(start_at)
-}
-
 pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
-    let start_at = wait_start(control)?;
+    let start_at = control::wait_start(control)?;
     let mut child = Command::new(env::current_exe()?)
         .args(args)
         .env("BENCH_START_AT", start_at.to_string())
@@ -216,43 +195,6 @@ pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
     };
     fs::write(control.with_extension("done"), format!("{status}\n"))?;
     Ok(status.code().unwrap_or(2) as u8)
-}
-
-pub(super) fn ready_supervised(control: &Path) -> Result<u8> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !control.with_extension("ready").exists() {
-        if Instant::now() >= deadline {
-            return Err("remote generator did not become ready".into());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(0)
-}
-
-pub(super) fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
-    let _: i64 = timestamp.parse()?;
-    let temporary = control.with_extension("start.tmp");
-    fs::write(&temporary, timestamp)?;
-    refresh_observer(control)?;
-    fs::rename(temporary, control.with_extension("start"))?;
-    Ok(0)
-}
-
-pub(super) fn refresh_observer(control: &Path) -> Result<u8> {
-    fs::write(control.with_extension("lease"), "alive\n")?;
-    Ok(0)
-}
-
-pub(super) fn stop_supervised(control: &Path) -> Result<u8> {
-    fs::write(control, "cancel\n")?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !control.with_extension("done").exists() {
-        if Instant::now() >= deadline {
-            return Err("remote supervisor did not confirm shutdown".into());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(0)
 }
 
 // A target observer uses the same start barrier as the generators, then stops
@@ -337,23 +279,26 @@ impl TargetMonitor {
                 cancelled,
             )?;
             checked(
-                scp().arg("--").arg(binary).arg(destination(
-                    user,
-                    host,
-                    &format!("{remote_dir}/twelve-dollar-benchmark"),
-                )),
+                scp()
+                    .arg("--")
+                    .arg(binary.with_file_name("twelve-dollar-observer"))
+                    .arg(destination(
+                        user,
+                        host,
+                        &format!("{remote_dir}/twelve-dollar-observer"),
+                    )),
                 cancelled,
             )?;
             checked(
                 ssh(user, host).arg(format!(
                     "{} --version",
-                    quote(&format!("{remote_dir}/twelve-dollar-benchmark"))
+                    quote(&format!("{remote_dir}/twelve-dollar-observer"))
                 )),
                 cancelled,
             )?;
             let mut command = ssh(user, host);
             command.arg(format!(
-                "cd {} || exit 2; trap '' HUP; exec env {} ./twelve-dollar-benchmark --observe metrics",
+                "cd {} || exit 2; trap '' HUP; exec env {} ./twelve-dollar-observer --observe metrics",
                 quote(remote_dir),
                 assignments
                     .iter()
@@ -363,7 +308,7 @@ impl TargetMonitor {
             ));
             command
         } else {
-            let mut command = Command::new(binary);
+            let mut command = Command::new(binary.with_file_name("twelve-dollar-observer"));
             command.current_dir(&dir).arg("--observe").arg(&control);
             for assignment in &assignments {
                 let (key, value) = assignment.split_once('=').unwrap();
@@ -379,7 +324,7 @@ impl TargetMonitor {
             .spawn()?;
         Ok(Self {
             child: Some(child),
-            binary: binary.into(),
+            binary: binary.with_file_name("twelve-dollar-observer"),
             dir,
             control,
             remote,
@@ -393,7 +338,7 @@ impl TargetMonitor {
             let mut cmd = ssh(user, host);
             cmd.arg(format!(
                 "{} {} {} {}",
-                quote(&format!("{remote_dir}/twelve-dollar-benchmark")),
+                quote(&format!("{remote_dir}/twelve-dollar-observer")),
                 action,
                 quote(&format!("{remote_dir}/metrics")),
                 timestamp.map(quote).unwrap_or_default()
@@ -437,7 +382,7 @@ impl TargetMonitor {
                     let mut command = ssh(user, host);
                     command.arg(format!(
                         "{} --refresh-observer {}",
-                        quote(&format!("{dir}/twelve-dollar-benchmark")),
+                        quote(&format!("{dir}/twelve-dollar-observer")),
                         quote(&format!("{dir}/metrics"))
                     ));
                     command

@@ -11,8 +11,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
-pub(super) type Roles = BTreeMap<String, Vec<u32>>;
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub type Roles = BTreeMap<String, Vec<u32>>;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Interface {
@@ -48,6 +48,8 @@ struct Point {
     tcp: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     interval_rates: Value,
+    #[serde(default)]
+    service: Value,
     errors: Vec<String>,
 }
 
@@ -322,6 +324,126 @@ fn process(
     })
 }
 
+fn service_resources(roles: &Roles) -> Value {
+    let read = || -> Result<Value> {
+        let mut paths = BTreeSet::new();
+        for role in ["application", "proxy"] {
+            for pid in roles.get(role).into_iter().flatten() {
+                let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+                let group = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::"))
+                    .ok_or("cgroup v2 membership unavailable")?;
+                paths.insert(Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')));
+            }
+        }
+        let mut groups = BTreeMap::new();
+        for path in &paths {
+            if paths
+                .iter()
+                .any(|parent| parent != path && path.starts_with(parent))
+            {
+                continue;
+            }
+            let memory: u64 = fs::read_to_string(path.join("memory.current"))?
+                .trim()
+                .parse()?;
+            let cpu: u64 = fs::read_to_string(path.join("cpu.stat"))?
+                .lines()
+                .find_map(|line| line.strip_prefix("usage_usec ").map(str::to_owned))
+                .ok_or("cgroup CPU usage unavailable")?
+                .parse()?;
+            groups.insert(
+                path.to_string_lossy().into_owned(),
+                json!({"memory_current_bytes": memory, "cpu_usage_us": cpu}),
+            );
+        }
+        Ok(json!({"groups": groups}))
+    };
+    read().unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}))
+}
+
+/// Summarize counters between samples wholly inside the full-load hold.
+pub fn summarize_hold(
+    path: &Path,
+    start: chrono::DateTime<Utc>,
+    finish: chrono::DateTime<Utc>,
+) -> Result<Value> {
+    let mut first: Option<Point> = None;
+    let mut last: Option<Point> = None;
+    let mut peak_memory = None;
+    for line in BufReader::new(File::open(path)?).lines() {
+        let point: Point = serde_json::from_str(&line?)?;
+        let at = chrono::DateTime::parse_from_rfc3339(&point.timestamp)?;
+        if at < start || at > finish {
+            continue;
+        }
+        if let Some(groups) = point
+            .service
+            .get("groups")
+            .and_then(Value::as_object)
+            .filter(|groups| !groups.is_empty())
+        {
+            let memory: Option<u64> = groups
+                .values()
+                .map(|group| group.get("memory_current_bytes").and_then(Value::as_u64))
+                .sum();
+            peak_memory = peak_memory.max(memory);
+        }
+        if first.is_none() {
+            first = Some(point.clone());
+        }
+        last = Some(point);
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        return Err("no telemetry samples inside full-load hold".into());
+    };
+    let seconds = (chrono::DateTime::parse_from_rfc3339(&last.timestamp)?
+        - chrono::DateTime::parse_from_rfc3339(&first.timestamp)?)
+    .num_microseconds()
+    .filter(|n| *n > 0)
+    .ok_or("not enough telemetry samples inside hold")? as f64
+        / 1_000_000.0;
+    let count = |point: &Point| -> Option<u64> {
+        point
+            .activity
+            .get("requests")?
+            .as_array()?
+            .iter()
+            .map(|row| row.get(0)?.as_u64())
+            .sum()
+    };
+    let requests = count(&last)
+        .zip(count(&first))
+        .and_then(|(end, begin)| end.checked_sub(begin));
+    let cpu = first
+        .service
+        .get("groups")
+        .and_then(Value::as_object)
+        .zip(last.service.get("groups").and_then(Value::as_object))
+        .filter(|(begin, end)| !begin.is_empty() && begin.keys().eq(end.keys()))
+        .and_then(|(begin, end)| {
+            begin
+                .iter()
+                .map(|(path, value)| {
+                    end.get(path)?
+                        .get("cpu_usage_us")?
+                        .as_u64()?
+                        .checked_sub(value.get("cpu_usage_us")?.as_u64()?)
+                })
+                .sum::<Option<u64>>()
+        });
+    Ok(json!({
+        "sample_started_at": first.timestamp,
+        "sample_finished_at": last.timestamp,
+        "sample_duration_s": seconds,
+        "requests_per_second": requests.map(|n| n as f64 / seconds),
+        "service_cpu_percent": cpu.map(|n| n as f64 / (seconds * 10_000.0)),
+        "sampled_peak_memory_bytes": peak_memory,
+        "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache"
+    }))
+}
+
 fn limits() -> Value {
     let paths = [
         (
@@ -502,7 +624,7 @@ fn discover_roles(ports: &[u16]) -> Result<Roles> {
     ]))
 }
 
-pub(super) struct Sampler {
+pub struct Sampler {
     stop: mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<std::result::Result<(), String>>>,
     path: PathBuf,
@@ -578,6 +700,7 @@ impl Sampler {
                     processes,
                     limits: limits(),
                     activity: activity(),
+                    service: service_resources(&roles),
                     tcp,
                     interval_rates: Value::Null,
                     errors,
@@ -803,7 +926,7 @@ fn add_errors(destination: &mut BTreeSet<String>, errors: impl IntoIterator<Item
     }
 }
 
-pub(super) fn summarize(path: &Path) -> Result<Value> {
+pub(crate) fn summarize(path: &Path) -> Result<Value> {
     // Keep only endpoint counters and peaks; a long trace must not become a second in-memory copy.
     let mut first: Option<Point> = None;
     let mut last: Option<Point> = None;
@@ -882,7 +1005,7 @@ pub(super) fn summarize(path: &Path) -> Result<Value> {
     )
 }
 
-pub(super) fn observe(
+pub fn observe(
     control: &Path,
     application_pids: Vec<u32>,
     proxy_pids: Vec<u32>,
@@ -912,7 +1035,7 @@ pub(super) fn observe(
         }
         let lease_duration = Duration::try_from_secs_f64(lease_seconds)?;
         let observer_started = Instant::now();
-        let start_at = crate::runner::wait_start(control)?;
+        let start_at = crate::control::wait_start(control)?;
         while Utc::now().timestamp_millis() < start_at {
             if control.exists() {
                 return Err("target observation cancelled before start".into());
@@ -1056,6 +1179,7 @@ mod tests {
                 ("CurrEstab".into(), 2),
             ])),
             interval_rates: Value::Null,
+            service: Value::Null,
             errors: vec![],
         }
     }

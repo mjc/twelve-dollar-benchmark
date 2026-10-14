@@ -6,7 +6,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub fn wait_start(control: &Path) -> Result<i64> {
     fs::write(control.with_extension("ready"), "ready\n")?;
@@ -21,7 +21,11 @@ pub fn wait_start(control: &Path) -> Result<i64> {
     let start_at: i64 = fs::read_to_string(control.with_extension("start"))?
         .trim()
         .parse()?;
-    if Utc::now().timestamp_millis() - start_at > 250 {
+    if Utc::now()
+        .timestamp_millis()
+        .checked_sub(start_at)
+        .is_none_or(|elapsed| elapsed > 250)
+    {
         fs::write(control.with_extension("done"), "missed start\n")?;
         return Err(
             "missed coordinated start; check SSH delay and host clock synchronization".into(),
@@ -51,9 +55,6 @@ pub fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
 }
 
 pub fn refresh_observer(control: &Path) -> Result<u8> {
-    if control.exists() || control.with_extension("done").exists() {
-        return Err("cannot refresh an observer that has already stopped".into());
-    }
     fs::write(control.with_extension("lease"), "alive\n")?;
     Ok(0)
 }

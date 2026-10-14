@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
+use twelve_dollar_benchmark::{control, setting, telemetry};
 
 mod config;
 mod connections;
@@ -22,7 +23,6 @@ mod destinations;
 mod errors;
 mod runner;
 mod scoring;
-mod telemetry;
 
 const ENDPOINTS: [&str; 4] = [
     Endpoint::Feed.name(),
@@ -487,12 +487,6 @@ async fn wait_ramp_slot(deadline: Instant) {
     }
 }
 
-fn setting(name: &str, fallback: &str) -> String {
-    env::var(name)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| fallback.to_owned())
-}
 fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Error>> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -872,14 +866,14 @@ fn main() -> ExitCode {
     }) {
         let result = if let Some(p) = args.get(1) {
             match args[0].as_str() {
-                "--refresh-observer" => runner::refresh_observer(Path::new(p)),
+                "--refresh-observer" => control::refresh_observer(Path::new(p)),
                 "--observe" => observe_target(Path::new(p)),
                 "--supervise" => runner::supervise(Path::new(p), &args[2..]),
-                "--stop-supervised" => runner::stop_supervised(Path::new(p)),
-                "--ready-supervised" => runner::ready_supervised(Path::new(p)),
+                "--stop-supervised" => control::stop_supervised(Path::new(p)),
+                "--ready-supervised" => control::ready_supervised(Path::new(p)),
                 _ => args.get(2).map_or_else(
                     || Err("missing coordinated start timestamp".into()),
-                    |t| runner::start_supervised(Path::new(p), t),
+                    |t| control::start_supervised(Path::new(p), t),
                 ),
             }
         } else {

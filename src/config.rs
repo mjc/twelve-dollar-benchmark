@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     env,
     error::Error,
     net::IpAddr,
@@ -75,44 +74,7 @@ pub(super) fn pids(value: &str) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-pub(super) fn parse_destination_ports(value: &str) -> Result<Vec<u16>> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(value);
-    if value.is_empty() {
-        return Err("destination ports must not be empty".into());
-    }
-
-    let mut ports = Vec::new();
-    let mut seen = BTreeSet::new();
-    for item in value.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            return Err("destination ports must not contain empty entries".into());
-        }
-        let (start, end) = match item.split_once('-') {
-            Some((start, end)) => (start.trim().parse::<u16>()?, end.trim().parse::<u16>()?),
-            None => {
-                let port = item.parse::<u16>()?;
-                (port, port)
-            }
-        };
-        if start == 0 || end == 0 {
-            return Err("destination ports must be positive".into());
-        }
-        if start > end {
-            return Err("destination port ranges must be ascending".into());
-        }
-        for port in start..=end {
-            if seen.insert(port) {
-                ports.push(port);
-            }
-        }
-    }
-    Ok(ports)
-}
+pub(super) use twelve_dollar_benchmark::parse_destination_ports;
 
 fn interval(value: &str) -> Result<Duration> {
     let seconds: f64 = value.trim_end_matches('s').parse()?;

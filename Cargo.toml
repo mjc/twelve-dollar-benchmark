@@ -3,6 +3,11 @@ name = "twelve-dollar-benchmark"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "twelve-dollar-benchmark"
+
+[[bin]]
+name = "twelve-dollar-observer"
+path = "src/observer.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
