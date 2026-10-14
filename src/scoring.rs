@@ -71,11 +71,14 @@ struct Workflow {
     error: Option<String>,
 }
 
-fn find_score(mut trial: impl FnMut(Stage, usize) -> Result<bool>) -> Result<usize> {
+fn find_score(
+    start_users: usize,
+    mut trial: impl FnMut(Stage, usize) -> Result<bool>,
+) -> Result<usize> {
     // Warm-up thresholds do not contribute to the score.
     trial(Stage::Warmup, 1000)?;
     let mut low = 0;
-    let mut high = 2500;
+    let mut high = start_users;
     while trial(Stage::Search, high)? {
         low = high;
         high = high
@@ -154,7 +157,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         started_at: Utc::now(),
         finished_at: None,
         current: None,
-        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": 2500,
+        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users,
             "search_hold_s": 300, "confirmation_hold_s": 300, "resolution_users": 250,
             "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
         trials: Vec::new(),
@@ -163,7 +166,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     save_state(&root, &state)?;
     let mut confirmed = None;
     let mut last = None;
-    let score = find_score(|stage, users| {
+    let score = find_score(cfg.start_users, |stage, users| {
         if cancelled.load(Ordering::Relaxed) {
             return Err("scoring interrupted".into());
         }
@@ -331,7 +334,7 @@ mod tests {
     #[test]
     fn search_excludes_warmup_narrows_and_steps_down_on_confirmation_failure() {
         let mut calls = Vec::new();
-        let score = find_score(|stage, users| {
+        let score = find_score(2500, |stage, users| {
             calls.push((stage, users));
             Ok(match stage {
                 Stage::Warmup => false,
@@ -355,9 +358,9 @@ mod tests {
 
     #[test]
     fn failures_at_the_smallest_candidate_produce_zero_without_false_confirmation() {
-        let score = find_score(|stage, _| Ok(stage == Stage::Warmup)).unwrap();
+        let score = find_score(2500, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
         assert_eq!(score, 0);
-        assert!(find_score(|_, _| Err("control failure".into())).is_err());
+        assert!(find_score(2500, |_, _| Err("control failure".into())).is_err());
     }
 
     #[test]

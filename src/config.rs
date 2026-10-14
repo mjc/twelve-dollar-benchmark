@@ -7,6 +7,7 @@ pub(super) struct Config {
     pub label: Option<String>,
     pub destination_ports: Vec<u16>,
     pub users: usize,
+    pub start_users: usize,
     pub ramp_up: String,
     pub duration: String,
     pub tokens: PathBuf,
@@ -30,6 +31,7 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --monitor-user USER    Monitor the target over SSH while generating locally
   --users N             Fixed-load run at N users; disables automatic scoring
   --score               Warm up, find the limit and confirm a five-minute score
+  --start-users N       First search load (2500); positive multiple of 250
   --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
   --duration TIME       Hold at total users (5m); ramp-down remains 30s
@@ -51,7 +53,7 @@ workload overrides are rejected so they cannot change the target or total load.
 Pass short diagnostic flags separately (for example, -v -v rather than -vv).
 
 Without --users or VUS, run the scoring workflow: 1,000-user two-minute
-unscored warm-up; five-minute searches from 2,500, doubling then narrowing to
+unscored warm-up; five-minute searches from --start-users (2,500), doubling then narrowing to
 250 users; a separate five-minute confirmation, stepping down 250 on failure.
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
@@ -115,6 +117,7 @@ fn parse_with(
         label: None,
         destination_ports: vec![default_port],
         users: 100,
+        start_users: 2500,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
@@ -161,6 +164,7 @@ fn parse_with(
             "--output-dir",
             "--source-ips",
             "--destination-ports",
+            "--start-users",
             "--users",
             "--ramp-up",
             "--duration",
@@ -197,6 +201,12 @@ fn parse_with(
             "--source-ips" => config.source_ips = value,
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
+            }
+            "--start-users" => {
+                config.start_users = value.parse()?;
+                if config.start_users == 0 || !config.start_users.is_multiple_of(250) {
+                    return Err("--start-users must be a positive multiple of 250".into());
+                }
             }
             "--users" => {
                 users = value;

@@ -26,14 +26,15 @@ directory. Relative token, summary, and output paths resolve from the calling
 directory.
 
 Without `--users` or `VUS`, the runner finds a score. It warms up at 1,000 users
-for two minutes without scoring, starts at 2,500 users and doubles until a run
+for two minutes without scoring, starts at `--start-users` (2,500 by default) and doubles until a run
 fails, then narrows the passing/failing bracket to 250 users. Search runs use
 the workload's five-minute hold. A separate five-minute run confirms the result;
 if it fails, the runner steps down by 250 users and tries again. Each run also
 includes the configured ramp-up, 30-second ramp-down, and drain. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.
 
-Use `--score` to select scoring explicitly, or `--users N` for a fixed-load run.
+Use `--score --start-users 100000` to start the search at 100,000 users.
+The warm-up stays at 1,000 users. Use `--users N` for a fixed-load run.
 `--duration` controls fixed-load holds. A fixed-load result is not presented as
 a confirmed score.
 
@@ -45,6 +46,7 @@ a confirmed score.
 | `--monitor-user USER` | `--user` or unset | SSH to the target for monitoring while generators run locally |
 | `--users N` | unset (scoring workflow) | Fixed total concurrent users across all generators |
 | `--score` | enabled when neither `--users` nor `VUS` is set | Find and confirm a score |
+| `--start-users N` | `2500` | First search load; positive multiple of 250 |
 | `--label NAME` | target URL | Implementation name in the final table |
 | `--ramp-up TIME` | `60s` | Ramp to total users |
 | `--duration TIME` | `5m` | Hold at total users |
