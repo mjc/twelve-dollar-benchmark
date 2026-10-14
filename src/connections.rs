@@ -37,19 +37,22 @@ impl Connections {
             *total = total.saturating_add(count);
         }
     }
-    #[allow(clippy::cast_precision_loss)] // Rates and latency summaries are report statistics.
     pub fn report(&mut self, seconds: Option<f64>) -> Value {
         let mut all = self.successful_ms.clone();
         all.extend_from_slice(&self.failed_ms);
         let total = all.len();
-        let rate = |n: usize| seconds.filter(|s| *s > 0.0).map(|s| n as f64 / s);
         json!({
             "scope": "client connection setup including DNS and TCP; pooled requests do not start a new attempt; an attempt may try multiple DNS addresses and source ports",
             "attempts": total, "established": self.successful_ms.len(), "failed": self.failed_ms.len(), "cancelled": self.cancelled,
-            "attempts_per_second": rate(total), "connections_per_second": rate(self.successful_ms.len()), "failed_per_second": rate(self.failed_ms.len()),
+            "attempts_per_second": rate(total, seconds), "connections_per_second": rate(self.successful_ms.len(), seconds), "failed_per_second": rate(self.failed_ms.len(), seconds),
             "setup_duration_ms": distribution(&mut all), "successful_setup_duration_ms": distribution(&mut self.successful_ms), "failed_setup_duration_ms": distribution(&mut self.failed_ms), "errors": self.errors,
         })
     }
+}
+
+#[allow(clippy::cast_precision_loss)] // Rates are floating point report statistics.
+fn rate(count: usize, seconds: Option<f64>) -> Option<f64> {
+    seconds.filter(|s| *s > 0.0).map(|s| count as f64 / s)
 }
 
 #[allow(clippy::cast_precision_loss)] // Averages are represented as floating point milliseconds.
@@ -59,11 +62,9 @@ fn distribution(samples: &mut [f64]) -> Value {
         "med_ms": percentile(samples, 0.5), "p95_ms": percentile(samples, 0.95), "p99_ms": percentile(samples, 0.99), "max_ms": samples.last()})
 }
 
-#[allow(clippy::cast_precision_loss)] // Request rates are floating point report statistics.
 pub(super) fn request_rates(samples: &Samples, seconds: Option<f64>) -> Value {
     let n = samples.latency_ms.len();
-    let rate = |count: usize| seconds.filter(|s| *s > 0.0).map(|s| count as f64 / s);
-    json!({"requests_per_second": rate(n), "successful_requests_per_second": rate(n.saturating_sub(samples.failed)), "failed_requests_per_second": rate(samples.failed)})
+    json!({"requests_per_second": rate(n, seconds), "successful_requests_per_second": rate(n.saturating_sub(samples.failed), seconds), "failed_requests_per_second": rate(samples.failed, seconds)})
 }
 
 #[derive(Clone)]

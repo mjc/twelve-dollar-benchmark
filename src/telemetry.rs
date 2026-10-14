@@ -446,7 +446,7 @@ pub fn summarize_hold(
         "sample_started_at": first.timestamp,
         "sample_finished_at": last.timestamp,
         "sample_duration_s": seconds,
-        "requests_per_second": requests.map(|n| n as f64 / seconds),
+        "requests_per_second": rate(requests, seconds, 1.0),
         "service_cpu_percent": cpu.map(|n| n as f64 / (seconds * 10_000.0)),
         "sampled_peak_memory_bytes": peak_memory,
         "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache"
@@ -816,8 +816,12 @@ fn rate(delta: Option<u64>, seconds: f64, scale: f64) -> Option<f64> {
     }
 }
 
+fn interval_seconds(begin: &Point, end: &Point) -> f64 {
+    end.elapsed_s - begin.elapsed_s
+}
+
 fn network_report(begin: &Point, end: &Point) -> Value {
-    let seconds = end.elapsed_s - begin.elapsed_s;
+    let seconds = interval_seconds(begin, end);
     let (Some(first), Some(last)) = (&begin.interfaces, &end.interfaces) else {
         return json!({"interfaces": null, "unavailable_reason": "network interface counters unavailable"});
     };
@@ -848,7 +852,7 @@ fn tcp_report(begin: &Point, end: &Point) -> Value {
     let (Some(first), Some(last)) = (&begin.tcp, &end.tcp) else {
         return json!({"unavailable_reason": "TCP namespace counters unavailable"});
     };
-    let seconds = end.elapsed_s - begin.elapsed_s;
+    let seconds = interval_seconds(begin, end);
     let mut report = BTreeMap::new();
     for (name, value) in last {
         if name == "CurrEstab" {
@@ -862,7 +866,7 @@ fn tcp_report(begin: &Point, end: &Point) -> Value {
 }
 
 fn activity_report(begin: &Point, end: &Point) -> Value {
-    let seconds = end.elapsed_s - begin.elapsed_s;
+    let seconds = interval_seconds(begin, end);
     let (Some(first), Some(last)) = (
         begin.activity.get("requests").and_then(Value::as_array),
         end.activity.get("requests").and_then(Value::as_array),
@@ -912,7 +916,7 @@ fn activity_report(begin: &Point, end: &Point) -> Value {
 }
 
 fn interval_report(begin: &Point, end: &Point) -> Value {
-    let seconds = end.elapsed_s - begin.elapsed_s;
+    let seconds = interval_seconds(begin, end);
     let mut cpu = BTreeMap::new();
     for (role, processes) in &end.processes {
         let reports: Vec<_> = processes.iter().map(|process| {
