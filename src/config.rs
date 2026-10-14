@@ -10,8 +10,11 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(super) struct Config {
     pub base_url: String,
+    pub label: Option<String>,
     pub destination_ports: Vec<u16>,
     pub users: usize,
+    pub start_users: usize,
+    pub max_users: usize,
     pub ramp_up: String,
     pub duration: String,
     pub tokens: PathBuf,
@@ -34,6 +37,9 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options]
   --monitor-user USER    Monitor the target over SSH while generating locally
   --users N             Fixed-load run at N users; disables automatic scoring
   --score               Warm up, find the limit and confirm a five-minute score
+  --start-users N       First search load (2500); positive multiple of 250
+  --max-users N         Search ceiling (300000); positive multiple of 250
+  --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
   --duration TIME       Hold at total users (5m); ramp-down remains 30s
   --tokens PATH         Token file; explicit paths resolve from your directory
@@ -52,7 +58,7 @@ Legacy BASE_URL, DESTINATION_PORTS, VUS, RAMP_UP, DURATION, TOKENS and SOURCE_IP
 Explicit arguments win. Unsupported options are rejected.
 
 Without --users or VUS, run the scoring workflow: 1,000-user two-minute
-unscored warm-up; five-minute searches from 2,500, doubling then narrowing to
+unscored warm-up; five-minute searches from --start-users (2,500), doubling then narrowing to
 250 users; a separate five-minute confirmation, stepping down 250 on failure.
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
@@ -170,8 +176,11 @@ fn parse_with(
     let mut explicit_destination_ports = None;
     let mut config = Config {
         base_url,
+        label: None,
         destination_ports: vec![default_port],
         users: 100,
+        start_users: 2500,
+        max_users: 300000,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
@@ -207,11 +216,14 @@ fn parse_with(
             continue;
         }
         let takes_value = [
+            "--label",
             "--user",
             "--monitor-user",
             "--output-dir",
             "--source-ips",
             "--destination-ports",
+            "--max-users",
+            "--start-users",
             "--users",
             "--ramp-up",
             "--duration",
@@ -232,6 +244,7 @@ fn parse_with(
             return Err(format!("{flag} requires a non-empty value").into());
         }
         match flag {
+            "--label" => config.label = Some(value),
             "--user" => config.user = Some(value),
             "--monitor-user" => config.monitor_user = Some(value),
             "--output-dir" => config.output = Some(caller.join(value)),
@@ -239,6 +252,19 @@ fn parse_with(
             "--source-ips" => config.source_ips = value,
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
+            }
+            "--start-users" | "--max-users" => {
+                let users: usize = value
+                    .parse()
+                    .map_err(|_| format!("{flag} must be a positive multiple of 250"))?;
+                if users == 0 || !users.is_multiple_of(250) {
+                    return Err(format!("{flag} must be a positive multiple of 250").into());
+                }
+                if flag == "--start-users" {
+                    config.start_users = users;
+                } else {
+                    config.max_users = users;
+                }
             }
             "--users" => {
                 users = value;
@@ -302,6 +328,9 @@ fn parse_with(
             .map_err(|_| "--users must be a positive integer")?;
         if config.users == 0 {
             return Err("--users must be positive".into());
+        }
+        if config.score && config.start_users > config.max_users {
+            return Err("--start-users must not exceed --max-users".into());
         }
         duration(&config.ramp_up)
             .map_err(|error| format!("invalid --ramp-up duration: {error}"))?;

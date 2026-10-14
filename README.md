@@ -15,6 +15,10 @@ The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with Rust
 that toolchain is missing, it installs rustup and Rust 1.99.0. The generator
 sends HTTP/1.1 traffic. It does not include HTTPS or TLS support.
 
+The build also produces `twelve-dollar-observer`. For remote target monitoring,
+the runner copies only this observer binary to the target host; generators
+continue running on their selected hosts.
+
 The token file must already exist. By default, the runner reads
 `seed/tokens.json` from the directory where you invoke it. Use `--tokens` or
 `TOKENS` to select another file. You can invoke `run.sh` by path from any
@@ -22,12 +26,17 @@ directory. Relative token, summary, and output paths resolve from the calling
 directory.
 
 Without `--users` or `VUS`, the runner finds a score. It warms up at 1,000 users
-for two minutes without scoring, starts at 2,500 users and doubles until a run
-fails, then narrows the passing/failing bracket to 250 users. Search runs use
-the workload's five-minute hold. A separate five-minute run confirms the result;
-if it fails, the runner steps down by 250 users and tries again. Each run also
+for two minutes without scoring, starts at `--start-users` (2,500 by default)
+and doubles until a run fails or reaches `--max-users` (300,000 by default),
+then narrows the passing/failing bracket to 250 users. Search runs use the
+workload's five-minute hold. A separate five-minute run confirms the result; if
+it fails, the runner steps down by 250 users and tries again. Each run also
 includes the configured ramp-up, 30-second ramp-down, and drain. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.
+
+If the search ceiling passes confirmation, the result is a lower bound: the
+server limit was not found. Increase `--max-users` when generator capacity
+allows.
 
 Use `--score` to select scoring explicitly, or `--users N` for a fixed-load run.
 `--duration` controls fixed-load holds. A fixed-load result is not presented as
@@ -41,6 +50,9 @@ a confirmed score.
 | `--monitor-user USER` | `--user` or unset | SSH to the target for monitoring while generators run locally |
 | `--users N` | unset (scoring workflow) | Fixed total concurrent users across all generators |
 | `--score` | enabled when neither `--users` nor `VUS` is set | Find and confirm a score |
+| `--start-users N` | `2500` | First search load; positive multiple of 250 |
+| `--max-users N` | `300000` | Search ceiling; positive multiple of 250 |
+| `--label NAME` | target URL | Implementation name in the final score table |
 | `--ramp-up TIME` | `60s` | Ramp to total users |
 | `--duration TIME` | `5m` | Hold at total users |
 | `--tokens PATH` | `seed/tokens.json` | User tokens |
@@ -114,19 +126,25 @@ samples, connection samples, and telemetry.
 
 ## Results
 
-The coordinator prints compact Markdown tables when the run finishes. The first
-table shows the challenge score: requested and reached VUs, p95, p99, HTTP error
-percentage and PASS/FAIL. The following tables show request rates, connection
-rates and setup times, bandwidth, packets per second, and process resources.
-Scoring runs put the confirmed score first and retain the search history in
+The runner prints Markdown tables when a run finishes. Scoring output starts
+with the maximum-users comparison row: implementation label, confirmed users,
+request rate during the confirmed hold, p50/p95/p99, HTTP errors, service CPU,
+sampled peak cgroup memory, and the failing threshold. Rank and PR are blank.
+The row is saved as `leaderboard.md` in the scoring results directory. A score
+at the search ceiling is prefixed with `≥`. Fixed-load output starts with
+requested and reached users, p95/p99, HTTP errors, and PASS/FAIL. Both modes
+then show request rates, connection rates and setup times, bandwidth, packets
+per second, and process resources. Scoring runs retain the search history in
 `workflow.json`, with each trial under `trials/`. Setup failures and interrupted
 runs stop the search instead of counting as an application limit.
 
 Each results directory contains `aggregate.json` and a Markdown `report.md`.
 The report includes overall and per-endpoint request rates, successful and
 failed connection setup distributions, requested and reached user counts,
-required and observed full-load hold times, source-port capacity, and sampled
-kernel and conntrack counters and peaks. A `local/` or per-host directory
+required and observed common full-load hold times, source-port capacity, and
+sampled kernel and conntrack counters and peaks. Hold request rate, service CPU,
+and sampled peak cgroup memory cover samples taken inside the common full-load
+window. A `local/` or per-host directory
 contains `summary.json`, exact HTTP `samples.json`, `connection-samples.json`,
 `telemetry.jsonl`, and `output.log`. Target observations are stored in
 `target/`.

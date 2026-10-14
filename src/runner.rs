@@ -607,7 +607,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
                 finished = Some(finished.map_or(report.finished_at, |s| s.max(report.finished_at)));
                 hosts.extend(report.hosts);
                 source_ips.extend(report.source_ips);
-                if worker.remote_dir.is_some() && report.planned_hold_s > 0.0 {
+                if report.planned_hold_s > 0.0 {
                     required_hold = required_hold.max(report.planned_hold_s);
                     if let (Some(begin), Some(end)) =
                         (report.hold_started_at, report.hold_finished_at)
@@ -673,6 +673,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "total_users": total_users, "hosts": hosts, "source_ips": source_ips,
         "started_at": started, "finished_at": finished,
         "common_hold_s": common_hold_s, "required_hold_s": required_hold,
+        "hold_started_at": hold_start, "hold_finished_at": hold_end,
         // An elapsed interval across all workers, not a sum of their durations.
         "duration_s": started.zip(finished).and_then(|(s, f)| (f-s).to_std().ok()).map(|d| d.as_secs_f64()),
         "latency": "client wall time through complete response body, including connection setup",
@@ -685,6 +686,49 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     })
 }
 
+pub(super) fn render_score_table(report: &Value) -> String {
+    let number = |value: Option<f64>, suffix: &str| {
+        value
+            .map(|n| format!("{n:.2}{suffix}"))
+            .unwrap_or_else(|| "unavailable".into())
+    };
+    let label = report["implementation"]
+        .as_str()
+        .unwrap_or("target")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ");
+    format!(
+        "| Rank | PR | Implementation | Max users | Req/s | p50 | p95 | p99 | Errors | CPU | Peak memory | Limited by |\n\
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n\
+| — | — | {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        if report["score_is_lower_bound"] == true {
+            format!("≥ {}", report["score"])
+        } else {
+            report["score"].to_string()
+        },
+        number(report["hold"]["requests_per_second"].as_f64(), ""),
+        number(report["aggregate"]["med_ms"].as_f64(), " ms"),
+        number(report["aggregate"]["p95_ms"].as_f64(), " ms"),
+        number(report["aggregate"]["p99_ms"].as_f64(), " ms"),
+        number(
+            report["aggregate"]["failure_rate"]
+                .as_f64()
+                .map(|n| n * 100.0),
+            "%"
+        ),
+        number(report["hold"]["service_cpu_percent"].as_f64(), "%"),
+        number(
+            report["hold"]["sampled_peak_memory_bytes"]
+                .as_f64()
+                .map(|n| n / 1_048_576.0),
+            " MiB"
+        ),
+        report["limit_reached"]
+            .as_str()
+            .unwrap_or("not established")
+    )
+}
+
 pub(super) fn render_report(report: &Value, compact: bool) -> String {
     let fmt = |value: &Value| {
         value
@@ -692,29 +736,43 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
             .map(|n| format!("{n:.2}"))
             .unwrap_or_else(|| "unavailable".into())
     };
-    let title = report["score"]
-        .as_u64()
-        .map_or_else(|| "results".into(), |score| format!("score: {score} VUs"));
-    let vu_label = if report["score"].is_u64() {
-        "Score"
+    let title = report["score"].as_u64().map_or_else(
+        || "results".into(),
+        |score| {
+            let bound = if report["score_is_lower_bound"] == true {
+                "≥ "
+            } else {
+                ""
+            };
+            format!("score: {bound}{score} VUs")
+        },
+    );
+    let error_rate = report["aggregate"]["failure_rate"]
+        .as_f64()
+        .map(|rate| format!("{:.2}", rate * 100.0))
+        .unwrap_or_else(|| "unavailable".into());
+    let table = if report["score"].is_u64() {
+        format!(
+            "{}\nReq/s and CPU are means from samples inside the confirmed hold. Memory is sampled peak cgroup usage, including socket buffers and page cache. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",
+            render_score_table(report)
+        )
     } else {
-        "Requested"
+        format!(
+            "| Requested VUs | Reached VUs | p95 ms | p99 ms | HTTP errors % | Result |\n|---:|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} | {} |",
+            report["requested_users"],
+            report["maximum_users"],
+            fmt(&report["aggregate"]["p95_ms"]),
+            fmt(&report["aggregate"]["p99_ms"]),
+            error_rate,
+            if report["passed"] == true {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        )
     };
     let mut text = format!(
-        "# Benchmark {title}\n\n| {vu_label} VUs | Reached VUs | p95 ms | p99 ms | HTTP errors % | Result |\n|---:|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} | {} |\n\nThresholds: p95 < 500 ms, p99 < 1,000 ms, HTTP errors < 1%.\n{} requests over {} seconds, including ramp and drain.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
-        report.get("score").unwrap_or(&report["requested_users"]),
-        report["maximum_users"],
-        fmt(&report["aggregate"]["p95_ms"]),
-        fmt(&report["aggregate"]["p99_ms"]),
-        fmt(&report["aggregate"]["failure_rate"]
-            .as_f64()
-            .map(|rate| json!(rate * 100.0))
-            .unwrap_or(Value::Null)),
-        if report["passed"] == true {
-            "PASS"
-        } else {
-            "FAIL"
-        },
+        "# Benchmark {title}\n\n{table}\n\nThresholds: p95 < 500 ms, p99 < 1,000 ms, HTTP errors < 1%.\n{} requests over {} seconds, including ramp and drain.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
         report["aggregate"]["requests"],
         fmt(&report["duration_s"])
     );
@@ -1396,6 +1454,32 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
     aggregate["network_hosts"] =
         network_hosts(&aggregate["generator_telemetry"], &target_telemetry);
     aggregate["target_telemetry"] = target_telemetry;
+    aggregate["implementation"] = json!(cfg.label.as_deref().unwrap_or(&cfg.base_url));
+    let hold = (|| -> Result<Value> {
+        let start = serde_json::from_value(aggregate["hold_started_at"].clone())?;
+        let finish = serde_json::from_value(aggregate["hold_finished_at"].clone())?;
+        let mut requests_per_second = 0.0;
+        for worker in &workers {
+            let summary = twelve_dollar_benchmark::telemetry::summarize_hold(
+                &output.join(&worker.name).join("telemetry.jsonl"),
+                start,
+                finish,
+            )?;
+            requests_per_second += summary["requests_per_second"]
+                .as_f64()
+                .ok_or("hold request counters unavailable")?;
+        }
+        let mut target = twelve_dollar_benchmark::telemetry::summarize_hold(
+            &output.join("target/telemetry.jsonl"),
+            start,
+            finish,
+        )
+        .unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}));
+        target["requests_per_second"] = json!(requests_per_second);
+        Ok(target)
+    })();
+    aggregate["hold"] =
+        hold.unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}));
     aggregate["destination_ports"] = json!(cfg.destination_ports);
     aggregate["requested_users"] = json!(cfg.users);
     aggregate["source_port_allocation"] = json!({"first": 1024, "last": 65535,
