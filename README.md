@@ -143,7 +143,9 @@ Error details are collected by default in endpoint summaries, aggregate
 summaries, and raw samples. Counts report exact error-kind and HTTP-status
 totals; each report retains at most 100 examples per endpoint, runtime errors,
 and aggregate, with an omitted-example count when the cap is exceeded. Reasons
-and response-body excerpts are each limited to 1 KiB. Examples are also written as
+and response-body excerpts are each limited to 1 KiB. Rendered Markdown groups
+counts by type and HTTP status and deduplicates representative examples by
+context while keeping worker attribution. Examples are also written as
 `BENCH_ERROR` lines to each worker's `output.log` as they occur.
 
 The reports include total and per-endpoint successful/failed requests per second,

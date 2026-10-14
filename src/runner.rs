@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
+    fmt::Write as _,
     fs::{self, File},
     io::{BufReader, Read},
     net::IpAddr,
@@ -981,95 +982,152 @@ fn markdown_text(value: &str) -> String {
         .collect::<String>()
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ErrorContext<'a> {
+    kind: &'a str,
+    status_code: Option<u64>,
+    reason: &'a str,
+    body_excerpt: Option<&'a str>,
+    path: &'a str,
+    worker: Option<&'a str>,
+}
+
+fn string_field<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
+    value.get(name).and_then(Value::as_str)
+}
+
+fn error_context(example: &Value) -> ErrorContext<'_> {
+    ErrorContext {
+        kind: string_field(example, "kind").unwrap_or_default(),
+        status_code: example.get("status_code").and_then(Value::as_u64),
+        reason: string_field(example, "reason").unwrap_or_default(),
+        body_excerpt: string_field(example, "body_excerpt"),
+        path: string_field(example, "path").unwrap_or_default(),
+        worker: string_field(example, "worker"),
+    }
+}
+
 fn render_error_details(text: &mut String, title: &str, value: &Value) {
-    let Some(counts) = value["counts"]
-        .as_object()
+    let Some(counts) = value
+        .get("counts")
+        .and_then(Value::as_object)
         .filter(|counts| !counts.is_empty())
     else {
         return;
     };
-    text.push_str(&format!("\n{title}:\n"));
-    for (kind, count) in counts {
-        text.push_str(&format!("- {}: {}\n", markdown_text(kind), count));
-    }
-    if let Some(examples) = value["examples"].as_array() {
-        let mut shown = Vec::with_capacity(5);
-        let mut workers = BTreeSet::new();
-        for (index, example) in examples.iter().enumerate() {
-            if shown.len() == 5 {
-                break;
+    let _ = writeln!(text, "\n{title}:");
+    for (label, prefix) in [("Error type", "kind:"), ("HTTP status", "status:")] {
+        let rows = counts
+            .iter()
+            .filter_map(|(key, count)| key.strip_prefix(prefix).map(|name| (name, count)))
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            let _ = writeln!(text, "\n| {label} | Count |\n|---|---:|");
+            for (name, count) in rows {
+                let _ = writeln!(text, "| {} | {count} |", markdown_text(name));
             }
-            if let Some(worker) = example["worker"].as_str()
+        }
+    }
+    if let Some(examples) = value.get("examples").and_then(Value::as_array) {
+        let mut unique = Vec::with_capacity(examples.len());
+        let mut contexts = BTreeSet::new();
+        let mut duplicates = 0;
+        for example in examples {
+            if contexts.insert(error_context(example)) {
+                unique.push(example);
+            } else {
+                duplicates += 1;
+            }
+        }
+
+        let mut shown_contexts = BTreeSet::new();
+        let mut workers = BTreeSet::new();
+        for example in &unique {
+            if let Some(worker) = string_field(example, "worker")
                 && workers.insert(worker)
             {
-                shown.push(index);
+                shown_contexts.insert(error_context(example));
+                if shown_contexts.len() == 5 {
+                    break;
+                }
             }
         }
-        for index in 0..examples.len() {
-            if shown.len() == 5 {
+
+        let mut shown_count = shown_contexts.len().min(5);
+        for example in &unique {
+            if shown_count == 5 {
                 break;
             }
-            if !shown.contains(&index) {
-                shown.push(index);
+            if shown_contexts.insert(error_context(example)) {
+                shown_count += 1;
             }
         }
-        shown.sort_unstable();
-        for index in &shown {
-            let example = &examples[*index];
-            let worker = example["worker"].as_str().map(markdown_text);
-            let endpoint = example["endpoint"]
-                .as_str()
+        if shown_count > 0 {
+            let _ = writeln!(text, "\nExamples:\n");
+        }
+        for example in unique
+            .iter()
+            .filter(|example| shown_contexts.contains(&error_context(example)))
+        {
+            let worker = string_field(example, "worker").map(markdown_text);
+            let endpoint = string_field(example, "endpoint")
                 .map(markdown_text)
                 .unwrap_or_default();
-            let path = example["path"]
-                .as_str()
+            let path = string_field(example, "path")
                 .map(markdown_text)
                 .unwrap_or_default();
-            let kind = example["kind"]
-                .as_str()
+            let kind = string_field(example, "kind")
                 .map(markdown_text)
                 .unwrap_or_default();
-            let reason = example["reason"]
-                .as_str()
+            let reason = string_field(example, "reason")
                 .map(markdown_text)
                 .unwrap_or_default();
-            let status = example["status_code"]
-                .as_u64()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "no HTTP status".into());
-            text.push_str(&format!(
-                "- {}{} {} {}: {} ({})\n",
-                worker
-                    .as_deref()
-                    .map(|name| format!("{name}: "))
-                    .unwrap_or_default(),
-                endpoint,
-                path,
-                status,
-                kind,
-                reason
-            ));
-            if let Some(body) = example["body_excerpt"].as_str() {
+            let status = example
+                .get("status_code")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "no HTTP status".to_owned(), |n| n.to_string());
+            let worker = worker
+                .as_deref()
+                .map_or_else(String::new, |name| format!("{name}: "));
+            let _ = writeln!(
+                text,
+                "- {worker}{endpoint} {path} {status}: {kind} ({reason})"
+            );
+            if let Some(body) = string_field(example, "body_excerpt") {
                 let encoded =
                     serde_json::to_string(body).unwrap_or_else(|_| "\"unavailable\"".into());
-                text.push_str(&format!(
-                    "    {}{}\n",
-                    markdown_text(&encoded),
-                    if example["body_truncated"] == true {
-                        " [truncated]"
-                    } else {
-                        ""
-                    }
-                ));
+                let truncated = if example
+                    .get("body_truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    " [truncated]"
+                } else {
+                    ""
+                };
+                let _ = writeln!(text, "    {}{truncated}", markdown_text(&encoded));
             }
         }
-        let hidden = examples.len().saturating_sub(shown.len());
+        let hidden = unique.len().saturating_sub(shown_count);
         if hidden > 0 {
-            text.push_str(&format!("- {hidden} stored examples not shown.\n"));
+            let _ = writeln!(text, "- {hidden} distinct stored examples not shown.");
+        }
+        if duplicates > 0 {
+            let _ = writeln!(
+                text,
+                "- {duplicates} repeated stored examples omitted from display."
+            );
         }
     }
-    if let Some(omitted) = value["omitted"].as_u64().filter(|n| *n > 0) {
-        text.push_str(&format!("- {omitted} additional examples omitted.\n"));
+    if let Some(omitted) = value
+        .get("omitted")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        let _ = writeln!(
+            text,
+            "- {omitted} additional examples omitted before storage."
+        );
     }
 }
 
@@ -1583,6 +1641,78 @@ mod tests {
         assert_eq!(result["aggregate"]["failed"], 202);
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn rendered_error_examples_include_each_worker_before_filling_the_limit() {
+        let repeated = |worker: &str, reason: &str| {
+            (0..6)
+                .map(|_| {
+                    json!({
+                        "worker": worker,
+                        "endpoint": "GET /feed",
+                        "path": "/feed",
+                        "kind": "http",
+                        "reason": reason,
+                        "body_excerpt": "busy",
+                        "status_code": 503
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut examples = repeated("host-one", "first host repeated reason");
+        examples.extend(repeated("host-two", "second host repeated reason"));
+        for reason in [
+            "first host unique C",
+            "first host unique D",
+            "first host unique E",
+            "first host unique F",
+            "first host unique G",
+        ] {
+            examples.push(json!({
+                "worker": "host-one",
+                "endpoint": "GET /feed",
+                "path": "/feed",
+                "kind": "http",
+                "reason": reason,
+                "body_excerpt": "busy",
+                "status_code": 503
+            }));
+        }
+        let report = json!({
+            "endpoints": {
+                "GET /feed": {
+                    "errors": {
+                        "counts": {"kind:http": 17, "status:503": 17},
+                        "examples": examples,
+                        "omitted": 3
+                    }
+                }
+            }
+        });
+
+        let rendered = render_report(&report, false);
+
+        assert!(rendered.contains("| Error type | Count |"));
+        assert!(rendered.contains("| http | 17 |"));
+        assert!(rendered.contains("| HTTP status | Count |"));
+        assert!(rendered.contains("| 503 | 17 |"));
+        assert!(rendered.contains("host-one: GET /feed /feed"));
+        assert!(rendered.contains("host-two: GET /feed /feed"));
+        assert!(rendered.contains("first host repeated reason"));
+        assert!(rendered.contains("second host repeated reason"));
+        assert!(rendered.contains("first host unique C"));
+        let first = rendered.find("first host repeated reason").unwrap();
+        let second = rendered.find("second host repeated reason").unwrap();
+        let third = rendered.find("first host unique C").unwrap();
+        let fourth = rendered.find("first host unique D").unwrap();
+        let fifth = rendered.find("first host unique E").unwrap();
+        assert!(first < second && second < third && third < fourth && fourth < fifth);
+        assert!(rendered.contains("Examples:\n\n- host-one:"));
+        assert!(!rendered.contains("first host unique F"));
+        assert!(rendered.contains("- 2 distinct stored examples not shown."));
+        assert!(rendered.contains("- 10 repeated stored examples omitted from display."));
+        assert!(rendered.contains("- 3 additional examples omitted before storage."));
     }
 
     #[test]
