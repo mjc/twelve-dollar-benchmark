@@ -19,7 +19,7 @@ pub(super) fn urls(base: &str, ports: &[u16]) -> Result<Vec<Url>> {
         .map(|port| {
             let mut url = base.clone();
             url.set_port(Some(*port))
-                .map_err(|_| "unable to set destination port")?;
+                .map_err(|()| "unable to set destination port")?;
             Ok(url)
         })
         .collect()

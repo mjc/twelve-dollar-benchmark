@@ -63,24 +63,7 @@ unscored warm-up; five-minute searches from --start-users (2,500), doubling then
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
 
-pub(super) fn pids(value: &str) -> Result<Vec<u32>> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut pids = Vec::new();
-    for item in value.split(',') {
-        let pid: u32 = item.trim().parse()?;
-        if pid == 0 {
-            return Err("process IDs must be positive".into());
-        }
-        if !pids.contains(&pid) {
-            pids.push(pid);
-        }
-    }
-    Ok(pids)
-}
-
-pub(super) use twelve_dollar_benchmark::parse_destination_ports;
+pub(super) use twelve_dollar_benchmark::{parse_destination_ports, parse_pids as pids};
 
 fn interval(value: &str) -> Result<Duration> {
     let seconds: f64 = value.trim_end_matches('s').parse()?;
@@ -154,6 +137,8 @@ pub(super) fn parse(args: &[String]) -> Result<Config> {
     parse_with(args, &caller, |key| env::var(key).ok())
 }
 
+// Keep CLI overrides and their cross-option validation in one ordered pass.
+#[allow(clippy::too_many_lines)]
 fn parse_with(
     args: &[String],
     caller: &Path,
@@ -180,7 +165,7 @@ fn parse_with(
         destination_ports: vec![default_port],
         users: 100,
         start_users: 2500,
-        max_users: 300000,
+        max_users: 300_000,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
@@ -278,7 +263,9 @@ fn parse_with(
             _ => return Err(format!("unsupported option: {flag}").into()),
         }
     }
-    let positional_destination_ports = if !target.is_empty() {
+    let positional_destination_ports = if target.is_empty() {
+        None
+    } else {
         let [target_ip, target_ports] = target.as_slice() else {
             return Err("supply target IP and port together".into());
         };
@@ -297,8 +284,6 @@ fn parse_with(
             IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
         };
         Some(destination_ports)
-    } else {
-        None
     };
     config.destination_ports = if let Some(ports) = explicit_destination_ports {
         ports
@@ -416,6 +401,32 @@ mod tests {
     }
 
     #[test]
+    fn scoring_bounds_and_label_default_validate_together() {
+        let defaults = parse_args(&[], &[]).unwrap();
+        assert!(defaults.score);
+        assert_eq!(defaults.start_users, 2500);
+        assert_eq!(defaults.max_users, 300_000);
+        assert_eq!(defaults.label, None);
+
+        let config = parse_args(
+            &[
+                "--start-users=1250",
+                "--max-users=6750",
+                "--label",
+                "candidate",
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(config.start_users, 1250);
+        assert_eq!(config.max_users, 6750);
+        assert_eq!(config.label.as_deref(), Some("candidate"));
+        assert!(parse_args(&["--start-users=1001"], &[]).is_err());
+        assert!(parse_args(&["--max-users=0"], &[]).is_err());
+        assert!(parse_args(&["--start-users=5000", "--max-users=2500"], &[]).is_err());
+    }
+
+    #[test]
     fn destination_port_lists_and_ranges_are_ordered_and_deduplicated() {
         assert_eq!(
             parse_destination_ports("3100,3101,3102").unwrap(),
@@ -500,7 +511,7 @@ mod tests {
         assert_eq!(config.ramp_up, "60s");
         assert_eq!(config.duration, "5m");
         assert_eq!(config.tokens, PathBuf::from("seed/tokens.json"));
-        assert!(config.source_ips.is_empty());
+        assert_eq!(config.source_ips, "");
 
         let config = parse_args(&[], &[("BASE_URL", "http://example.test")]).unwrap();
         assert_eq!(config.destination_ports, vec![80]);

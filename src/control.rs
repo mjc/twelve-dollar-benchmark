@@ -8,6 +8,11 @@ use std::{
 };
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+/// Wait for the coordinator's start timestamp and report readiness.
+///
+/// # Errors
+///
+/// Returns an error if the start is cancelled, times out, is missed, or cannot be read.
 pub fn wait_start(control: &Path) -> Result<i64> {
     fs::write(control.with_extension("ready"), "ready\n")?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -34,6 +39,11 @@ pub fn wait_start(control: &Path) -> Result<i64> {
     Ok(start_at)
 }
 
+/// Wait until a supervised generator has written its readiness marker.
+///
+/// # Errors
+///
+/// Returns an error if the marker is not written before the timeout.
 pub fn ready_supervised(control: &Path) -> Result<u8> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !control.with_extension("ready").exists() {
@@ -45,6 +55,11 @@ pub fn ready_supervised(control: &Path) -> Result<u8> {
     Ok(0)
 }
 
+/// Publish a validated timestamp to start a supervised generator.
+///
+/// # Errors
+///
+/// Returns an error if the timestamp is invalid or the control files cannot be updated.
 pub fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
     let _: i64 = timestamp.parse()?;
     let temporary = control.with_extension("start.tmp");
@@ -54,11 +69,21 @@ pub fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
     Ok(0)
 }
 
+/// Refresh the observer lease marker.
+///
+/// # Errors
+///
+/// Returns an error if the lease marker cannot be written.
 pub fn refresh_observer(control: &Path) -> Result<u8> {
     fs::write(control.with_extension("lease"), "alive\n")?;
     Ok(0)
 }
 
+/// Cancel a supervised generator and wait for its completion marker.
+///
+/// # Errors
+///
+/// Returns an error if cancellation cannot be written or shutdown times out.
 pub fn stop_supervised(control: &Path) -> Result<u8> {
     fs::write(control, "cancel\n")?;
     let deadline = Instant::now() + Duration::from_secs(15);

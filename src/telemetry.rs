@@ -79,6 +79,8 @@ fn interfaces(text: &str) -> Result<BTreeMap<String, Interface>> {
     Ok(result)
 }
 
+// Keep the netlink request and multipart decoder together so their bounds stay auditable.
+#[allow(clippy::too_many_lines)]
 fn socket_inodes() -> Result<HashSet<u64>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: no pointer arguments; OwnedFd takes ownership only on success.
@@ -103,8 +105,8 @@ fn socket_inodes() -> Result<HashSet<u64>> {
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
-            (&timeout as *const libc::timeval).cast(),
-            size_of_val(&timeout) as libc::socklen_t,
+            std::ptr::from_ref(&timeout).cast(),
+            libc::socklen_t::try_from(size_of_val(&timeout))?,
         )
     } < 0
     {
@@ -112,7 +114,7 @@ fn socket_inodes() -> Result<HashSet<u64>> {
     }
     // SAFETY: an all-zero sockaddr_nl is valid before assigning its family.
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    kernel.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK)?;
     let mut inodes = HashSet::new();
     for family in [libc::AF_INET, libc::AF_INET6] {
         // nlmsghdr (16 bytes), inet_diag_req_v2 (8), inet_diag_sockid (48).
@@ -120,9 +122,9 @@ fn socket_inodes() -> Result<HashSet<u64>> {
         request[..4].copy_from_slice(&72_u32.to_ne_bytes());
         request[4..6].copy_from_slice(&20_u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
         request[6..8].copy_from_slice(&0x301_u16.to_ne_bytes()); // REQUEST | DUMP
-        request[8..12].copy_from_slice(&(family as u32).to_ne_bytes());
-        request[16] = family as u8;
-        request[17] = libc::IPPROTO_TCP as u8;
+        request[8..12].copy_from_slice(&u32::try_from(family)?.to_ne_bytes());
+        request[16] = u8::try_from(family)?;
+        request[17] = u8::try_from(libc::IPPROTO_TCP)?;
         request[20..24].copy_from_slice(&2_u32.to_ne_bytes()); // 1 << TCP_ESTABLISHED
         // SAFETY: request and kernel are live buffers of their stated sizes.
         if unsafe {
@@ -131,14 +133,14 @@ fn socket_inodes() -> Result<HashSet<u64>> {
                 request.as_ptr().cast(),
                 request.len(),
                 0,
-                (&kernel as *const libc::sockaddr_nl).cast(),
-                size_of_val(&kernel) as libc::socklen_t,
+                std::ptr::from_ref(&kernel).cast(),
+                libc::socklen_t::try_from(size_of_val(&kernel))?,
             )
         } < 0
         {
             return Err(std::io::Error::last_os_error().into());
         }
-        let mut buffer = [0_u8; 65536];
+        let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
         'dump: loop {
             // SAFETY: buffer is writable for its entire stated length.
             let received = unsafe {
@@ -225,6 +227,7 @@ fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
     ))
 }
 
+#[allow(clippy::cast_precision_loss)] // Kernel CPU ticks become floating-point report seconds.
 fn process(
     pid: u32,
     ticks: f64,
@@ -297,15 +300,14 @@ fn process(
         Ok(text) => text
             .lines()
             .find_map(|line| line.strip_prefix("Max open files"))
-            .map(|line| {
+            .map_or(Value::Null, |line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
                 if fields.len() >= 2 {
                     json!({"soft": fields[0], "hard": fields[1]})
                 } else {
                     Value::Null
                 }
-            })
-            .unwrap_or(Value::Null),
+            }),
         Err(error) => {
             errors.push(format!("descriptor limits: {error}"));
             Value::Null
@@ -363,7 +365,22 @@ fn service_resources(roles: &Roles) -> Value {
     read().unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}))
 }
 
+fn checked_sum(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values
+        .into_iter()
+        .try_fold(0_u64, |total, value| total.checked_add(value?))
+}
+
+#[allow(clippy::cast_precision_loss)] // Kernel clock rates are small practical values.
+fn ticks_per_second(ticks: libc::c_long) -> f64 {
+    ticks as f64
+}
+
 /// Summarize counters between samples wholly inside the full-load hold.
+///
+/// # Errors
+/// Returns an error if the file or samples are malformed, or no valid interval exists.
+#[allow(clippy::cast_precision_loss)] // Benchmark rates and CPU share are floating-point estimates.
 pub fn summarize_hold(
     path: &Path,
     start: chrono::DateTime<Utc>,
@@ -384,10 +401,11 @@ pub fn summarize_hold(
             .and_then(Value::as_object)
             .filter(|groups| !groups.is_empty())
         {
-            let memory: Option<u64> = groups
-                .values()
-                .map(|group| group.get("memory_current_bytes").and_then(Value::as_u64))
-                .sum();
+            let memory = checked_sum(
+                groups
+                    .values()
+                    .map(|group| group.get("memory_current_bytes").and_then(Value::as_u64)),
+            );
             peak_memory = peak_memory.max(memory);
         }
         if first.is_none() {
@@ -398,20 +416,14 @@ pub fn summarize_hold(
     let (Some(first), Some(last)) = (first, last) else {
         return Err("no telemetry samples inside full-load hold".into());
     };
-    let seconds = (chrono::DateTime::parse_from_rfc3339(&last.timestamp)?
+    let duration = (chrono::DateTime::parse_from_rfc3339(&last.timestamp)?
         - chrono::DateTime::parse_from_rfc3339(&first.timestamp)?)
-    .num_microseconds()
-    .filter(|n| *n > 0)
-    .ok_or("not enough telemetry samples inside hold")? as f64
-        / 1_000_000.0;
+    .to_std()
+    .map_err(|_| "not enough telemetry samples inside hold")?;
+    let seconds = duration.as_secs_f64();
     let count = |point: &Point| -> Option<u64> {
-        point
-            .activity
-            .get("requests")?
-            .as_array()?
-            .iter()
-            .map(|row| row.get(0)?.as_u64())
-            .sum()
+        let rows = point.activity.get("requests")?.as_array()?;
+        checked_sum(rows.iter().map(|row| row.get(0).and_then(Value::as_u64)))
     };
     let requests = count(&last)
         .zip(count(&first))
@@ -423,15 +435,12 @@ pub fn summarize_hold(
         .zip(last.service.get("groups").and_then(Value::as_object))
         .filter(|(begin, end)| !begin.is_empty() && begin.keys().eq(end.keys()))
         .and_then(|(begin, end)| {
-            begin
-                .iter()
-                .map(|(path, value)| {
-                    end.get(path)?
-                        .get("cpu_usage_us")?
-                        .as_u64()?
-                        .checked_sub(value.get("cpu_usage_us")?.as_u64()?)
-                })
-                .sum::<Option<u64>>()
+            checked_sum(begin.iter().map(|(path, value)| {
+                end.get(path)?
+                    .get("cpu_usage_us")?
+                    .as_u64()?
+                    .checked_sub(value.get("cpu_usage_us")?.as_u64()?)
+            }))
         });
     Ok(json!({
         "sample_started_at": first.timestamp,
@@ -493,9 +502,7 @@ fn listener_pids_for_ports(ports: &[u16]) -> Result<Vec<u32>> {
             if fields.len() >= 10
                 && fields[3] == "0A"
                 && fields[1].rsplit_once(':').is_some_and(|(_, p)| {
-                    u16::from_str_radix(p, 16)
-                        .ok()
-                        .is_some_and(|port| ports.contains(&port))
+                    u16::from_str_radix(p, 16).is_ok_and(|port| ports.contains(&port))
                 })
             {
                 inodes.insert(format!("socket:[{}]", fields[9]));
@@ -630,6 +637,10 @@ pub struct Sampler {
     path: PathBuf,
 }
 impl Sampler {
+    /// Start periodic host and process sampling and wait for the baseline sample.
+    ///
+    /// # Errors
+    /// Returns an error if the output file cannot be created or the baseline fails.
     pub fn start(
         path: PathBuf,
         roles: Roles,
@@ -647,6 +658,8 @@ impl Sampler {
             if ticks <= 0 || page <= 0 {
                 return Err("unable to read kernel tick/page sizes".into());
             }
+            let ticks = ticks_per_second(ticks);
+            let page = u64::try_from(page).map_err(|_| "invalid kernel page size".to_owned())?;
             let mut writer = BufWriter::new(file);
             let started = Instant::now();
             let mut identities = BTreeMap::new();
@@ -664,7 +677,7 @@ impl Sampler {
                 for (role, pids) in &roles {
                     let mut data = Vec::new();
                     for pid in pids {
-                        match process(*pid, ticks as f64, page as u64, &sockets) {
+                        match process(*pid, ticks, page, &sockets) {
                             Ok(data_point) => {
                                 let original =
                                     identities.entry(*pid).or_insert(data_point.start_ticks);
@@ -736,14 +749,18 @@ impl Sampler {
             path,
         })
     }
+    /// Stop sampling and summarize the collected measurements.
+    ///
+    /// # Errors
+    /// Returns an error if the sampler thread or summary data cannot be read.
+    ///
     pub fn finish(mut self) -> Result<Value> {
         let _ = self.stop.send(());
-        let result = self
+        let handle = self
             .thread
             .take()
-            .unwrap()
-            .join()
-            .map_err(|_| "telemetry sampler panicked")?;
+            .ok_or("telemetry sampler thread was already joined")?;
+        let result = handle.join().map_err(|_| "telemetry sampler panicked")?;
         result.map_err(|e| -> Box<dyn Error> { e.into() })?;
         summarize(&self.path)
     }
@@ -790,6 +807,7 @@ fn tcp_counters(text: &str) -> Result<BTreeMap<String, u64>> {
         .collect()
 }
 
+#[allow(clippy::cast_precision_loss)] // Rates are reported as floating-point metrics.
 fn rate(delta: Option<u64>, seconds: f64, scale: f64) -> Option<f64> {
     if seconds > 0.0 {
         delta.map(|n| n as f64 * scale / seconds)
@@ -1005,14 +1023,18 @@ pub(crate) fn summarize(path: &Path) -> Result<Value> {
     )
 }
 
+/// Run the target-side telemetry observer until its control lease ends.
+///
+/// # Errors
+/// Returns an error if telemetry sampling or summary output fails.
 pub fn observe(
     control: &Path,
     application_pids: Vec<u32>,
     proxy_pids: Vec<u32>,
-    ports: Vec<u16>,
+    ports: &[u16],
     interval: Duration,
 ) -> Result<u8> {
-    let discovery = discover_roles(&ports);
+    let discovery = discover_roles(ports);
     let discovery_error = discovery.as_ref().err().map(ToString::to_string);
     let mut roles = discovery.unwrap_or_default();
     if !application_pids.is_empty() {
@@ -1098,8 +1120,10 @@ pub fn observe(
 fn observer_lease_expired(control: &Path, started: Instant, duration: Duration) -> bool {
     let elapsed = fs::metadata(control.with_extension("lease"))
         .and_then(|metadata| metadata.modified())
-        .map(|modified| modified.elapsed().unwrap_or(Duration::ZERO))
-        .unwrap_or_else(|_| started.elapsed());
+        .map_or_else(
+            |_| started.elapsed(),
+            |modified| modified.elapsed().unwrap_or(Duration::ZERO),
+        );
     elapsed >= duration
 }
 
@@ -1120,6 +1144,13 @@ mod tests {
     };
 
     #[test]
+    fn checked_sum_marks_missing_and_overflowing_counters_unavailable() {
+        assert_eq!(checked_sum([Some(2), Some(3)]), Some(5));
+        assert_eq!(checked_sum([Some(u64::MAX), Some(1)]), None);
+        assert_eq!(checked_sum([Some(2), None]), None);
+    }
+
+    #[test]
     fn decodes_proc_tcp_addresses_and_discovers_direct_application() {
         assert_eq!(
             proc_address("0100007F:0C1C").unwrap().to_string(),
@@ -1135,7 +1166,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let roles = discover_roles(&[listener.local_addr().unwrap().port()]).unwrap();
         assert!(roles["application"].contains(&std::process::id()));
-        assert!(roles["proxy"].is_empty());
+        assert_eq!(roles["proxy"], Vec::<u32>::new());
     }
 
     fn fixture(elapsed: f64) -> Point {
@@ -1199,7 +1230,9 @@ mod tests {
         let control = temporary();
         let lease = control.with_extension("lease");
         let duration = Duration::from_secs(2);
-        let old_start = Instant::now() - Duration::from_secs(3);
+        let old_start = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("monotonic clock supports the test interval");
         assert!(observer_lease_expired(&control, old_start, duration));
         assert!(!observer_lease_expired(&control, Instant::now(), duration));
         fs::write(&lease, "heartbeat\n").unwrap();

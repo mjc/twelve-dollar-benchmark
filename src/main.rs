@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
-use twelve_dollar_benchmark::{control, setting, telemetry};
+use twelve_dollar_benchmark::{ENDPOINTS, control, setting, telemetry};
 
 mod config;
 mod connections;
@@ -23,13 +23,6 @@ mod destinations;
 mod errors;
 mod runner;
 mod scoring;
-
-const ENDPOINTS: [&str; 4] = [
-    Endpoint::Feed.name(),
-    Endpoint::Post.name(),
-    Endpoint::Like.name(),
-    Endpoint::Create.name(),
-];
 
 #[derive(Clone, Copy)]
 enum Endpoint {
@@ -43,11 +36,12 @@ impl Endpoint {
     const ALL: [Self; 4] = [Self::Feed, Self::Post, Self::Like, Self::Create];
 
     const fn name(self) -> &'static str {
+        let [feed, post, like, create] = ENDPOINTS;
         match self {
-            Self::Feed => "GET /feed",
-            Self::Post => "GET /posts/:id",
-            Self::Like => "POST /posts/:id/like",
-            Self::Create => "POST /posts",
+            Self::Feed => feed,
+            Self::Post => post,
+            Self::Like => like,
+            Self::Create => create,
         }
     }
 
@@ -117,6 +111,7 @@ struct Summary {
     errors: errors::ErrorDetails,
 }
 impl Samples {
+    #[allow(clippy::cast_precision_loss)] // Report statistics are inherently floating point.
     fn summary(&mut self) -> Summary {
         self.latency_ms.sort_unstable_by(f64::total_cmp);
         let n = self.latency_ms.len();
@@ -135,6 +130,11 @@ impl Samples {
     }
 }
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // p is bounded to [0, 1]; checked slice access validates rounded ranks.
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
         return None;
@@ -254,6 +254,7 @@ fn runtime_error(
     ));
 }
 
+#[allow(clippy::too_many_lines)] // Keep full-body timing and sample accounting in one request path.
 async fn request(
     user: &User,
     endpoint: Endpoint,
@@ -455,6 +456,7 @@ fn global_user_index(offset: usize, local: usize) -> Option<usize> {
 }
 
 #[must_use]
+#[allow(clippy::cast_precision_loss)] // Duration scaling needs a floating point user fraction.
 fn ramp_offset(user: usize, users: usize, ramp: Duration) -> Duration {
     if users <= 1 {
         Duration::ZERO
@@ -533,6 +535,7 @@ fn build_client(
         .build()
 }
 
+#[allow(clippy::too_many_lines)] // Keep launch, cancellation, ramp-down, and drain ordering explicit.
 async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let cfg = config::parse(args)?;
     if cfg.help {
@@ -607,7 +610,9 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         if interrupted {
             break;
         }
-        let at = start + ramp_offset(local, cfg.users, ramp);
+        let at = start
+            .checked_add(ramp_offset(local, cfg.users, ramp))
+            .ok_or("ramp-up deadline exceeds the system clock range")?;
         tokio::select! {
             () = wait_ramp_slot(at) => {},
             _ = interrupt.recv() => { interrupted = true; break; },
@@ -671,7 +676,9 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         });
     }
     let hold_started_at = (!interrupted).then(Utc::now);
-    let hold_deadline = Instant::now() + hold;
+    let hold_deadline = Instant::now()
+        .checked_add(hold)
+        .ok_or("hold deadline exceeds the system clock range")?;
     let mut hold_finished_at = None;
     if !interrupted {
         interrupted = tokio::select! {
@@ -689,7 +696,8 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     } else {
         for (n, tx) in stops.iter().enumerate() {
             let deadline = hold_deadline
-                + Duration::from_secs(30).mul_f64((n + 1) as f64 / stops.len().max(1) as f64);
+                .checked_add(ramp_offset(n + 1, stops.len() + 1, Duration::from_secs(30)))
+                .ok_or("ramp-down deadline exceeds the system clock range")?;
             interrupted = tokio::select! {
                 () = wait_ramp_slot(deadline) => false,
                 _ = interrupt.recv() => true,
@@ -743,8 +751,11 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         aggregate.checks_failed += samples.checks_failed;
         aggregate.errors.merge(&samples.errors);
         let mut summary = serde_json::to_value(samples.summary())?;
-        if let serde_json::Value::Object(rates) = connections::request_rates(samples, elapsed) {
-            summary.as_object_mut().unwrap().extend(rates);
+        if let (Some(summary), serde_json::Value::Object(rates)) = (
+            summary.as_object_mut(),
+            connections::request_rates(samples, elapsed),
+        ) {
+            summary.extend(rates);
         }
         endpoints.insert(name.into(), summary);
     }
@@ -824,29 +835,6 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed)
 }
 
-fn observe_target(control: &Path) -> Result<u8, Box<dyn std::error::Error>> {
-    let pids = |name| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        let v = setting(name, "");
-        if v.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(v.split(',').map(str::parse).collect::<Result<_, _>>()?)
-    };
-    let interval: f64 = setting("BENCH_SAMPLE_INTERVAL", "1").parse()?;
-    if !interval.is_finite() || interval < 0.1 {
-        return Err("invalid sample interval".into());
-    }
-    telemetry::observe(
-        control,
-        pids("BENCH_APPLICATION_PIDS")?,
-        pids("BENCH_PROXY_PIDS")?,
-        config::parse_destination_ports(&setting(
-            "BENCH_TARGET_PORTS",
-            &setting("BENCH_TARGET_PORT", "3000"),
-        ))?,
-        Duration::from_secs_f64(interval),
-    )
-}
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.as_slice() == ["--version"] || args.as_slice() == ["-V"] {
@@ -855,8 +843,6 @@ fn main() -> ExitCode {
     }
     if args.first().is_some_and(|a| {
         [
-            "--refresh-observer",
-            "--observe",
             "--supervise",
             "--stop-supervised",
             "--ready-supervised",
@@ -865,16 +851,17 @@ fn main() -> ExitCode {
         .contains(&a.as_str())
     }) {
         let result = if let Some(p) = args.get(1) {
-            match args[0].as_str() {
-                "--refresh-observer" => control::refresh_observer(Path::new(p)),
-                "--observe" => observe_target(Path::new(p)),
-                "--supervise" => runner::supervise(Path::new(p), &args[2..]),
-                "--stop-supervised" => control::stop_supervised(Path::new(p)),
-                "--ready-supervised" => control::ready_supervised(Path::new(p)),
-                _ => args.get(2).map_or_else(
+            match args.first().map(String::as_str) {
+                Some("--supervise") => {
+                    runner::supervise(Path::new(p), args.get(2..).unwrap_or_default())
+                }
+                Some("--stop-supervised") => control::stop_supervised(Path::new(p)),
+                Some("--ready-supervised") => control::ready_supervised(Path::new(p)),
+                Some("--start-supervised") => args.get(2).map_or_else(
                     || Err("missing coordinated start timestamp".into()),
                     |t| control::start_supervised(Path::new(p), t),
                 ),
+                _ => Err("unknown supervisor command".into()),
             }
         } else {
             Err("missing supervisor control path".into())
@@ -919,7 +906,7 @@ fn main() -> ExitCode {
                 }
                 flag.store(true, Ordering::Relaxed);
             });
-            return match runner::run(&args[1..], cancelled) {
+            return match runner::run(args.get(1..).unwrap_or_default(), &cancelled) {
                 Ok(c) => ExitCode::from(c),
                 Err(e) => {
                     eprintln!("benchmark runner error: {e}");
@@ -943,10 +930,10 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    fn user(base: String, metrics: Metrics) -> User {
+    fn user(base: &str, metrics: Metrics) -> User {
         User {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            base: reqwest::Url::parse(&base).unwrap(),
+            base: reqwest::Url::parse(base).unwrap(),
             index: 7,
             source: None,
             metrics,
@@ -1020,7 +1007,7 @@ mod tests {
 
     #[test]
     fn source_ip_parser_accepts_ranges_and_rejects_non_unicast_or_malformed_values() {
-        assert!(parse_source_ips("  ").unwrap().is_empty());
+        assert_eq!(parse_source_ips("  ").unwrap(), Vec::<IpAddr>::new());
         assert_eq!(
             parse_source_ips("127.0.0.[1-3]").unwrap(),
             [1, 2, 3].map(|n| IpAddr::V4(Ipv4Addr::new(127, 0, 0, n)))
@@ -1065,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn empty_validated_token_set_is_a_runtime_error_not_a_panic() {
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user("http://127.0.0.1:3000".into(), metrics);
+        let user = user("http://127.0.0.1:3000", metrics);
         browse(&user, &[], 0).await;
         assert_eq!(user.runtime_errors.load(Ordering::Relaxed), 1);
     }
@@ -1112,7 +1099,7 @@ mod tests {
             stream.write_all(b"complete body").unwrap();
         });
         let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(format!("http://{address}"), metrics.clone());
+        let user = user(&format!("http://{address}"), metrics.clone());
         let token = Token {
             username: "u".into(),
             token: "secret".into(),
@@ -1146,7 +1133,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(format!("http://{address}"), metrics.clone());
+        let user = user(&format!("http://{address}"), metrics.clone());
         let response = request(&user, Endpoint::Feed, "/feed", None, None).await;
         assert!(response.is_none());
         let mut data = metrics.lock().unwrap();
@@ -1175,7 +1162,7 @@ mod tests {
                 .unwrap();
         });
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(format!("http://{address}"), metrics.clone());
+        let user = user(&format!("http://{address}"), metrics.clone());
         assert!(
             request(&user, Endpoint::Feed, "/feed", None, None)
                 .await
@@ -1204,7 +1191,7 @@ mod tests {
             stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nunavailable").unwrap();
         });
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(format!("http://{address}"), metrics.clone());
+        let user = user(&format!("http://{address}"), metrics.clone());
         assert!(
             request(&user, Endpoint::Feed, "/feed", None, None)
                 .await

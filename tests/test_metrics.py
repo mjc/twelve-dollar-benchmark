@@ -315,7 +315,8 @@ class MetricsTests(unittest.TestCase):
                    BENCH_TARGET_PORT=str(self.server.server_port), BENCH_SAMPLE_INTERVAL="0.1",
                    BENCH_OBSERVER_LEASE_SECONDS=str(lease_seconds))
         log = (directory / "observer.log").open("w")
-        child = subprocess.Popen([str(self.binary.with_name("twelve-dollar-observer")), "--observe", str(control)],
+        observer = self.binary.with_name("twelve-dollar-observer")
+        child = subprocess.Popen([str(observer), "--observe", str(control)],
                                  cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT)
 
         def cleanup():

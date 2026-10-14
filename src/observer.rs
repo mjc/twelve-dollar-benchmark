@@ -1,30 +1,23 @@
 use std::{env, path::Path, process::ExitCode, time::Duration};
-use twelve_dollar_benchmark::{control, parse_destination_ports, setting, telemetry};
+use twelve_dollar_benchmark::{control, parse_destination_ports, parse_pids, setting, telemetry};
 
 fn observe_target(control: &Path) -> Result<u8, Box<dyn std::error::Error>> {
-    let parse_pids = |name| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        let value = setting(name, "");
-        if value.is_empty() {
-            return Ok(Vec::new());
-        }
-        value
-            .split(',')
-            .map(|p| p.parse::<u32>().map_err(Into::into))
-            .collect()
-    };
+    let pids = |name| parse_pids(&setting(name, ""));
     let interval: f64 = setting("BENCH_SAMPLE_INTERVAL", "1").parse()?;
     if !interval.is_finite() || interval < 0.1 {
         return Err("invalid sample interval".into());
     }
+    let interval = Duration::try_from_secs_f64(interval).map_err(|_| "invalid sample interval")?;
+    let ports = parse_destination_ports(&setting(
+        "BENCH_TARGET_PORTS",
+        &setting("BENCH_TARGET_PORT", "3000"),
+    ))?;
     telemetry::observe(
         control,
-        parse_pids("BENCH_APPLICATION_PIDS")?,
-        parse_pids("BENCH_PROXY_PIDS")?,
-        parse_destination_ports(&setting(
-            "BENCH_TARGET_PORTS",
-            &setting("BENCH_TARGET_PORT", "3000"),
-        ))?,
-        Duration::from_secs_f64(interval),
+        pids("BENCH_APPLICATION_PIDS")?,
+        pids("BENCH_PROXY_PIDS")?,
+        &ports,
+        interval,
     )
 }
 

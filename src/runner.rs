@@ -27,6 +27,11 @@ use std::{
 use twelve_dollar_benchmark::{ENDPOINTS, control};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+const OBSERVER_BINARY: &str = "twelve-dollar-observer";
+
+fn remote_observer_path(directory: &str) -> String {
+    format!("{directory}/{OBSERVER_BINARY}")
+}
 
 #[derive(Clone, Serialize)]
 struct Worker {
@@ -194,7 +199,7 @@ pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
         thread::sleep(Duration::from_millis(100));
     };
     fs::write(control.with_extension("done"), format!("{status}\n"))?;
-    Ok(status.code().unwrap_or(2) as u8)
+    Ok(u8::try_from(status.code().unwrap_or(2)).unwrap_or(2))
 }
 
 // A target observer uses the same start barrier as the generators, then stops
@@ -210,6 +215,8 @@ struct TargetMonitor {
     heartbeat: Option<thread::JoinHandle<()>>,
 }
 impl TargetMonitor {
+    // Setup spans local and remote observers; the shared protocol is kept together here.
+    #[allow(clippy::too_many_lines)]
     fn prepare(
         cfg: &config::Config,
         binary: &Path,
@@ -243,35 +250,36 @@ impl TargetMonitor {
         });
         let control = dir.join("metrics");
         let assignments = [
-            format!(
-                "BENCH_APPLICATION_PIDS={}",
+            (
+                "BENCH_APPLICATION_PIDS",
                 cfg.application_pids
                     .iter()
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
             ),
-            format!(
-                "BENCH_PROXY_PIDS={}",
+            (
+                "BENCH_PROXY_PIDS",
                 cfg.proxy_pids
                     .iter()
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
             ),
-            format!(
-                "BENCH_TARGET_PORTS={}",
+            (
+                "BENCH_TARGET_PORTS",
                 cfg.destination_ports
                     .iter()
                     .map(u16::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
             ),
-            format!(
-                "BENCH_SAMPLE_INTERVAL={}",
-                cfg.sample_interval.as_secs_f64()
+            (
+                "BENCH_SAMPLE_INTERVAL",
+                cfg.sample_interval.as_secs_f64().to_string(),
             ),
         ];
+        let observer_binary = binary.with_file_name(OBSERVER_BINARY);
         let log = File::create(dir.join("output.log"))?;
         let mut command = if let Some((user, host, remote_dir)) = &remote {
             checked(
@@ -279,40 +287,36 @@ impl TargetMonitor {
                 cancelled,
             )?;
             checked(
-                scp()
-                    .arg("--")
-                    .arg(binary.with_file_name("twelve-dollar-observer"))
-                    .arg(destination(
-                        user,
-                        host,
-                        &format!("{remote_dir}/twelve-dollar-observer"),
-                    )),
+                scp().arg("--").arg(&observer_binary).arg(destination(
+                    user,
+                    host,
+                    &remote_observer_path(remote_dir),
+                )),
                 cancelled,
             )?;
             checked(
                 ssh(user, host).arg(format!(
                     "{} --version",
-                    quote(&format!("{remote_dir}/twelve-dollar-observer"))
+                    quote(&remote_observer_path(remote_dir))
                 )),
                 cancelled,
             )?;
             let mut command = ssh(user, host);
             command.arg(format!(
-                "cd {} || exit 2; trap '' HUP; exec env {} ./twelve-dollar-observer --observe metrics",
+                "cd {} || exit 2; trap '' HUP; exec env {} ./{OBSERVER_BINARY} --observe metrics",
                 quote(remote_dir),
                 assignments
                     .iter()
-                    .map(|v| quote(v))
+                    .map(|(name, value)| format!("{name}={}", quote(value)))
                     .collect::<Vec<_>>()
                     .join(" ")
             ));
             command
         } else {
-            let mut command = Command::new(binary.with_file_name("twelve-dollar-observer"));
+            let mut command = Command::new(&observer_binary);
             command.current_dir(&dir).arg("--observe").arg(&control);
-            for assignment in &assignments {
-                let (key, value) = assignment.split_once('=').unwrap();
-                command.env(key, value);
+            for (name, value) in &assignments {
+                command.env(name, value);
             }
             command
         };
@@ -324,7 +328,7 @@ impl TargetMonitor {
             .spawn()?;
         Ok(Self {
             child: Some(child),
-            binary: binary.with_file_name("twelve-dollar-observer"),
+            binary: observer_binary,
             dir,
             control,
             remote,
@@ -338,7 +342,7 @@ impl TargetMonitor {
             let mut cmd = ssh(user, host);
             cmd.arg(format!(
                 "{} {} {} {}",
-                quote(&format!("{remote_dir}/twelve-dollar-observer")),
+                quote(&remote_observer_path(remote_dir)),
                 action,
                 quote(&format!("{remote_dir}/metrics")),
                 timestamp.map(quote).unwrap_or_default()
@@ -382,7 +386,7 @@ impl TargetMonitor {
                     let mut command = ssh(user, host);
                     command.arg(format!(
                         "{} --refresh-observer {}",
-                        quote(&format!("{dir}/twelve-dollar-observer")),
+                        quote(&remote_observer_path(dir)),
                         quote(&format!("{dir}/metrics"))
                     ));
                     command
@@ -526,6 +530,8 @@ fn split_users(total: usize, count: usize) -> Result<Vec<(usize, usize)>> {
         .collect())
 }
 
+// Worker report validation and aggregation form one ordered pass over each worker.
+#[allow(clippy::too_many_lines)]
 fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
     let mut maximum_users = 0;
@@ -589,7 +595,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
                             && report.connections["failed"].as_u64()
                                 == Some(samples.failed_ms.len() as u64) =>
                     {
-                        connection_data.merge(samples)
+                        connection_data.merge(samples);
                     }
                     _ => connection_available = false,
                 }
@@ -688,9 +694,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
 
 pub(super) fn render_score_table(report: &Value) -> String {
     let number = |value: Option<f64>, suffix: &str| {
-        value
-            .map(|n| format!("{n:.2}{suffix}"))
-            .unwrap_or_else(|| "unavailable".into())
+        value.map_or_else(|| "unavailable".into(), |n| format!("{n:.2}{suffix}"))
     };
     let label = report["implementation"]
         .as_str()
@@ -729,28 +733,26 @@ pub(super) fn render_score_table(report: &Value) -> String {
     )
 }
 
+// This is a linear document renderer; section order mirrors the published report.
+#[allow(clippy::too_many_lines)]
 pub(super) fn render_report(report: &Value, compact: bool) -> String {
     let fmt = |value: &Value| {
         value
             .as_f64()
-            .map(|n| format!("{n:.2}"))
-            .unwrap_or_else(|| "unavailable".into())
+            .map_or_else(|| "unavailable".into(), |n| format!("{n:.2}"))
     };
-    let title = report["score"].as_u64().map_or_else(
-        || "results".into(),
-        |score| {
-            let bound = if report["score_is_lower_bound"] == true {
-                "≥ "
-            } else {
-                ""
-            };
-            format!("score: {bound}{score} VUs")
-        },
+    let title = report["score"].as_u64().map_or("results".into(), |score| {
+        let bound = if report["score_is_lower_bound"] == true {
+            "≥ "
+        } else {
+            ""
+        };
+        format!("score: {bound}{score} VUs")
+    });
+    let error_rate = report["aggregate"]["failure_rate"].as_f64().map_or_else(
+        || "unavailable".into(),
+        |rate| format!("{:.2}", rate * 100.0),
     );
-    let error_rate = report["aggregate"]["failure_rate"]
-        .as_f64()
-        .map(|rate| format!("{:.2}", rate * 100.0))
-        .unwrap_or_else(|| "unavailable".into());
     let table = if report["score"].is_u64() {
         format!(
             "{}\nReq/s and CPU are means from samples inside the confirmed hold. Memory is sampled peak cgroup usage, including socket buffers and page cache. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",
@@ -776,49 +778,55 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         report["aggregate"]["requests"],
         fmt(&report["duration_s"])
     );
-    text.push_str(&format!(
-        "| All endpoints | {} | {} | {} | {} | {} |\n",
+    let _ = writeln!(
+        text,
+        "| All endpoints | {} | {} | {} | {} | {} |",
         fmt(&report["request_rates"]["requests_per_second"]),
         fmt(&report["request_rates"]["successful_requests_per_second"]),
         fmt(&report["request_rates"]["failed_requests_per_second"]),
         fmt(&report["aggregate"]["p95_ms"]),
         fmt(&report["aggregate"]["p99_ms"])
-    ));
+    );
     if let Some(endpoints) = report["endpoints"].as_object() {
         for (name, endpoint) in endpoints {
-            text.push_str(&format!(
-                "| {name} | {} | {} | {} | {} | {} |\n",
+            let _ = writeln!(
+                text,
+                "| {name} | {} | {} | {} | {} | {} |",
                 fmt(&endpoint["requests_per_second"]),
                 fmt(&endpoint["successful_requests_per_second"]),
                 fmt(&endpoint["failed_requests_per_second"]),
                 fmt(&endpoint["p95_ms"]),
                 fmt(&endpoint["p99_ms"])
-            ));
+            );
         }
     }
-    text.push_str(&format!(
-        "\nFull-load hold: {} s / {} s required.\n",
+    let _ = writeln!(
+        text,
+        "\nFull-load hold: {} s / {} s required.",
         fmt(&report["common_hold_s"]),
         fmt(&report["required_hold_s"])
-    ));
-    text.push_str(&format!(
-        "Source ports: {}–{}; theoretical tuple capacity {} before occupied ports and TIME_WAIT.\n",
+    );
+    let _ = writeln!(
+        text,
+        "Source ports: {}–{}; theoretical tuple capacity {} before occupied ports and TIME_WAIT.",
         report["source_port_allocation"]["first"],
         report["source_port_allocation"]["last"],
         report["source_port_allocation"]["tuple_capacity"]
-    ));
+    );
     if !compact {
         if let Some(endpoints) = report["endpoints"].as_object() {
             for (endpoint, details) in endpoints {
                 if details["failed"].as_u64().unwrap_or(0) > 0
                     && details["errors"]["counts"]
                         .as_object()
-                        .is_none_or(|counts| counts.is_empty())
+                        .is_none_or(serde_json::Map::is_empty)
                 {
-                    text.push_str(&format!(
-                    "\nRequest errors — {}: {} failed requests; error details are unavailable in this legacy report.\n",
-                    markdown_text(endpoint), details["failed"]
-                ));
+                    let _ = writeln!(
+                        text,
+                        "\nRequest errors — {}: {} failed requests; error details are unavailable in this legacy report.",
+                        markdown_text(endpoint),
+                        details["failed"]
+                    );
                     continue;
                 }
                 render_error_details(
@@ -835,36 +843,50 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         );
     }
     let connections = &report["connections"];
-    text.push_str(&format!("\n| Connection attempts/s | Established/s | Failed/s | Cancelled |\n|---:|---:|---:|---:|\n| {} | {} | {} | {} |\n",
-        fmt(&connections["attempts_per_second"]), fmt(&connections["connections_per_second"]), fmt(&connections["failed_per_second"]), connections["cancelled"]));
-    text.push_str(&format!("Connection attempts: {} ({} per second); {} established, {} failed, {} cancelled.\n\n| Setup outcome | Samples | Average ms | Median ms | p95 ms | p99 ms | Maximum ms |\n|---|---:|---:|---:|---:|---:|---:|\n",
-        connections["attempts"], fmt(&connections["attempts_per_second"]), connections["established"], connections["failed"], connections["cancelled"]));
+    let _ = writeln!(
+        text,
+        "\n| Connection attempts/s | Established/s | Failed/s | Cancelled |\n|---:|---:|---:|---:|\n| {} | {} | {} | {} |",
+        fmt(&connections["attempts_per_second"]),
+        fmt(&connections["connections_per_second"]),
+        fmt(&connections["failed_per_second"]),
+        connections["cancelled"]
+    );
+    let _ = writeln!(
+        text,
+        "Connection attempts: {} ({} per second); {} established, {} failed, {} cancelled.\n\n| Setup outcome | Samples | Average ms | Median ms | p95 ms | p99 ms | Maximum ms |\n|---|---:|---:|---:|---:|---:|---:|",
+        connections["attempts"],
+        fmt(&connections["attempts_per_second"]),
+        connections["established"],
+        connections["failed"],
+        connections["cancelled"]
+    );
     for (name, key) in [
         ("All", "setup_duration_ms"),
         ("Successful", "successful_setup_duration_ms"),
         ("Failed (including cancelled)", "failed_setup_duration_ms"),
     ] {
         let setup = &connections[key];
-        text.push_str(&format!(
-            "| {name} | {} | {} | {} | {} | {} | {} |\n",
+        let _ = writeln!(
+            text,
+            "| {name} | {} | {} | {} | {} | {} | {} |",
             setup["samples"],
             fmt(&setup["avg_ms"]),
             fmt(&setup["med_ms"]),
             fmt(&setup["p95_ms"]),
             fmt(&setup["p99_ms"]),
             fmt(&setup["max_ms"])
-        ));
+        );
     }
     if let Some(reason) = connections["unavailable_reason"].as_str() {
-        text.push_str(&format!("Connection metrics unavailable: {reason}\n"));
+        let _ = writeln!(text, "Connection metrics unavailable: {reason}");
     }
     text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |\n|---|---|---:|---:|---:|---:|\n");
     if let Some(hosts) = report["network_hosts"]["hosts"].as_object() {
         for host in hosts.values() {
             let observers = host["observed_by"]
                 .as_array()
-                .unwrap()
-                .iter()
+                .into_iter()
+                .flatten()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -879,16 +901,16 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
                     let mbps = |key| {
                         network[key]
                             .as_f64()
-                            .map(|n| json!(n / 1_000_000.0))
-                            .unwrap_or(Value::Null)
+                            .map_or(Value::Null, |n| json!(n / 1_000_000.0))
                     };
-                    text.push_str(&format!(
-                        "| {observers} | {name} | {} | {} | {} | {} |\n",
+                    let _ = writeln!(
+                        text,
+                        "| {observers} | {name} | {} | {} | {} | {} |",
                         fmt(&mbps("receive_bits_per_second")),
                         fmt(&mbps("transmit_bits_per_second")),
                         fmt(&network["receive_packets_per_second"]),
                         fmt(&network["transmit_packets_per_second"])
-                    ));
+                    );
                 }
             }
         }
@@ -902,7 +924,10 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         .chain(std::iter::once(("target", &report["target_telemetry"])));
     for (observer, value) in observations {
         if let Some(reason) = value["unavailable_reason"].as_str() {
-            text.push_str(&format!("| {observer} | {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |\n"));
+            let _ = writeln!(
+                text,
+                "| {observer} | {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |"
+            );
         }
         if let Some(roles) = value["processes"].as_object() {
             for (role, values) in roles {
@@ -910,15 +935,18 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
                     continue;
                 }
                 if let Some(reason) = values["unavailable_reason"].as_str() {
-                    text.push_str(&format!("| {observer} | {role}: {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |\n"));
+                    let _ = writeln!(
+                        text,
+                        "| {observer} | {role}: {reason} | unavailable | unavailable | unavailable | unavailable | unavailable |"
+                    );
                 }
                 for process in values["processes"].as_array().into_iter().flatten() {
                     let rss = process["peak_resident_bytes"]
                         .as_f64()
-                        .map(|n| json!(n / 1048576.0))
-                        .unwrap_or(Value::Null);
-                    text.push_str(&format!(
-                        "| {observer} | {role} / {} | {} | {} | {} | {} / {} | {} |\n",
+                        .map_or(Value::Null, |n| json!(n / 1_048_576.0));
+                    let _ = writeln!(
+                        text,
+                        "| {observer} | {role} / {} | {} | {} | {} | {} / {} | {} |",
                         process["pid"],
                         fmt(&process["cpu_percent_of_one_core"]),
                         fmt(&rss),
@@ -930,7 +958,7 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
                             .as_str()
                             .unwrap_or("unavailable"),
                         process["peak_established_sockets"]
-                    ));
+                    );
                 }
             }
         }
@@ -950,13 +978,14 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
                         .as_str()
                         .or_else(|| limit["unavailable_reason"].as_str())
                         .unwrap_or("unavailable");
-                    text.push_str(&format!(
-                        "| {observer} | {name} | {} |\n",
-                        markdown_text(display)
-                    ));
+                    let _ = writeln!(text, "| {observer} | {name} | {} |", markdown_text(display));
                 }
             }
-            text.push_str(&format!("| {observer} | peak namespace established sockets | {} |\n| {observer} | peak conntrack count | {} |\n", value["peak_namespace_established_sockets"], value["peak_conntrack_count"]));
+            let _ = writeln!(
+                text,
+                "| {observer} | peak namespace established sockets | {} |\n| {observer} | peak conntrack count | {} |",
+                value["peak_namespace_established_sockets"], value["peak_conntrack_count"]
+            );
         }
     }
     text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
@@ -1010,6 +1039,8 @@ fn error_context(example: &Value) -> ErrorContext<'_> {
     }
 }
 
+// Preserve the grouped and deduplicated error presentation in a single pass.
+#[allow(clippy::too_many_lines)]
 fn render_error_details(text: &mut String, title: &str, value: &Value) {
     let Some(counts) = value
         .get("counts")
@@ -1134,7 +1165,9 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
     }
 }
 
-pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
+// Coordinates worker setup, execution, collection, and publication as one run lifecycle.
+#[allow(clippy::too_many_lines)]
+pub(super) fn run(args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
     let cfg = config::parse(args)?;
     if cfg.help {
         print!("{}", config::HELP);
@@ -1223,7 +1256,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                         quote(&remote_dir),
                         quote(&format!("{remote_dir}/results"))
                     )),
-                    &cancelled,
+                    cancelled,
                 )?;
                 checked(
                     scp().arg("--").arg(&binary).arg(destination(
@@ -1231,7 +1264,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                         &ip.to_string(),
                         &format!("{remote_dir}/twelve-dollar-benchmark"),
                     )),
-                    &cancelled,
+                    cancelled,
                 )?;
                 checked(
                     scp().arg("--").arg(&tokens).arg(destination(
@@ -1239,7 +1272,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                         &ip.to_string(),
                         &format!("{remote_dir}/tokens.json"),
                     )),
-                    &cancelled,
+                    cancelled,
                 )?;
                 // Check the copied executable before launching any load on any host.
                 checked(
@@ -1247,7 +1280,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                         "{} --version",
                         quote(&format!("{remote_dir}/twelve-dollar-benchmark"))
                     )),
-                    &cancelled,
+                    cancelled,
                 )?;
                 Ok(())
             })();
@@ -1267,7 +1300,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
             for (worker, ip) in workers.into_iter().zip(ips) {
                 let output = output.clone();
                 let user = user.clone();
-                let cancelled = cancelled.clone();
+                let cancelled = Arc::clone(cancelled);
                 let base_url = cfg.base_url.clone();
                 let destination_ports = destination_ports.clone();
                 let ramp = cfg.ramp_up.clone();
@@ -1343,18 +1376,17 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                             quote(&format!("{dir}/twelve-dollar-benchmark")),
                             quote(&format!("{dir}/cancel"))
                         )),
-                        &cancelled,
+                        cancelled,
                     )?;
                 }
-                (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
+                (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, cancelled);
                 // All SSH sessions are ready before any generator starts.
                 let start_at = (Utc::now().timestamp_millis() + 5000).to_string();
-                start_monitor(&mut monitor, &mut target_unavailable, &start_at, &cancelled);
+                start_monitor(&mut monitor, &mut target_unavailable, &start_at, cancelled);
                 let publications = thread::scope(|scope| {
                     let mut handles = Vec::new();
                     for (ip, dir) in &controls {
                         let start_at = &start_at;
-                        let cancelled = &cancelled;
                         handles.push(scope.spawn(move || {
                             checked(
                                 ssh(user, ip).arg(format!(
@@ -1395,9 +1427,9 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         let dir = output.join("local");
         fs::create_dir(&dir)?;
         let log = File::create(dir.join("output.log"))?;
-        (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, &cancelled);
+        (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, cancelled);
         let start_at = (Utc::now().timestamp_millis() + 1000).to_string();
-        start_monitor(&mut monitor, &mut target_unavailable, &start_at, &cancelled);
+        start_monitor(&mut monitor, &mut target_unavailable, &start_at, cancelled);
         let status = execute(
             Command::new(&binary)
                 .current_dir(&dir)
@@ -1419,7 +1451,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                 .env("BENCH_START_AT", start_at)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log)),
-            &cancelled,
+            cancelled,
         );
         let (exit_code, error) = match status {
             Ok(status) => (
@@ -1523,7 +1555,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
     if workers.iter().any(|worker| worker.error.is_some()) {
         return Ok(2);
     }
-    Ok(if aggregate["passed"] == true { 0 } else { 1 })
+    Ok(u8::from(aggregate["passed"] != true))
 }
 
 #[cfg(test)]

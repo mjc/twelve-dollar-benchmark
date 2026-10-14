@@ -131,7 +131,66 @@ fn save_state(root: &Path, state: &Workflow) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
+fn validate_trial(
+    cfg: &Config,
+    cancelled: &AtomicBool,
+    report: &Value,
+    status: u8,
+    stage: Stage,
+    users: usize,
+    directory: &Path,
+) -> Result<bool> {
+    let passed = report["passed"] == true;
+    if status == 2
+        || cancelled.load(Ordering::Relaxed)
+        || report["completed"] != true
+        || report["runtime_errors"].as_u64() != Some(0)
+    {
+        return Err(format!(
+            "{} at {users} VUs did not complete a valid load run; inspect {}",
+            stage.name(),
+            directory.display()
+        )
+        .into());
+    }
+    if (cfg.monitor_user.is_some() || cfg.user.is_some())
+        && report["target_telemetry"]["unavailable_reason"].is_string()
+    {
+        return Err(format!(
+            "target telemetry is unavailable; inspect {} before continuing the score search",
+            directory.display()
+        )
+        .into());
+    }
+    if passed && (cfg.monitor_user.is_some() || cfg.user.is_some()) {
+        for metric in [
+            "requests_per_second",
+            "service_cpu_percent",
+            "sampled_peak_memory_bytes",
+        ] {
+            if !report["hold"][metric].is_number() {
+                return Err(format!(
+                    "hold metric {metric} is unavailable; inspect {} before continuing",
+                    directory.display()
+                )
+                .into());
+            }
+        }
+    }
+    if report["connections"]["errors"]
+        .as_object()
+        .is_some_and(|errors| {
+            errors.keys().any(|error| {
+                error.contains("AddrNotAvailable") || error.contains("tcp bind source port error")
+            })
+        })
+    {
+        return Err("generator source-port exhaustion invalidates the limit search; add source IPs or generator hosts".into());
+    }
+    Ok(passed)
+}
+
+fn create_run_dir(cfg: &Config) -> Result<PathBuf> {
     let root = cfg.output.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
             "results/score-{}-{}",
@@ -147,6 +206,61 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     fs::create_dir(&root)?;
     let root = fs::canonicalize(root)?;
     fs::create_dir(root.join("trials"))?;
+    Ok(root)
+}
+
+fn run_trial(
+    root: &Path,
+    cfg: &Config,
+    args: &[String],
+    cancelled: &Arc<AtomicBool>,
+    workflow: &mut Workflow,
+    stage: Stage,
+    users: usize,
+) -> Result<(Value, bool, PathBuf)> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("scoring interrupted".into());
+    }
+    let index = workflow.trials.len() + 1;
+    let directory = root
+        .join("trials")
+        .join(format!("{index:02}-{}-{users}", stage.name()));
+    println!(
+        "\n{}: {users} VUs, {} hold{}",
+        stage.name(),
+        stage.duration(),
+        if stage == Stage::Warmup {
+            " (not scored)"
+        } else {
+            ""
+        }
+    );
+    workflow.current = Some(CurrentTrial {
+        stage,
+        users,
+        directory: directory.clone(),
+    });
+    save_state(root, workflow)?;
+    let status = runner::run(&trial_args(args, users, stage, &directory), cancelled)?;
+    let report: Value = serde_json::from_slice(&fs::read(directory.join("aggregate.json"))?)?;
+    workflow.trials.push(Trial {
+        stage,
+        users,
+        scored: stage != Stage::Warmup,
+        passed: report["passed"] == true,
+        completed: report["completed"] == true,
+        p95_ms: report["aggregate"]["p95_ms"].as_f64(),
+        p99_ms: report["aggregate"]["p99_ms"].as_f64(),
+        failure_rate: report["aggregate"]["failure_rate"].as_f64(),
+        report: directory.join("aggregate.json"),
+    });
+    save_state(root, workflow)?;
+    let passed = validate_trial(cfg, cancelled, &report, status, stage, users, &directory)?;
+    Ok((report, passed, directory))
+}
+
+pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
+    let root = create_run_dir(cfg)?;
     println!("Scoring results: {}", root.display());
     let mut state = Workflow {
         completed: false,
@@ -165,96 +279,10 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     let mut confirmed = None;
     let mut last = None;
     let score = find_score(cfg.start_users, cfg.max_users, |stage, users| {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err("scoring interrupted".into());
-        }
-        let index = state.trials.len() + 1;
-        let directory = root
-            .join("trials")
-            .join(format!("{index:02}-{}-{users}", stage.name()));
-        println!(
-            "\n{}: {users} VUs, {} hold{}",
-            stage.name(),
-            stage.duration(),
-            if stage == Stage::Warmup {
-                " (not scored)"
-            } else {
-                ""
-            }
-        );
-        state.current = Some(CurrentTrial {
-            stage,
-            users,
-            directory: directory.clone(),
-        });
-        save_state(&root, &state)?;
-        let status = runner::run(
-            &trial_args(args, users, stage, &directory),
-            cancelled.clone(),
-        )?;
-        let report: Value = serde_json::from_slice(&fs::read(directory.join("aggregate.json"))?)?;
-        let passed = report["passed"] == true;
-        state.trials.push(Trial {
-            stage,
-            users,
-            scored: stage != Stage::Warmup,
-            passed,
-            completed: report["completed"] == true,
-            p95_ms: report["aggregate"]["p95_ms"].as_f64(),
-            p99_ms: report["aggregate"]["p99_ms"].as_f64(),
-            failure_rate: report["aggregate"]["failure_rate"].as_f64(),
-            report: directory.join("aggregate.json"),
-        });
-        save_state(&root, &state)?;
-        if status == 2
-            || cancelled.load(Ordering::Relaxed)
-            || report["completed"] != true
-            || report["runtime_errors"].as_u64() != Some(0)
-        {
-            return Err(format!(
-                "{} at {users} VUs did not complete a valid load run; inspect {}",
-                stage.name(),
-                directory.display()
-            )
-            .into());
-        }
-        if (cfg.monitor_user.is_some() || cfg.user.is_some())
-            && report["target_telemetry"]["unavailable_reason"].is_string()
-        {
-            return Err(format!(
-                "target telemetry is unavailable; inspect {} before continuing the score search",
-                directory.display()
-            )
-            .into());
-        }
-        if passed && (cfg.monitor_user.is_some() || cfg.user.is_some()) {
-            for metric in [
-                "requests_per_second",
-                "service_cpu_percent",
-                "sampled_peak_memory_bytes",
-            ] {
-                if !report["hold"][metric].is_number() {
-                    return Err(format!(
-                        "hold metric {metric} is unavailable; inspect {} before continuing",
-                        directory.display()
-                    )
-                    .into());
-                }
-            }
-        }
-        if report["connections"]["errors"]
-            .as_object()
-            .is_some_and(|errors| {
-                errors.keys().any(|error| {
-                    error.contains("AddrNotAvailable")
-                        || error.contains("tcp bind source port error")
-                })
-            })
-        {
-            return Err("generator source-port exhaustion invalidates the limit search; add source IPs or generator hosts".into());
-        }
+        let (report, passed, directory) =
+            run_trial(&root, cfg, args, cancelled, &mut state, stage, users)?;
         if stage == Stage::Confirm && passed {
-            confirmed = Some((report.clone(), directory.clone()));
+            confirmed = Some((report.clone(), directory));
         }
         last = Some(report);
         Ok(passed)
@@ -325,7 +353,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     }
     print!("{}", runner::render_report(&report, true));
     println!("Full score report: {}", root.join("report.md").display());
-    Ok(if score > 0 { 0 } else { 1 })
+    Ok(u8::from(score == 0))
 }
 
 #[cfg(test)]
@@ -335,7 +363,7 @@ mod tests {
     #[test]
     fn search_excludes_warmup_narrows_and_steps_down_on_confirmation_failure() {
         let mut calls = Vec::new();
-        let score = find_score(2500, 300000, |stage, users| {
+        let score = find_score(2500, 300_000, |stage, users| {
             calls.push((stage, users));
             Ok(match stage {
                 Stage::Warmup => false,
@@ -344,14 +372,16 @@ mod tests {
             })
         })
         .unwrap();
-        assert!(calls[0] == (Stage::Warmup, 1000));
-        assert!(
-            calls[1..4]
-                == [
+        assert_eq!(calls.first(), Some(&(Stage::Warmup, 1000)));
+        assert_eq!(
+            calls.get(1..4),
+            Some(
+                &[
                     (Stage::Search, 2500),
                     (Stage::Search, 5000),
-                    (Stage::Search, 10000)
-                ]
+                    (Stage::Search, 10_000)
+                ][..]
+            )
         );
         assert_eq!(score, 7250);
         assert!(calls.ends_with(&[(Stage::Confirm, 7500), (Stage::Confirm, 7250)]));
@@ -359,9 +389,32 @@ mod tests {
 
     #[test]
     fn failures_at_the_smallest_candidate_produce_zero_without_false_confirmation() {
-        let score = find_score(2500, 300000, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
+        let score = find_score(2500, 300_000, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
         assert_eq!(score, 0);
-        assert!(find_score(2500, 300000, |_, _| Err("control failure".into())).is_err());
+        assert!(find_score(2500, 300_000, |_, _| Err("control failure".into())).is_err());
+    }
+
+    #[test]
+    fn search_confirms_a_non_doubling_ceiling() {
+        let mut calls = Vec::new();
+        let ceiling = 6_750;
+        let score = find_score(2500, ceiling, |stage, users| {
+            calls.push((stage, users));
+            Ok(true)
+        })
+        .unwrap();
+
+        assert_eq!(score, ceiling);
+        assert_eq!(
+            calls,
+            [
+                (Stage::Warmup, 1000),
+                (Stage::Search, 2500),
+                (Stage::Search, 5000),
+                (Stage::Search, ceiling),
+                (Stage::Confirm, ceiling),
+            ]
+        );
     }
 
     #[test]
