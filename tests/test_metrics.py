@@ -43,6 +43,9 @@ class MetricsTests(unittest.TestCase):
         self.connection_combinations = set()
         self.in_flight = 0
         self.requests = 0
+        self.feed_status = 200
+        self.error_body = b'{"error":"queue full"}'
+        self.truncate_error_body = False
         self.observations = []
         self.topology_observations = []
         fixture = self
@@ -84,9 +87,28 @@ class MetricsTests(unittest.TestCase):
                         fixture.in_flight -= 1
 
             def do_GET(self):
-                self.respond(200, json.dumps(
+                status = fixture.feed_status if self.path == "/feed" else 200
+                body = fixture.error_body if status >= 400 else json.dumps(
                     {"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}
-                ).encode())
+                ).encode()
+                if status >= 400 and fixture.truncate_error_body:
+                    with fixture.lock:
+                        fixture.in_flight += 1
+                        fixture.requests += 1
+                    try:
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body) + 64))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        self.wfile.flush()
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.close_connection = True
+                    finally:
+                        with fixture.lock:
+                            fixture.in_flight -= 1
+                else:
+                    self.respond(status, body)
 
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -357,6 +379,42 @@ class MetricsTests(unittest.TestCase):
         report = (output / "report.md").read_text()
         self.assertIn("GET /feed", report)
         self.assertIn("p99", report.lower())
+
+    def test_error_details_capture_http_body_and_truncated_transport(self):
+        self.feed_status = 503
+        body_output = self.root / "http-error"
+        status, log = self.run_benchmark(self.command(self.server.server_port, body_output,
+                                                      users=1, duration="6s"),
+                                         low_descriptor_limit=True)
+        self.assertEqual(status, 1, log)
+        native = json.loads((body_output / "local" / "summary.json").read_text())
+        raw = json.loads((body_output / "local" / "samples.json").read_text())
+        feed = raw[0]["errors"]
+        self.assertFalse(native["native_metrics"])
+        self.assertGreater(feed["counts"]["status:503"], 0)
+        self.assertEqual(feed["counts"]["kind:http"], feed["counts"]["status:503"])
+        self.assertIn("queue full", feed["examples"][0]["body_excerpt"])
+        self.assertFalse(feed["examples"][0]["body_truncated"])
+        aggregate = json.loads((body_output / "aggregate.json").read_text())
+        self.assertEqual(aggregate["aggregate"]["errors"]["counts"]["status:503"],
+                         feed["counts"]["status:503"])
+        worker_log = (body_output / "local" / "output.log").read_text()
+        self.assertIn("BENCH_ERROR", worker_log)
+        self.assertIn("503", worker_log)
+        self.assertIn("queue full", worker_log)
+
+        self.truncate_error_body = True
+        transport_output = self.root / "truncated-error"
+        status, log = self.run_benchmark(self.command(self.server.server_port, transport_output,
+                                                      users=1, duration="6s"),
+                                         low_descriptor_limit=True)
+        self.assertEqual(status, 1, log)
+        raw = json.loads((transport_output / "local" / "samples.json").read_text())
+        feed = raw[0]["errors"]
+        self.assertGreater(feed["counts"]["kind:body_read"], 0)
+        truncated = next(example for example in feed["examples"] if example["kind"] == "body_read")
+        self.assertEqual(truncated["status_code"], 503)
+        self.assertIsNone(truncated["body_excerpt"])
 
     def test_generator_continues_when_hard_limit_caps_descriptor_floor(self):
         output = self.root / "capped"

@@ -99,6 +99,15 @@ JSON records configured targets in `configured_hosts` and `destination_ports`,
 and observed request destinations in `hosts`. Duplicate destination ports are
 removed while preserving their first-occurrence order.
 
+Error details are collected by default in endpoint summaries, aggregate
+summaries, and raw samples. Counts report exact error-kind and HTTP-status
+totals; each report retains at most 100 examples per endpoint, runtime errors,
+and aggregate, with an omitted-example count when the cap is exceeded. Reasons
+and response-body excerpts are each limited to 1 KiB. Examples are also written
+as `BENCH_ERROR` lines to each worker's `output.log` as they occur. This logging
+does not enable Goose's native metric queues; those remain disabled unless a
+native diagnostic is requested.
+
 The reports include total and per-endpoint successful/failed requests per second,
 connection attempts and establishments per second, and setup durations including
 failed and cancelled attempts. Request rates count requests; connection rates

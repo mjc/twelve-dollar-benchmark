@@ -1,5 +1,6 @@
 use super::{
-    config, connections, destinations, load_tokens, parse_source_ips, passes, Samples, ENDPOINTS,
+    config, connections, destinations, errors::ErrorDetails, load_tokens, parse_source_ips, passes,
+    Samples, ENDPOINTS,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,8 @@ struct Report {
     hosts: BTreeSet<String>,
     source_ips: Vec<IpAddr>,
     runtime_errors: usize,
+    #[serde(default)]
+    runtime_error_details: ErrorDetails,
     completed: bool,
     aggregate: Value,
     #[serde(default)]
@@ -562,6 +565,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     let mut maximum_users = 0;
     let mut total_users = 0;
     let mut runtime_errors = 0;
+    let mut runtime_error_details = ErrorDetails::default();
     let mut started: Option<DateTime<Utc>> = None;
     let mut finished: Option<DateTime<Utc>> = None;
     let mut hosts = BTreeSet::new();
@@ -628,6 +632,11 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
                 maximum_users += report.maximum_users;
                 total_users += report.total_users;
                 runtime_errors += report.runtime_errors;
+                let mut runtime_details = report.runtime_error_details;
+                for example in &mut runtime_details.examples {
+                    example.worker = Some(worker.name.clone());
+                }
+                runtime_error_details.merge(&runtime_details);
                 started = Some(started.map_or(report.started_at, |s| s.min(report.started_at)));
                 finished = Some(finished.map_or(report.finished_at, |s| s.max(report.finished_at)));
                 hosts.extend(report.hosts);
@@ -645,9 +654,13 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
                     }
                 }
                 for (combined, mut received) in samples.iter_mut().zip(raw) {
+                    for example in &mut received.errors.examples {
+                        example.worker = Some(worker.name.clone());
+                    }
                     combined.latency_ms.append(&mut received.latency_ms);
                     combined.failed += received.failed;
                     combined.checks_failed += received.checks_failed;
+                    combined.errors.merge(&received.errors);
                 }
             }
             Err(error) => {
@@ -670,6 +683,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         aggregate.latency_ms.extend_from_slice(&sample.latency_ms);
         aggregate.failed += sample.failed;
         aggregate.checks_failed += sample.checks_failed;
+        aggregate.errors.merge(&sample.errors);
         let mut endpoint = serde_json::to_value(sample.summary()).unwrap();
         let duration_s = started
             .zip(finished)
@@ -689,6 +703,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "generator": "goose 0.18.1", "workers": workers,
         "completed": completed, "passed": completed && passes(&summary, runtime_errors),
         "runtime_errors": runtime_errors, "maximum_users": maximum_users,
+        "runtime_error_details": runtime_error_details,
         "total_users": total_users, "hosts": hosts, "source_ips": source_ips,
         "started_at": started, "finished_at": finished,
         "common_hold_s": common_hold_s, "required_hold_s": required_hold,
@@ -711,7 +726,16 @@ fn render_report(report: &Value) -> String {
             .map(|n| format!("{n:.2}"))
             .unwrap_or_else(|| "unavailable".into())
     };
-    let mut text = format!("# Benchmark results\n\n{}; {} requests over {} seconds.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n", if report["passed"] == true {"PASS"} else {"FAIL"}, report["aggregate"]["requests"], fmt(&report["duration_s"]));
+    let mut text = format!(
+        "# Benchmark results\n\n{}; {} requests over {} seconds.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
+        if report["passed"] == true {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        report["aggregate"]["requests"],
+        fmt(&report["duration_s"])
+    );
     if let Some(endpoints) = report["endpoints"].as_object() {
         for (name, endpoint) in endpoints {
             text.push_str(&format!(
@@ -724,6 +748,31 @@ fn render_report(report: &Value) -> String {
             ));
         }
     }
+    if let Some(endpoints) = report["endpoints"].as_object() {
+        for (endpoint, details) in endpoints {
+            if details["failed"].as_u64().unwrap_or(0) > 0
+                && details["errors"]["counts"]
+                    .as_object()
+                    .is_none_or(|counts| counts.is_empty())
+            {
+                text.push_str(&format!(
+                    "\nRequest errors — {}: {} failed requests; error details are unavailable in this legacy report.\n",
+                    markdown_text(endpoint), details["failed"]
+                ));
+                continue;
+            }
+            render_error_details(
+                &mut text,
+                &format!("Request errors — {}", markdown_text(endpoint)),
+                &details["errors"],
+            );
+        }
+    }
+    render_error_details(
+        &mut text,
+        "Runtime errors",
+        &report["runtime_error_details"],
+    );
     let connections = &report["connections"];
     text.push_str(&format!("\nConnections: {} established/s, {} failed attempts/s; setup p95 {} ms, p99 {} ms (successes and failures).\n", fmt(&connections["connections_per_second"]), fmt(&connections["failed_per_second"]), fmt(&connections["setup_duration_ms"]["p95_ms"]), fmt(&connections["setup_duration_ms"]["p99_ms"])));
     if let Some(reason) = connections["unavailable_reason"].as_str() {
@@ -795,6 +844,98 @@ fn render_report(report: &Value) -> String {
     }
     text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
     text
+}
+
+fn markdown_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' => " ".into(),
+            '&' => "&amp;".into(),
+            '<' => "&lt;".into(),
+            '>' => "&gt;".into(),
+            '|' => "&#124;".into(),
+            '\\' => "&#92;".into(),
+            '*' => "&#42;".into(),
+            '_' => "&#95;".into(),
+            '[' => "&#91;".into(),
+            ']' => "&#93;".into(),
+            '#' => "&#35;".into(),
+            '`' => "&#96;".into(),
+            ch if ch.is_control() => " ".into(),
+            ch => ch.to_string(),
+        })
+        .collect::<String>()
+}
+
+fn render_error_details(text: &mut String, title: &str, value: &Value) {
+    let Some(counts) = value["counts"]
+        .as_object()
+        .filter(|counts| !counts.is_empty())
+    else {
+        return;
+    };
+    text.push_str(&format!("\n{title}:\n"));
+    for (kind, count) in counts {
+        text.push_str(&format!("- {}: {}\n", markdown_text(kind), count));
+    }
+    if let Some(examples) = value["examples"].as_array() {
+        for example in examples.iter().take(5) {
+            let worker = example["worker"].as_str().map(markdown_text);
+            let endpoint = example["endpoint"]
+                .as_str()
+                .map(markdown_text)
+                .unwrap_or_default();
+            let path = example["path"]
+                .as_str()
+                .map(markdown_text)
+                .unwrap_or_default();
+            let kind = example["kind"]
+                .as_str()
+                .map(markdown_text)
+                .unwrap_or_default();
+            let reason = example["reason"]
+                .as_str()
+                .map(markdown_text)
+                .unwrap_or_default();
+            let status = example["status_code"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "no HTTP status".into());
+            text.push_str(&format!(
+                "- {}{} {} {}: {} ({})\n",
+                worker
+                    .as_deref()
+                    .map(|name| format!("{name}: "))
+                    .unwrap_or_default(),
+                endpoint,
+                path,
+                status,
+                kind,
+                reason
+            ));
+            if let Some(body) = example["body_excerpt"].as_str() {
+                let encoded =
+                    serde_json::to_string(body).unwrap_or_else(|_| "\"unavailable\"".into());
+                text.push_str(&format!(
+                    "    {}{}\n",
+                    markdown_text(&encoded),
+                    if example["body_truncated"] == true {
+                        " [truncated]"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        let hidden = examples.len().saturating_sub(5);
+        if hidden > 0 {
+            text.push_str(&format!("- {hidden} stored examples not shown.\n"));
+        }
+    }
+    if let Some(omitted) = value["omitted"].as_u64().filter(|n| *n > 0) {
+        text.push_str(&format!("- {omitted} additional examples omitted.\n"));
+    }
 }
 
 pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
@@ -1178,6 +1319,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::errors::example;
     use super::*;
 
     fn fixture(name: &str, samples: Vec<f64>, offset: i64) -> (PathBuf, Worker) {
@@ -1259,6 +1401,62 @@ mod tests {
         assert_eq!(result["completed"], false);
         assert!(worker.error.is_some());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_error_details_merge_counts_and_keep_bounded_host_attribution() {
+        let (dir, first) = fixture("errors-a", vec![10.0], 0);
+        let (other, second) = fixture("errors-b", vec![11.0], 0);
+        fs::rename(other.join(&second.name), dir.join(&second.name)).unwrap();
+        for worker in [&first, &second] {
+            let path = dir.join(&worker.name).join("samples.json");
+            let mut raw: [Samples; 4] =
+                serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+            raw[0].latency_ms = vec![10.0; 101];
+            raw[0].failed = 101;
+            for _ in 0..101 {
+                raw[0].errors.record(example(
+                    "GET /feed",
+                    "/feed",
+                    Some(503),
+                    "http",
+                    "queue full",
+                    Some(b"busy"),
+                    worker.user_offset,
+                    "http://fixture.test:3000",
+                    Some("192.0.2.1".into()),
+                ));
+            }
+            let mut aggregate = Samples {
+                latency_ms: vec![10.0; 101],
+                failed: 101,
+                ..Samples::default()
+            };
+            aggregate.errors.merge(&raw[0].errors);
+            let summary_path = dir.join(&worker.name).join("summary.json");
+            let mut summary: Value =
+                serde_json::from_reader(File::open(&summary_path).unwrap()).unwrap();
+            summary["aggregate"] = serde_json::to_value(aggregate.summary()).unwrap();
+            serde_json::to_writer(File::create(summary_path).unwrap(), &summary).unwrap();
+            serde_json::to_writer(File::create(path).unwrap(), &raw).unwrap();
+        }
+
+        let mut workers = vec![first, second];
+        let result = collect(&dir, &mut workers);
+        let errors = &result["endpoints"]["GET /feed"]["errors"];
+        assert_eq!(errors["counts"]["kind:http"], 202);
+        assert_eq!(errors["counts"]["status:503"], 202);
+        assert_eq!(errors["examples"].as_array().unwrap().len(), 100);
+        assert_eq!(errors["omitted"], 102);
+        assert_eq!(result["aggregate"]["errors"]["counts"]["status:503"], 202);
+        assert!(errors["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["worker"].is_string()));
+        assert_eq!(result["aggregate"]["failed"], 202);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other).unwrap();
     }
     #[test]
     fn total_users_split_evenly_with_disjoint_token_offsets() {

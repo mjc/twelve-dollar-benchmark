@@ -23,6 +23,7 @@ use std::{
 mod config;
 mod connections;
 mod destinations;
+mod errors;
 mod runner;
 mod telemetry;
 
@@ -56,6 +57,8 @@ struct Samples {
     latency_ms: Vec<f64>,
     failed: usize,
     checks_failed: usize,
+    #[serde(default)]
+    errors: errors::ErrorDetails,
 }
 
 type Metrics = Arc<Mutex<[Samples; 4]>>;
@@ -71,6 +74,7 @@ struct Summary {
     p95_ms: Option<f64>,
     p99_ms: Option<f64>,
     max_ms: Option<f64>,
+    errors: errors::ErrorDetails,
 }
 
 impl Samples {
@@ -87,6 +91,7 @@ impl Samples {
             p95_ms: percentile(&self.latency_ms, 0.95),
             p99_ms: percentile(&self.latency_ms, 0.99),
             max_ms: self.latency_ms.last().copied(),
+            errors: self.errors.clone(),
         }
     }
 }
@@ -114,14 +119,35 @@ fn passes(summary: &Summary, runtime_errors: usize) -> bool {
 fn track_errors(
     function: TransactionFunction,
     runtime_errors: Arc<AtomicUsize>,
+    runtime_error_details: Arc<Mutex<errors::ErrorDetails>>,
+    user_offset: usize,
+    source_ips: Arc<Vec<IpAddr>>,
 ) -> TransactionFunction {
     Arc::new(move |user| {
         let function = function.clone();
         let runtime_errors = runtime_errors.clone();
+        let runtime_error_details = runtime_error_details.clone();
+        let source_ips = source_ips.clone();
         Box::pin(async move {
             let result = function(user).await;
-            if result.is_err() {
+            if let Err(error) = &result {
                 runtime_errors.fetch_add(1, Ordering::Relaxed);
+                runtime_error_details
+                    .lock()
+                    .unwrap()
+                    .record(errors::example(
+                        "transaction",
+                        "",
+                        None,
+                        "runtime",
+                        errors::error_chain(error),
+                        None,
+                        user_offset + user.weighted_users_index,
+                        user.base_url.as_str(),
+                        source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    ));
             }
             result
         })
@@ -153,6 +179,13 @@ fn run_completed(metrics: &GooseMetrics, interrupted: bool) -> bool {
 fn http_success(status: u16) -> bool {
     // k6's default expected-response range; endpoint checks are separate.
     (200..400).contains(&status)
+}
+
+fn request_failure_kind(error: &TransactionError) -> &'static str {
+    match error {
+        TransactionError::Reqwest(error) if error.is_builder() => "request_builder",
+        _ => "transport",
+    }
 }
 
 fn check_success(endpoint: usize, status: u16) -> bool {
@@ -239,6 +272,7 @@ fn build_client(
 
 // Read every body before stopping the score timer, including errors and writes.
 // Goose's native timer stops at headers and remains useful for diagnostics only.
+#[allow(clippy::too_many_arguments)] // Keep request inputs visible at the call sites.
 async fn request(
     user: &mut GooseUser,
     metrics: &Metrics,
@@ -246,13 +280,35 @@ async fn request(
     path: &str,
     auth: Option<&Token>,
     body: Option<&serde_json::Value>,
+    user_offset: usize,
+    source_ips: &[IpAddr],
 ) -> Result<Option<Vec<u8>>, Box<TransactionError>> {
     let method = if endpoint < 2 {
         GooseMethod::Get
     } else {
         GooseMethod::Post
     };
-    let mut builder = user.get_request_builder(&method, path)?;
+    let mut builder = match user.get_request_builder(&method, path) {
+        Ok(builder) => builder,
+        Err(error) => {
+            metrics.lock().unwrap()[endpoint]
+                .errors
+                .record(errors::example(
+                    ENDPOINTS[endpoint],
+                    path,
+                    None,
+                    "request_builder",
+                    errors::error_chain(&error),
+                    None,
+                    user_offset + user.weighted_users_index,
+                    user.base_url.as_str(),
+                    source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                ));
+            return Err(error);
+        }
+    };
     if let Some(token) = auth {
         builder = builder
             .bearer_auth(&token.token)
@@ -268,13 +324,84 @@ async fn request(
         .set_request_builder(builder)
         .build();
     let started = Instant::now();
-    let mut response = user.request(goose_request).await?;
-    let status = response.request.status_code;
-    let bytes = match response.response {
-        Ok(response) => response.bytes().await.ok().map(|bytes| bytes.to_vec()),
-        Err(_) => None,
+    let mut response = match user.request(goose_request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let kind = request_failure_kind(&error);
+            metrics.lock().unwrap()[endpoint]
+                .errors
+                .record(errors::example(
+                    ENDPOINTS[endpoint],
+                    path,
+                    None,
+                    kind,
+                    errors::error_chain(&error),
+                    None,
+                    user_offset + user.weighted_users_index,
+                    user.base_url.as_str(),
+                    source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                ));
+            return Err(error);
+        }
     };
-    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let status = response.request.status_code;
+    let mut captured_latency_ms = None;
+    let bytes = match response.response {
+        Ok(response) => match response.bytes().await {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(error) => {
+                let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                captured_latency_ms = Some(latency_ms);
+                metrics.lock().unwrap()[endpoint].errors.record(
+                    errors::example(
+                        ENDPOINTS[endpoint],
+                        path,
+                        Some(status),
+                        "body_read",
+                        errors::error_chain(&error.without_url()),
+                        None,
+                        user_offset + user.weighted_users_index,
+                        user.base_url.as_str(),
+                        source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    )
+                    .with_latency(latency_ms),
+                );
+                None
+            }
+        },
+        Err(error) => {
+            let kind = if error.is_builder() {
+                "request_builder"
+            } else {
+                "transport"
+            };
+            let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+            captured_latency_ms = Some(latency_ms);
+            metrics.lock().unwrap()[endpoint].errors.record(
+                errors::example(
+                    ENDPOINTS[endpoint],
+                    path,
+                    None,
+                    kind,
+                    errors::error_chain(&error.without_url()),
+                    None,
+                    user_offset + user.weighted_users_index,
+                    user.base_url.as_str(),
+                    source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                )
+                .with_latency(latency_ms),
+            );
+            None
+        }
+    };
+    let latency_ms =
+        captured_latency_ms.unwrap_or_else(|| started.elapsed().as_secs_f64() * 1000.0);
     let success = http_success(status) && bytes.is_some();
     {
         let mut metrics = metrics.lock().unwrap();
@@ -282,6 +409,41 @@ async fn request(
         samples.latency_ms.push(latency_ms);
         samples.failed += usize::from(!success);
         samples.checks_failed += usize::from(!check_success(endpoint, status) || bytes.is_none());
+        if !http_success(status) && bytes.is_some() {
+            samples.errors.record(
+                errors::example(
+                    ENDPOINTS[endpoint],
+                    path,
+                    Some(status),
+                    "http",
+                    format!("HTTP status {status}"),
+                    bytes.as_deref(),
+                    user_offset + user.weighted_users_index,
+                    user.base_url.as_str(),
+                    source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                )
+                .with_latency(latency_ms),
+            );
+        } else if bytes.is_some() && http_success(status) && !check_success(endpoint, status) {
+            samples.errors.record(
+                errors::example(
+                    ENDPOINTS[endpoint],
+                    path,
+                    Some(status),
+                    "check",
+                    format!("unexpected HTTP status {status}"),
+                    None,
+                    user_offset + user.weighted_users_index,
+                    user.base_url.as_str(),
+                    source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                )
+                .with_latency(latency_ms),
+            );
+        }
     }
     if !user.config.no_metrics && success {
         user.set_success(&mut response.request)?;
@@ -303,10 +465,21 @@ async fn browse(
     tokens: &[Token],
     metrics: &Metrics,
     user_offset: usize,
+    source_ips: &[IpAddr],
 ) -> TransactionResult {
     let user_index = user_offset + user.weighted_users_index;
     let token = &tokens[user_index % tokens.len()];
-    let feed = request(user, metrics, 0, "/feed", None, None).await?;
+    let feed = request(
+        user,
+        metrics,
+        0,
+        "/feed",
+        None,
+        None,
+        user_offset,
+        source_ips,
+    )
+    .await?;
     let Some(feed) = feed else {
         think(3.0, 7.0).await;
         return Ok(());
@@ -320,12 +493,38 @@ async fn browse(
     let Some(post_id) = post_id else {
         // A malformed/empty feed cannot produce a post request. Surface this as
         // a check failure without changing k6's HTTP failure definition.
-        metrics.lock().unwrap()[0].checks_failed += 1;
+        {
+            let mut metrics = metrics.lock().unwrap();
+            metrics[0].checks_failed += 1;
+            metrics[0].errors.record(errors::example(
+                ENDPOINTS[0],
+                "/feed",
+                Some(200),
+                "check",
+                "feed body was empty or malformed",
+                None,
+                user_index,
+                user.base_url.as_str(),
+                source_ips
+                    .get(user.weighted_users_index % source_ips.len().max(1))
+                    .map(ToString::to_string),
+            ));
+        }
         think(3.0, 7.0).await;
         return Ok(());
     };
     think(3.0, 7.0).await;
-    request(user, metrics, 1, &format!("/posts/{post_id}"), None, None).await?;
+    request(
+        user,
+        metrics,
+        1,
+        &format!("/posts/{post_id}"),
+        None,
+        None,
+        user_offset,
+        source_ips,
+    )
+    .await?;
     think(3.0, 8.0).await;
     if rand::rng().random_bool(0.15) {
         request(
@@ -335,6 +534,8 @@ async fn browse(
             &format!("/posts/{post_id}/like"),
             Some(token),
             None,
+            user_offset,
+            source_ips,
         )
         .await?;
     }
@@ -346,7 +547,17 @@ async fn browse(
             user_index + 1,
             user.get_iterations(),
         ) });
-        request(user, metrics, 3, "/posts", Some(token), Some(&body)).await?;
+        request(
+            user,
+            metrics,
+            3,
+            "/posts",
+            Some(token),
+            Some(&body),
+            user_offset,
+            source_ips,
+        )
+        .await?;
     }
     think(5.0, 15.0).await;
     Ok(())
@@ -415,7 +626,10 @@ fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Erro
         }
     }
     if limit.rlim_cur < desired {
-        eprintln!("Generator descriptor soft limit capped at {}; hard limit prevents reaching {} ({} users plus overhead)", limit.rlim_cur, desired, users);
+        eprintln!(
+            "Generator descriptor soft limit capped at {}; hard limit prevents reaching {} ({} users plus overhead)",
+            limit.rlim_cur, desired, users
+        );
     }
     if limit.rlim_cur < required {
         return Err(format!("Generator descriptor soft limit {} is below {} users plus process overhead; increase its hard limit before starting the load", limit.rlim_cur, users).into());
@@ -482,6 +696,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
     let connection_metrics = Arc::new(Mutex::new(connections::Connections::default()));
     let runtime_errors = Arc::new(AtomicUsize::new(0));
+    let runtime_error_details = Arc::new(Mutex::new(errors::ErrorDetails::default()));
     let startup_ips = source_ips.clone();
     let client_ips = source_ips.clone();
     let client_connections = connection_metrics.clone();
@@ -511,10 +726,12 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         })
     });
     let browse_metrics = metrics.clone();
+    let browse_source_ips = source_ips.clone();
     let browsing: TransactionFunction = Arc::new(move |user| {
         let tokens = tokens.clone();
         let metrics = browse_metrics.clone();
-        Box::pin(async move { browse(user, &tokens, &metrics, user_offset).await })
+        let source_ips = browse_source_ips.clone();
+        Box::pin(async move { browse(user, &tokens, &metrics, user_offset, &source_ips).await })
     });
     if let Ok(start_at) = env::var("BENCH_START_AT") {
         let remaining = start_at.parse::<i64>()? - Utc::now().timestamp_millis();
@@ -558,13 +775,25 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         .register_scenario(
             scenario!("Feed browser")
                 .register_transaction(
-                    Transaction::new(track_errors(startup, runtime_errors.clone()))
-                        .set_name("Start user")
-                        .set_on_start(),
+                    Transaction::new(track_errors(
+                        startup,
+                        runtime_errors.clone(),
+                        runtime_error_details.clone(),
+                        user_offset,
+                        source_ips.clone(),
+                    ))
+                    .set_name("Start user")
+                    .set_on_start(),
                 )
                 .register_transaction(
-                    Transaction::new(track_errors(browsing, runtime_errors.clone()))
-                        .set_name("Browse feed"),
+                    Transaction::new(track_errors(
+                        browsing,
+                        runtime_errors.clone(),
+                        runtime_error_details.clone(),
+                        user_offset,
+                        source_ips.clone(),
+                    ))
+                    .set_name("Browse feed"),
                 ),
         )
         .execute()
@@ -577,6 +806,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         aggregate.latency_ms.extend_from_slice(&samples.latency_ms);
         aggregate.failed += samples.failed;
         aggregate.checks_failed += samples.checks_failed;
+        aggregate.errors.merge(&samples.errors);
         let mut endpoint_summary = serde_json::to_value(samples.summary())?;
         if let serde_json::Value::Object(rates) =
             connections::request_rates(samples, run_duration_s(&results))
@@ -616,6 +846,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "completed": completed,
         "runtime_errors": runtime_errors,
+        "runtime_error_details": &*runtime_error_details.lock().unwrap(),
         "passed": passed,
         "aggregate": summary,
         "request_rates": connections::request_rates(&aggregate, run_duration_s(&results)),
@@ -1165,22 +1396,43 @@ mod tests {
         config.no_metrics = true;
         let mut user = GooseUser::single("http://127.0.0.1:1".parse().unwrap(), &config).unwrap();
         let runtime_errors = Arc::new(AtomicUsize::new(0));
-        let function: TransactionFunction = Arc::new(|user| {
+        let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+        let request_metrics = metrics.clone();
+        let function: TransactionFunction = Arc::new(move |user| {
+            let metrics = request_metrics.clone();
             Box::pin(async move {
-                let metrics: Metrics =
-                    Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
                 let token = Token {
                     username: "test-user".into(),
                     token: "bad\ntoken".into(),
                 };
-                request(user, &metrics, 2, "/posts/42/like", Some(&token), None).await?;
+                request(
+                    user,
+                    &metrics,
+                    2,
+                    "/posts/42/like",
+                    Some(&token),
+                    None,
+                    0,
+                    &[],
+                )
+                .await?;
                 Ok(())
             })
         });
-        let tracked = track_errors(function, runtime_errors.clone());
+        let tracked = track_errors(
+            function,
+            runtime_errors.clone(),
+            Arc::new(Mutex::new(errors::ErrorDetails::default())),
+            0,
+            Arc::new(Vec::new()),
+        );
         // Bypass preflight to exercise an unexpected runtime construction error.
         assert!(tracked(&mut user).await.is_err());
         assert_eq!(runtime_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.lock().unwrap()[2].errors.counts["kind:request_builder"],
+            1
+        );
         let mut healthy_samples = Samples {
             latency_ms: vec![10.0; 100],
             ..Default::default()
@@ -1232,7 +1484,8 @@ mod tests {
                 ),
                 ("/posts/42/like", "201 Created", r#"{"liked":true}"#),
                 ("/posts", "201 Created", r#"{"post":{"id":43}}"#),
-                ("/feed", "200 OK", "truncated"),
+                ("/feed", "503 Service Unavailable", "truncated"),
+                ("/posts/42", "201 Created", "truncated"),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -1292,7 +1545,7 @@ mod tests {
             username: "test-user".into(),
             token: "test-token".into(),
         };
-        let feed = request(&mut user, &metrics, 0, "/feed", None, None)
+        let feed = request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
             .await
             .unwrap()
             .unwrap();
@@ -1300,34 +1553,51 @@ mod tests {
             serde_json::from_slice::<Feed>(&feed).unwrap().posts[0].id,
             42
         );
-        assert!(request(&mut user, &metrics, 1, "/posts/42", None, None)
-            .await
-            .unwrap()
-            .is_none());
         assert!(
-            request(&mut user, &metrics, 2, "/posts/42/like", Some(&token), None)
+            request(&mut user, &metrics, 1, "/posts/42", None, None, 0, &[])
                 .await
                 .unwrap()
-                .is_some()
+                .is_none()
         );
+        assert!(request(
+            &mut user,
+            &metrics,
+            2,
+            "/posts/42/like",
+            Some(&token),
+            None,
+            0,
+            &[]
+        )
+        .await
+        .unwrap()
+        .is_some());
         assert!(request(
             &mut user,
             &metrics,
             3,
             "/posts",
             Some(&token),
-            Some(&serde_json::json!({"body":"test post"}))
+            Some(&serde_json::json!({"body":"test post"})),
+            0,
+            &[],
         )
         .await
         .unwrap()
         .is_some());
-        assert!(request(&mut user, &metrics, 0, "/feed", None, None)
+        assert!(request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
             .await
             .unwrap()
             .is_none());
+        assert!(
+            request(&mut user, &metrics, 1, "/posts/42", None, None, 0, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
         server.join().unwrap();
         // The listener is now closed: connection failures still contribute a sample.
-        assert!(request(&mut user, &metrics, 0, "/feed", None, None)
+        assert!(request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
             .await
             .unwrap()
             .is_none());
@@ -1336,8 +1606,25 @@ mod tests {
         assert!(metrics[0].latency_ms[0] >= 80.0);
         assert_eq!(metrics[0].failed, 2);
         assert_eq!(metrics[0].checks_failed, 2);
-        assert_eq!(metrics[1].failed, 1);
+        assert_eq!(metrics[1].failed, 2);
+        assert_eq!(metrics[1].checks_failed, 2);
         assert_eq!(metrics[2].failed, 0);
         assert_eq!(metrics[3].failed, 0);
+        assert_eq!(metrics[0].errors.counts["status:503"], 1);
+        assert_eq!(metrics[0].errors.counts["kind:body_read"], 1);
+        assert_eq!(metrics[0].errors.examples.len(), 2);
+        let body_error = metrics[0]
+            .errors
+            .examples
+            .iter()
+            .find(|example| example.kind == "body_read")
+            .unwrap();
+        assert_eq!(body_error.status_code, Some(503));
+        assert!(body_error.latency_ms.unwrap() >= 80.0);
+        assert_eq!(metrics[1].errors.counts["status:500"], 1);
+        assert_eq!(metrics[0].errors.counts["kind:transport"], 1);
+        assert_eq!(metrics[1].errors.counts["status:201"], 1);
+        assert_eq!(metrics[1].errors.counts["kind:body_read"], 1);
+        assert!(!metrics[1].errors.counts.contains_key("kind:check"));
     }
 }

@@ -265,13 +265,17 @@ class CoordinatorTests(unittest.TestCase):
         fixture = self
         self.requests = 0
         self.feed_status = 200
+        self.error_bodies = {}
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
             def do_GET(self):
                 fixture.requests += 1
-                body = json.dumps({"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}).encode()
-                self.send_response(fixture.feed_status if self.path == "/feed" else 200)
+                status = fixture.feed_status if self.path == "/feed" else 200
+                body = (fixture.error_bodies.get(self.server.server_port, b"queue full")
+                        if status >= 400 else
+                        json.dumps({"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}).encode())
+                self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -380,6 +384,33 @@ class CoordinatorTests(unittest.TestCase):
         lower = int(rank)
         expected = samples[lower] + (samples[min(lower + 1, len(samples) - 1)] - samples[lower]) * (rank - lower)
         self.assertAlmostEqual(report["aggregate"]["p99_ms"], expected)
+
+    def test_ssh_aggregation_keeps_error_counts_reasons_and_worker_attribution(self):
+        self.feed_status = 503
+        self.error_bodies[self.server.server_port] = b"first host queue full"
+        second = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.server.RequestHandlerClass)
+        second_thread = threading.Thread(target=second.serve_forever, daemon=True)
+        second_thread.start()
+        self.addCleanup(lambda: (second.shutdown(), second.server_close(), second_thread.join()))
+        self.error_bodies[second.server_port] = b"second host overloaded"
+        run, report = self.run_coordinator(extra=["--request-log", "native.log",
+                                                  "--destination-ports", f"{self.server.server_port},{second.server_port}"])
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        feed = report["endpoints"]["GET /feed"]["errors"]
+        self.assertGreaterEqual(feed["counts"]["status:503"], 2)
+        self.assertEqual(feed["counts"]["kind:http"], feed["counts"]["status:503"])
+        self.assertEqual(report["aggregate"]["failed"],
+                         sum(endpoint["failed"] for endpoint in report["endpoints"].values()))
+        examples = feed["examples"]
+        self.assertTrue(any("first host queue full" in example["body_excerpt"] for example in examples))
+        self.assertTrue(any("second host overloaded" in example["body_excerpt"] for example in examples))
+        self.assertEqual({example["worker"] for example in examples},
+                         {worker["name"] for worker in report["workers"]})
+        self.assertEqual(report["aggregate"]["errors"]["counts"]["status:503"],
+                         feed["counts"]["status:503"])
+        rendered = (self.root / "results" / "report.md").read_text()
+        self.assertIn("first host queue full", rendered)
+        self.assertIn("second host overloaded", rendered)
 
     def test_failed_upload_never_launches_any_generator(self):
         self.env["UPLOAD_FAIL"] = "1"
