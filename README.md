@@ -28,7 +28,7 @@ directory.
 Without `--users` or `VUS`, the runner finds a score. It warms up at 1,000 users
 for two minutes without scoring, starts at `--start-users` (2,500 by default) and doubles until a run
 fails, then narrows the passing/failing bracket to 250 users. Search runs use
-the workload's five-minute hold. A separate five-minute run confirms the result;
+one-minute holds. A separate five-minute run confirms the result;
 if it fails, the runner steps down by 250 users and tries again. Each run also
 includes the configured ramp-up, 30-second ramp-down, and drain. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.

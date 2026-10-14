@@ -33,7 +33,8 @@ impl Stage {
     fn duration(self) -> &'static str {
         match self {
             Self::Warmup => "2m",
-            Self::Search | Self::Confirm => "5m",
+            Self::Search => "1m",
+            Self::Confirm => "5m",
         }
     }
 }
@@ -164,7 +165,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         current: None,
         protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users, "maximum_search_users": cfg.max_users,
             "search_step_users": cfg.step_users,
-            "search_hold_s": 300, "confirmation_hold_s": 300, "resolution_users": 250,
+            "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
             "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
         trials: Vec::new(),
         error: None,
@@ -380,7 +381,7 @@ mod tests {
         let config = crate::config::parse(&args).unwrap();
         assert!(!config.score);
         assert_eq!(config.users, 2500);
-        assert_eq!(config.duration, "5m");
+        assert_eq!(config.duration, "1m");
         assert_eq!(config.diagnostics, ["--report-file", "native.html"]);
     }
 }

@@ -57,7 +57,7 @@ workload overrides are rejected so they cannot change the target or total load.
 Pass short diagnostic flags separately (for example, -v -v rather than -vv).
 
 Without --users or VUS, run the scoring workflow: 1,000-user two-minute
-unscored warm-up; five-minute searches from --start-users (2,500), doubling then narrowing to
+unscored warm-up; one-minute searches from --start-users (2,500), doubling then narrowing to
 250 users; a separate five-minute confirmation, stepping down 250 on failure.
 --step-users selects fixed search increments; narrowing and confirmation remain at 250.
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
