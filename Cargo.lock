@@ -1528,7 +1528,6 @@ dependencies = [
  "chrono",
  "goose",
  "gumdrop",
- "hyper-util",
  "libc",
  "rand",
  "reqwest",
