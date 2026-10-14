@@ -401,6 +401,21 @@ struct GooseAttackRunState {
     canceling: bool,
 }
 
+// Absolute progress keeps sub-millisecond user intervals from rounding to zero.
+fn ramp_users(previous: usize, target: usize, duration_ms: usize, elapsed_ms: u128) -> usize {
+    if duration_ms == 0 {
+        return target;
+    }
+    let delta = previous.abs_diff(target) as u128;
+    let progressed =
+        (delta * elapsed_ms.min(duration_ms as u128) / duration_ms as u128 + 1).min(delta) as usize;
+    if target >= previous {
+        previous + progressed
+    } else {
+        previous - progressed
+    }
+}
+
 /// Global internal state for the load test.
 pub struct GooseAttack {
     /// An optional transaction that is run one time before starting GooseUsers and running Scenarios.
@@ -1455,12 +1470,21 @@ impl GooseAttack {
                 * 1_000.0;
 
             // Determine if it's time to spawn a GooseUser.
-            if goose_attack_run_state.adjust_user_in_ms == 0
-                || util::ms_timer_expired(
-                    goose_attack_run_state.adjust_user_timer,
-                    goose_attack_run_state.adjust_user_in_ms,
+            let ready = if increase_rate > 1_000.0 {
+                goose_attack_run_state.active_users < ramp_users(
+                    previous_users,
+                    self.test_plan.steps[self.test_plan.current].0,
+                    self.test_plan.steps[self.test_plan.current].1,
+                    self.step_elapsed(),
                 )
-            {
+            } else {
+                goose_attack_run_state.adjust_user_in_ms == 0
+                    || util::ms_timer_expired(
+                        goose_attack_run_state.adjust_user_timer,
+                        goose_attack_run_state.adjust_user_in_ms,
+                    )
+            };
+            if ready {
                 let mut thread_user = match self.pop_user() {
                     Ok(user) => user,
                     Err(error) => {
@@ -1544,7 +1568,9 @@ impl GooseAttack {
             } else {
                 // Wake up twice a second to handle messages and allow for a quick shutdown if the
                 // load test is canceled during startup.
-                let sleep_duration = if goose_attack_run_state.adjust_user_in_ms > 500 {
+                let sleep_duration = if increase_rate > 1_000.0 {
+                    Duration::from_millis(1)
+                } else if goose_attack_run_state.adjust_user_in_ms > 500 {
                     Duration::from_millis(500)
                 } else {
                     Duration::from_millis(goose_attack_run_state.adjust_user_in_ms as u64)
@@ -1693,12 +1719,21 @@ impl GooseAttack {
                 * 1_000.0;
 
             // Determine if it's time to decrease a GooseUser.
-            if goose_attack_run_state.adjust_user_in_ms == 0
-                || util::ms_timer_expired(
-                    goose_attack_run_state.adjust_user_timer,
-                    goose_attack_run_state.adjust_user_in_ms,
+            let ready = if decrease_rate > 1_000.0 {
+                goose_attack_run_state.active_users > ramp_users(
+                    previous_users,
+                    self.test_plan.steps[self.test_plan.current].0,
+                    self.test_plan.steps[self.test_plan.current].1,
+                    self.step_elapsed(),
                 )
-            {
+            } else {
+                goose_attack_run_state.adjust_user_in_ms == 0
+                    || util::ms_timer_expired(
+                        goose_attack_run_state.adjust_user_timer,
+                        goose_attack_run_state.adjust_user_in_ms,
+                    )
+            };
+            if ready {
                 // Reset the adjust timer.
                 goose_attack_run_state.adjust_user_timer = std::time::Instant::now();
 
@@ -1733,7 +1768,9 @@ impl GooseAttack {
             } else {
                 // Wake up twice a second to handle messages and allow for a quick shutdown if the
                 // load test is canceled during decrease.
-                let sleep_duration = if goose_attack_run_state.adjust_user_in_ms > 500 {
+                let sleep_duration = if decrease_rate > 1_000.0 {
+                    Duration::from_millis(1)
+                } else if goose_attack_run_state.adjust_user_in_ms > 500 {
                     Duration::from_millis(500)
                 } else {
                     Duration::from_millis(goose_attack_run_state.adjust_user_in_ms as u64)

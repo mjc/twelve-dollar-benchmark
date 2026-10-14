@@ -35,5 +35,12 @@ Two local unit tests cover compact storage, deferred factory calls, weighted
 spawn order, factory indices, storage release, early host validation, and
 factory error propagation.
 
+For ramp rates above 1,000 users per second, user additions and removals follow
+absolute elapsed step progress. The published scheduler rounds intervals to
+whole milliseconds, producing zero-delay bursts at these rates. The local
+change batches due users between millisecond waits without changing lower-rate
+scheduling. The benchmark's high-rate regression check covers both user startup
+and shutdown pacing.
+
 Remove these patches when upstream Goose supports the TLS-disabled build and
 equivalent user/client initialization.
