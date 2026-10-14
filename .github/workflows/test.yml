@@ -1,0 +1,29 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust tools
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Load generator tests
+        run: cargo test --locked
+      - name: Runner tests
+        run: |
+          cargo build --locked
+          FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_runner.py
+          FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_metrics.py

@@ -1,0 +1,22 @@
+[package]
+name = "feed-load"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+goose = { version = "=0.18.1", default-features = false }
+gumdrop = "0.8"
+libc = "0.2"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tower = "0.5"
+
+[patch.crates-io]
+goose = { path = "vendor/goose" }
+hyper = { path = "vendor/hyper" }
+hyper-util = { path = "vendor/hyper-util" }

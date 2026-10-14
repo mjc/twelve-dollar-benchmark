@@ -1,0 +1,62 @@
+[package]
+name = "goose"
+version = "0.18.1"
+authors = ["Jeremy Andrews <jeremy@tag1consulting.com>"]
+edition = "2018"
+description = "A load testing framework inspired by Locust."
+homepage = "https://tag1.com/goose"
+documentation = "https://book.goose.rs"
+repository = "https://github.com/tag1consulting/goose"
+readme = "README.md"
+keywords = ["loadtesting", "performance", "web", "framework", "tool"]
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ctrlc = "3"
+downcast-rs = "2.0"
+flume = "0.11"
+futures = "0.3"
+gumdrop = "0.8"
+http = "1.1"
+itertools = "0.14"
+lazy_static = "1.4"
+log = "0.4"
+num-format = "0.4"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "cookies",
+    "gzip",
+    "json",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simplelog = "0.12"
+strum = "0.27"
+strum_macros = "0.27"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "time",
+    "sync",
+] }
+tokio-tungstenite = "0.27"
+tungstenite = "0.27"
+url = "2"
+
+[features]
+default = ["reqwest/default-tls"]
+rustls-tls = ["reqwest/rustls-tls", "tokio-tungstenite/rustls"]
+gaggle = []
+
+[dev-dependencies]
+httpmock = "0.7"
+native-tls = "0.2"
+nix = { version = "0.30", features = ["signal"] }
+rustls = "0.23"
+serial_test = "3.2"

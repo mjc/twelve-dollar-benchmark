@@ -1,0 +1,10 @@
+**/target
+**/*.rs.bk
+**goose.log
+/settings.json.code-workspace
+**swp
+/Cargo.lock
+/src/docs/*/book
+/.idea
+/.env
+/.venv
