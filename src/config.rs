@@ -41,9 +41,9 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --help                Show this runner's help
 
 Target monitoring uses --monitor-user, falling back to --user. Without SSH, target
-monitoring is local for loopback targets. Application PIDs default to accessible
-processes listening on the target port; identify the backend explicitly behind a
-proxy. An unselected proxy is reported as unavailable, never as zero CPU.
+monitoring is local for loopback targets. Application and recognized proxy
+processes are discovered from listeners and local TCP backends. PID flags are
+optional overrides. An undetected proxy is reported as unavailable, never as zero CPU.
 
 Legacy BASE_URL, DESTINATION_PORTS, VUS, RAMP_UP, DURATION, TOKENS and SOURCE_IPS remain defaults.
 Explicit arguments win. Goose diagnostic flags may follow --; --host and native
