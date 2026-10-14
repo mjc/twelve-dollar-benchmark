@@ -141,6 +141,7 @@ fn validate_trial(
     directory: &Path,
 ) -> Result<bool> {
     let passed = report["passed"] == true;
+    let target_is_remote = cfg.monitor_user.is_some() || cfg.user.is_some();
     if status == 2
         || cancelled.load(Ordering::Relaxed)
         || report["completed"] != true
@@ -153,16 +154,14 @@ fn validate_trial(
         )
         .into());
     }
-    if (cfg.monitor_user.is_some() || cfg.user.is_some())
-        && report["target_telemetry"]["unavailable_reason"].is_string()
-    {
+    if target_is_remote && report["target_telemetry"]["unavailable_reason"].is_string() {
         return Err(format!(
             "target telemetry is unavailable; inspect {} before continuing the score search",
             directory.display()
         )
         .into());
     }
-    if passed && (cfg.monitor_user.is_some() || cfg.user.is_some()) {
+    if passed && target_is_remote {
         for metric in [
             "requests_per_second",
             "service_cpu_percent",

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, error::Error};
+use std::{collections::BTreeSet, env, error::Error, time::Duration};
 
 pub mod control;
 pub mod telemetry;
@@ -41,6 +41,19 @@ pub fn parse_pids(value: &str) -> Result<Vec<u32>, Box<dyn Error>> {
         }
     }
     Ok(pids)
+}
+
+/// Parse a sample interval in seconds, with an optional trailing `s`.
+///
+/// # Errors
+///
+/// Returns an error unless the interval is finite, at least 0.1 seconds, and representable.
+pub fn parse_sample_interval(value: &str) -> Result<Duration, Box<dyn Error>> {
+    let seconds: f64 = value.trim_end_matches('s').parse()?;
+    if !seconds.is_finite() || seconds < 0.1 {
+        return Err("sample interval must be at least 0.1 seconds".into());
+    }
+    Duration::try_from_secs_f64(seconds).map_err(Into::into)
 }
 
 /// Parse a port list such as `3000,3001` or a range such as `3000-3002`.
@@ -88,7 +101,7 @@ pub fn parse_destination_ports(value: &str) -> Result<Vec<u16>, Box<dyn Error>> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pids;
+    use super::{parse_pids, parse_sample_interval};
 
     #[test]
     fn process_id_parser_handles_empty_deduplicated_and_invalid_values() {
@@ -96,5 +109,14 @@ mod tests {
         assert_eq!(parse_pids("12, 7,12").unwrap(), vec![12, 7]);
         assert!(parse_pids("0").is_err());
         assert!(parse_pids("12,nope").is_err());
+    }
+
+    #[test]
+    fn sample_interval_parser_checks_minimum_and_finite_range() {
+        assert_eq!(parse_sample_interval("0.5").unwrap().as_millis(), 500);
+        assert_eq!(parse_sample_interval("0.5s").unwrap().as_millis(), 500);
+        assert!(parse_sample_interval("0.09").is_err());
+        assert!(parse_sample_interval("NaN").is_err());
+        assert!(parse_sample_interval("1e100").is_err());
     }
 }

@@ -63,15 +63,9 @@ unscored warm-up; five-minute searches from --start-users (2,500), doubling then
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
 
-pub(super) use twelve_dollar_benchmark::{parse_destination_ports, parse_pids as pids};
-
-fn interval(value: &str) -> Result<Duration> {
-    let seconds: f64 = value.trim_end_matches('s').parse()?;
-    if !seconds.is_finite() || seconds < 0.1 {
-        return Err("sample interval must be at least 0.1 seconds".into());
-    }
-    Ok(Duration::try_from_secs_f64(seconds)?)
-}
+pub(super) use twelve_dollar_benchmark::{
+    parse_destination_ports, parse_pids as pids, parse_sample_interval as interval,
+};
 
 pub(super) fn duration(value: &str) -> Result<Duration> {
     let value = value.trim();
