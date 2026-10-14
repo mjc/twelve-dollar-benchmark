@@ -1,4 +1,4 @@
-use super::{Samples, percentile};
+use super::{Samples, errors, percentile};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -31,11 +31,13 @@ impl Connections {
     pub fn merge(&mut self, mut other: Self) {
         self.successful_ms.append(&mut other.successful_ms);
         self.failed_ms.append(&mut other.failed_ms);
-        self.cancelled += other.cancelled;
+        self.cancelled = self.cancelled.saturating_add(other.cancelled);
         for (error, count) in other.errors {
-            *self.errors.entry(error).or_default() += count;
+            let total = self.errors.entry(error).or_default();
+            *total = total.saturating_add(count);
         }
     }
+    #[allow(clippy::cast_precision_loss)] // Rates and latency summaries are report statistics.
     pub fn report(&mut self, seconds: Option<f64>) -> Value {
         let mut all = self.successful_ms.clone();
         all.extend_from_slice(&self.failed_ms);
@@ -50,16 +52,18 @@ impl Connections {
     }
 }
 
+#[allow(clippy::cast_precision_loss)] // Averages are represented as floating point milliseconds.
 fn distribution(samples: &mut [f64]) -> Value {
     samples.sort_unstable_by(f64::total_cmp);
     json!({"samples": samples.len(), "avg_ms": (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64),
         "med_ms": percentile(samples, 0.5), "p95_ms": percentile(samples, 0.95), "p99_ms": percentile(samples, 0.99), "max_ms": samples.last()})
 }
 
+#[allow(clippy::cast_precision_loss)] // Request rates are floating point report statistics.
 pub(super) fn request_rates(samples: &Samples, seconds: Option<f64>) -> Value {
     let n = samples.latency_ms.len();
     let rate = |count: usize| seconds.filter(|s| *s > 0.0).map(|s| count as f64 / s);
-    json!({"requests_per_second": rate(n), "successful_requests_per_second": rate(n-samples.failed), "failed_requests_per_second": rate(samples.failed)})
+    json!({"requests_per_second": rate(n), "successful_requests_per_second": rate(n.saturating_sub(samples.failed)), "failed_requests_per_second": rate(samples.failed)})
 }
 
 #[derive(Clone)]
@@ -90,13 +94,15 @@ impl Attempt {
         let mut metrics = self.metrics.lock().unwrap();
         if let Some(error) = error {
             metrics.failed_ms.push(elapsed);
-            let key: String = error.chars().take(512).collect();
+            let key = errors::sanitize_message_urls(&error);
+            let key: String = key.chars().take(512).collect();
             let key = if metrics.errors.contains_key(&key) || metrics.errors.len() < 16 {
                 key
             } else {
                 "other connection errors".into()
             };
-            *metrics.errors.entry(key).or_default() += 1;
+            let count = metrics.errors.entry(key).or_default();
+            *count = count.saturating_add(1);
         } else {
             metrics.successful_ms.push(elapsed);
         }
@@ -106,7 +112,10 @@ impl Attempt {
 impl Drop for Attempt {
     fn drop(&mut self) {
         if !self.finished {
-            self.metrics.lock().unwrap().cancelled += 1;
+            {
+                let mut metrics = self.metrics.lock().unwrap();
+                metrics.cancelled = metrics.cancelled.saturating_add(1);
+            }
             self.finish(Some(
                 "connection setup cancelled before completion (for example, request timeout)"
                     .into(),
@@ -150,6 +159,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_error_keys_redact_url_credentials_and_secrets() {
+        let metrics = Arc::new(Mutex::new(Connections::default()));
+        let mut attempt = Attempt {
+            metrics: metrics.clone(),
+            start: Instant::now(),
+            finished: false,
+        };
+        attempt.finish(Some(
+            "connect to https://alice:secret@example.test/path?token=hidden#fragment failed".into(),
+        ));
+
+        let metrics = metrics.lock().unwrap();
+        assert_eq!(metrics.errors.len(), 1);
+        let key = metrics.errors.keys().next().expect("one error key");
+        assert!(key.contains("https://example.test/path"));
+        assert!(!key.contains("alice"));
+        assert!(!key.contains("secret"));
+        assert!(!key.contains("token=hidden"));
+        assert!(!key.contains("fragment"));
+    }
+
+    #[test]
+    fn corrupted_failure_counts_do_not_underflow_request_rates() {
+        let samples = Samples {
+            latency_ms: vec![1.0],
+            failed: 2,
+            ..Default::default()
+        };
+
+        let rates = request_rates(&samples, Some(1.0));
+        assert_eq!(rates["successful_requests_per_second"], 0.0);
+        assert_eq!(rates["failed_requests_per_second"], 2.0);
+    }
+
+    #[test]
+    fn merging_connection_counters_saturates_instead_of_wrapping() {
+        let mut first = Connections {
+            cancelled: usize::MAX,
+            errors: BTreeMap::from([("connect".into(), usize::MAX)]),
+            ..Default::default()
+        };
+        first.merge(Connections {
+            cancelled: 1,
+            errors: BTreeMap::from([("connect".into(), 1)]),
+            ..Default::default()
+        });
+
+        assert_eq!(first.cancelled, usize::MAX);
+        assert_eq!(first.errors["connect"], usize::MAX);
+    }
+
     #[tokio::test]
     async fn connection_layer_counts_reuse_reconnect_failure_and_cancelled_futures() {
         use std::io::{Read, Write};
@@ -207,7 +269,7 @@ mod tests {
         drop(pending);
         let mut collected = metrics.lock().unwrap();
         assert_eq!(collected.successful_ms.len(), 1); // two requests reused one TCP connection
-        assert!(!collected.failed_ms.is_empty());
+        assert_ne!(collected.failed_ms.len(), 0);
         assert_eq!(collected.cancelled, 1);
         let report = collected.report(Some(2.0));
         assert_eq!(report["connections_per_second"], 0.5);

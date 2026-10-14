@@ -42,14 +42,16 @@ impl ErrorExample {
 
 impl ErrorDetails {
     pub fn record(&mut self, mut example: ErrorExample) {
-        *self
+        let kind_count = self
             .counts
             .entry(format!("kind:{}", example.kind))
-            .or_default() += 1;
+            .or_default();
+        *kind_count = kind_count.saturating_add(1);
         if matches!(example.kind.as_str(), "http" | "check" | "body_read")
             && let Some(status) = example.status_code
         {
-            *self.counts.entry(format!("status:{status}")).or_default() += 1;
+            let count = self.counts.entry(format!("status:{status}")).or_default();
+            *count = count.saturating_add(1);
         }
         example.reason = truncate(&example.reason, MAX_REASON_BYTES).0;
         if let Some(body) = example.body_excerpt.take() {
@@ -64,18 +66,22 @@ impl ErrorDetails {
             );
             self.examples.push(example);
         } else {
-            self.omitted += 1;
+            self.omitted = self.omitted.saturating_add(1);
         }
     }
 
     pub fn merge(&mut self, other: &Self) {
         for (key, count) in &other.counts {
-            *self.counts.entry(key.clone()).or_default() += count;
+            let total = self.counts.entry(key.clone()).or_default();
+            *total = total.saturating_add(*count);
         }
         let room = MAX_ERROR_EXAMPLES.saturating_sub(self.examples.len());
         self.examples
             .extend(other.examples.iter().take(room).cloned());
-        self.omitted += other.omitted + other.examples.len().saturating_sub(room);
+        self.omitted = self
+            .omitted
+            .saturating_add(other.omitted)
+            .saturating_add(other.examples.len().saturating_sub(room));
     }
 }
 
@@ -90,7 +96,7 @@ pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     sanitize_message_urls(&message)
 }
 
-fn sanitize_message_urls(message: &str) -> String {
+pub(super) fn sanitize_message_urls(message: &str) -> String {
     let mut sanitized = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(start) = ["http://", "https://"]
@@ -175,6 +181,10 @@ fn sanitize_url(value: &str) -> (String, bool) {
     }
     if url.query().is_some() {
         url.set_query(None);
+        changed = true;
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(None);
         changed = true;
     }
     (url.to_string(), changed)
