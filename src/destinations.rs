@@ -89,9 +89,11 @@ mod tests {
             Some(3100)
         );
         assert!(urls("ftp://localhost", &[3100]).is_err());
-        assert!(urls("https://localhost", &[443])
-            .unwrap_err()
-            .to_string()
-            .contains("HTTPS/TLS"));
+        assert!(
+            urls("https://localhost", &[443])
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS/TLS")
+        );
     }
 }

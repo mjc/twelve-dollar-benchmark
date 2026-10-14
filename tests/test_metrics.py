@@ -18,13 +18,13 @@ import time
 import unittest
 
 
-@unittest.skipUnless(os.environ.get("FEED_LOAD_BIN"), "set FEED_LOAD_BIN to test the built coordinator")
+@unittest.skipUnless(os.environ.get("TWELVE_DOLLAR_BENCHMARK_BIN"), "set TWELVE_DOLLAR_BENCHMARK_BIN to test the built coordinator")
 class MetricsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="goose metrics ")
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
-        self.binary = Path(os.environ["FEED_LOAD_BIN"]).resolve()
+        self.binary = Path(os.environ["TWELVE_DOLLAR_BENCHMARK_BIN"]).resolve()
         self.tokens = self.root / "tokens.json"
         self.tokens.write_text(json.dumps([
             {"username": f"user-{index}", "token": f"token-{index}"}
@@ -218,7 +218,7 @@ class MetricsTests(unittest.TestCase):
                    BENCH_TARGET_PORT=str(self.server.server_port), BENCH_SAMPLE_INTERVAL="0.1",
                    BENCH_OBSERVER_LEASE_SECONDS=str(lease_seconds))
         log = (directory / "observer.log").open("w")
-        child = subprocess.Popen([str(self.binary), "--observe", str(control)],
+        child = subprocess.Popen([str(self.binary.with_name("twelve-dollar-observer")), "--observe", str(control)],
                                  cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT)
 
         def cleanup():
@@ -299,7 +299,7 @@ class MetricsTests(unittest.TestCase):
         combinations = {(source_ip, port): 2 for source_ip in self.source_ips for port in ports}
         self.assertEqual(self.connection_combinations, set(combinations))
         if os.environ.get("METRICS_PARENT_NETWORK_NAMESPACE"):
-            self.assertEqual(self.source_ports, {44000, 44001})
+            self.assertEqual(self.source_ports, {1024, 1025})
 
         # Startup jitter is at most five seconds. Every user must own a socket
         # after that warmup, even when no request handler is doing any work.
@@ -466,9 +466,9 @@ class MetricsTests(unittest.TestCase):
         self.assert_rates(feed, aggregate["duration_s"])
 
 
-@unittest.skipUnless(os.environ.get("FEED_LOAD_BIN"), "set FEED_LOAD_BIN to test the built coordinator")
+@unittest.skipUnless(os.environ.get("TWELVE_DOLLAR_BENCHMARK_BIN"), "set TWELVE_DOLLAR_BENCHMARK_BIN to test the built coordinator")
 class CapacityNamespaceTests(unittest.TestCase):
-    def test_two_ephemeral_ports_hold_eight_connections_across_source_and_destination_pairs(self):
+    def test_explicit_source_ports_work_independently_of_tiny_kernel_ephemeral_range(self):
         unshare, ip = shutil.which("unshare"), shutil.which("ip")
         if sys.platform != "linux" or not unshare or not ip:
             self.skipTest("requires Linux, unshare and ip for an isolated port-range test")

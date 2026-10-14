@@ -115,4 +115,4 @@ rust_details=$("${rustc_command[@]}" -vV)
 rust_host=${rust_details#*$'\nhost: '}
 rust_host=${rust_host%%$'\n'*}
 "${cargo_command[@]}" build --locked --release --target "$rust_host" --manifest-path "$bench_dir/Cargo.toml" --target-dir "$bench_dir/target"
-exec "$bench_dir/target/$rust_host/release/feed-load" --orchestrate "$@"
+exec "$bench_dir/target/$rust_host/release/twelve-dollar-benchmark" --orchestrate "$@"

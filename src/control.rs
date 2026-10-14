@@ -1,0 +1,68 @@
+use chrono::Utc;
+use std::{
+    error::Error,
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+pub fn wait_start(control: &Path) -> Result<i64> {
+    fs::write(control.with_extension("ready"), "ready\n")?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !control.with_extension("start").exists() {
+        if control.exists() || Instant::now() >= deadline {
+            fs::write(control.with_extension("done"), "not started\n")?;
+            return Err("coordinated start cancelled or timed out".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let start_at: i64 = fs::read_to_string(control.with_extension("start"))?
+        .trim()
+        .parse()?;
+    if Utc::now().timestamp_millis() - start_at > 250 {
+        fs::write(control.with_extension("done"), "missed start\n")?;
+        return Err(
+            "missed coordinated start; check SSH delay and host clock synchronization".into(),
+        );
+    }
+    Ok(start_at)
+}
+
+pub fn ready_supervised(control: &Path) -> Result<u8> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !control.with_extension("ready").exists() {
+        if Instant::now() >= deadline {
+            return Err("remote generator did not become ready".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(0)
+}
+
+pub fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
+    let _: i64 = timestamp.parse()?;
+    let temporary = control.with_extension("start.tmp");
+    fs::write(&temporary, timestamp)?;
+    refresh_observer(control)?;
+    fs::rename(temporary, control.with_extension("start"))?;
+    Ok(0)
+}
+
+pub fn refresh_observer(control: &Path) -> Result<u8> {
+    fs::write(control.with_extension("lease"), "alive\n")?;
+    Ok(0)
+}
+
+pub fn stop_supervised(control: &Path) -> Result<u8> {
+    fs::write(control, "cancel\n")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !control.with_extension("done").exists() {
+        if Instant::now() >= deadline {
+            return Err("remote supervisor did not confirm shutdown".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(0)
+}

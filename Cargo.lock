@@ -317,22 +317,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "feed-load"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "goose",
- "gumdrop",
- "libc",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tower",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,6 +1519,23 @@ dependencies = [
  "sha1",
  "thiserror",
  "utf-8",
+]
+
+[[package]]
+name = "twelve-dollar-benchmark"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "goose",
+ "gumdrop",
+ "hyper-util",
+ "libc",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

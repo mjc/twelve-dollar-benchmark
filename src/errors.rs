@@ -46,10 +46,10 @@ impl ErrorDetails {
             .counts
             .entry(format!("kind:{}", example.kind))
             .or_default() += 1;
-        if matches!(example.kind.as_str(), "http" | "check" | "body_read") {
-            if let Some(status) = example.status_code {
-                *self.counts.entry(format!("status:{status}")).or_default() += 1;
-            }
+        if matches!(example.kind.as_str(), "http" | "check" | "body_read")
+            && let Some(status) = example.status_code
+        {
+            *self.counts.entry(format!("status:{status}")).or_default() += 1;
         }
         example.reason = truncate(&example.reason, MAX_REASON_BYTES).0;
         if let Some(body) = example.body_excerpt.take() {

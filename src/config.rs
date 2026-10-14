@@ -1,9 +1,10 @@
-use std::{collections::BTreeSet, env, error::Error, net::IpAddr, path::PathBuf, time::Duration};
+use std::{env, error::Error, net::IpAddr, path::PathBuf, time::Duration};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(super) struct Config {
     pub base_url: String,
+    pub label: Option<String>,
     pub destination_ports: Vec<u16>,
     pub users: usize,
     pub ramp_up: String,
@@ -11,12 +12,14 @@ pub(super) struct Config {
     pub tokens: PathBuf,
     pub source_ips: String,
     pub user: Option<String>,
+    pub monitor_user: Option<String>,
     pub output: Option<PathBuf>,
     pub diagnostics: Vec<String>,
     pub application_pids: Vec<u32>,
     pub proxy_pids: Vec<u32>,
     pub sample_interval: Duration,
     pub help: bool,
+    pub score: bool,
 }
 
 pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diagnostics]
@@ -24,7 +27,10 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --source-ips IPS       Local source IPs, or SSH generator hosts with --user
   --destination-ports PORTS  Destination ports, as a list or inclusive range
   --user USER            Copy the release/tokens and run generators over SSH
-  --users N             Total concurrent users across all generators (100)
+  --monitor-user USER    Monitor the target over SSH while generating locally
+  --users N             Fixed-load run at N users; disables automatic scoring
+  --score               Warm up, find the limit and confirm a five-minute score
+  --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
   --duration TIME       Hold at total users (5m); ramp-down remains 30s
   --tokens PATH         Token file; explicit paths resolve from your directory
@@ -34,7 +40,7 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --sample-interval SECONDS  Resource/network sampling period (1 second, minimum 0.1)
   --help                Show this runner's help
 
-Target monitoring uses the same SSH user when supplied. Without SSH, target
+Target monitoring uses --monitor-user, falling back to --user. Without SSH, target
 monitoring is local for loopback targets. Application PIDs default to accessible
 processes listening on the target port; identify the backend explicitly behind a
 proxy. An unselected proxy is reported as unavailable, never as zero CPU.
@@ -43,6 +49,11 @@ Legacy BASE_URL, DESTINATION_PORTS, VUS, RAMP_UP, DURATION, TOKENS and SOURCE_IP
 Explicit arguments win. Goose diagnostic flags may follow --; --host and native
 workload overrides are rejected so they cannot change the target or total load.
 Pass short diagnostic flags separately (for example, -v -v rather than -vv).
+
+Without --users or VUS, run the scoring workflow: 1,000-user two-minute
+unscored warm-up; five-minute searches from 2,500, doubling then narrowing to
+250 users; a separate five-minute confirmation, stepping down 250 on failure.
+--score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
 
 pub(super) fn pids(value: &str) -> Result<Vec<u32>> {
@@ -62,44 +73,7 @@ pub(super) fn pids(value: &str) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-pub(super) fn parse_destination_ports(value: &str) -> Result<Vec<u16>> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(value);
-    if value.is_empty() {
-        return Err("destination ports must not be empty".into());
-    }
-
-    let mut ports = Vec::new();
-    let mut seen = BTreeSet::new();
-    for item in value.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            return Err("destination ports must not contain empty entries".into());
-        }
-        let (start, end) = match item.split_once('-') {
-            Some((start, end)) => (start.trim().parse::<u16>()?, end.trim().parse::<u16>()?),
-            None => {
-                let port = item.parse::<u16>()?;
-                (port, port)
-            }
-        };
-        if start == 0 || end == 0 {
-            return Err("destination ports must be positive".into());
-        }
-        if start > end {
-            return Err("destination port ranges must be ascending".into());
-        }
-        for port in start..=end {
-            if seen.insert(port) {
-                ports.push(port);
-            }
-        }
-    }
-    Ok(ports)
-}
+pub(super) use twelve_dollar_benchmark::parse_destination_ports;
 
 fn interval(value: &str) -> Result<Duration> {
     let seconds: f64 = value.trim_end_matches('s').parse()?;
@@ -127,6 +101,8 @@ fn parse_with(
             .unwrap_or_else(|| fallback.to_owned())
     };
     let mut users = default("VUS", "100");
+    let mut fixed_users = lookup("VUS").is_some_and(|value| !value.is_empty());
+    let mut explicit_score = false;
     let base_url = default("BASE_URL", "http://127.0.0.1:3000");
     let default_port = reqwest::Url::parse(&base_url)
         .ok()
@@ -136,6 +112,7 @@ fn parse_with(
     let mut explicit_destination_ports = None;
     let mut config = Config {
         base_url,
+        label: None,
         destination_ports: vec![default_port],
         users: 100,
         ramp_up: default("RAMP_UP", "60s"),
@@ -143,12 +120,14 @@ fn parse_with(
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
         source_ips: default("SOURCE_IPS", ""),
         user: None,
+        monitor_user: None,
         output: None,
         diagnostics: Vec::new(),
         application_pids: Vec::new(),
         proxy_pids: Vec::new(),
         sample_interval: interval(&default("BENCH_SAMPLE_INTERVAL", "1"))?,
         help: false,
+        score: false,
     };
     let mut args = args.iter().peekable();
     let mut target = Vec::new();
@@ -164,12 +143,21 @@ fn parse_with(
             config.help = true;
             continue;
         }
+        if flag == "--score" {
+            if inline.is_some() {
+                return Err("--score takes no value".into());
+            }
+            explicit_score = true;
+            continue;
+        }
         if !flag.starts_with('-') {
             target.push(arg.clone());
             continue;
         }
         let takes_value = [
+            "--label",
             "--user",
+            "--monitor-user",
             "--output-dir",
             "--source-ips",
             "--destination-ports",
@@ -201,14 +189,19 @@ fn parse_with(
             return Err(format!("{flag} requires a non-empty value").into());
         }
         match flag {
+            "--label" => config.label = Some(value),
             "--user" => config.user = Some(value),
+            "--monitor-user" => config.monitor_user = Some(value),
             "--output-dir" => config.output = Some(caller.join(value)),
             "--tokens" => config.tokens = caller.join(value),
             "--source-ips" => config.source_ips = value,
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
             }
-            "--users" => users = value,
+            "--users" => {
+                users = value;
+                fixed_users = true;
+            }
             "--ramp-up" => config.ramp_up = value,
             "--duration" => config.duration = value,
             "--application-pids" => config.application_pids = pids(&value)?,
@@ -247,6 +240,17 @@ fn parse_with(
         parse_destination_ports(&environment_ports)?
     };
     validate_diagnostics(&config.diagnostics)?;
+    config.score = explicit_score || !fixed_users;
+    for user in config.user.iter().chain(config.monitor_user.iter()) {
+        if user.is_empty()
+            || user.starts_with('-')
+            || !user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        {
+            return Err("invalid SSH username".into());
+        }
+    }
     if config.help {
         config.users = users.parse().unwrap_or(100);
     } else {
@@ -410,6 +414,14 @@ mod tests {
     }
 
     #[test]
+    fn target_monitoring_does_not_select_remote_generators() {
+        let cfg = parse_args(&["127.0.0.1", "3100-3104", "--monitor-user", "mjc"], &[]).unwrap();
+        assert_eq!(cfg.monitor_user.as_deref(), Some("mjc"));
+        assert!(cfg.user.is_none());
+        assert!(parse_args(&["--monitor-user=bad user"], &[]).is_err());
+    }
+
+    #[test]
     fn destination_port_lists_and_ranges_are_ordered_and_deduplicated() {
         assert_eq!(
             parse_destination_ports("3100,3101,3102").unwrap(),
@@ -500,11 +512,13 @@ mod tests {
         assert_eq!(config.destination_ports, vec![80]);
         assert!(parse_args(&[], &[("BASE_URL", "https://example.test")]).is_err());
         // An explicit HTTP target wins over a legacy HTTPS default.
-        assert!(parse_args(
-            &["127.0.0.1", "3100"],
-            &[("BASE_URL", "https://example.test")]
-        )
-        .is_ok());
+        assert!(
+            parse_args(
+                &["127.0.0.1", "3100"],
+                &[("BASE_URL", "https://example.test")]
+            )
+            .is_ok()
+        );
     }
 
     #[test]

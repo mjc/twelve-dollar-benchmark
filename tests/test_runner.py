@@ -63,7 +63,7 @@ else:
     assert args[args.index("--target") + 1] == "fixture-host", args
     target = pathlib.Path(args[args.index("--target-dir") + 1]) / "fixture-host" / "release"
     target.mkdir(parents=True, exist_ok=True)
-    binary = target / "feed-load"
+    binary = target / "twelve-dollar-benchmark"
     binary.write_text("#!" + os.environ["BASH"] + "\nexec " +
         shlex.join([sys.executable, str(root / "driver"), "--run-load"]) + ' "$@"\n')
     binary.chmod(0o755)
@@ -144,7 +144,7 @@ class RunnerTests(unittest.TestCase):
         return [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
 
     def test_target_paths_flags_and_exit_status_from_any_directory(self):
-        stale = self.bench / "target" / "release" / "feed-load"
+        stale = self.bench / "target" / "release" / "twelve-dollar-benchmark"
         stale.parent.mkdir(parents=True)
         stale.write_text("#!" + self.env["BASH"] + "\nexit 99\n")
         stale.chmod(0o755)
@@ -216,7 +216,7 @@ name = pathlib.Path(sys.argv[0]).name
 with (root / "calls").open("a") as log:
     log.write(json.dumps([name, *args]) + "\n")
 def mapped(value):
-    return value.replace("/tmp/feed-load-", str(root / "remote-"))
+    return value.replace("/tmp/twelve-dollar-benchmark-", str(root / "remote-"))
 if name == "ssh":
     host, command = args[args.index("--") + 1:]
     if "--supervise " in command and host.endswith(".2"):
@@ -246,13 +246,13 @@ else:
 """
 
 
-@unittest.skipUnless(os.environ.get("FEED_LOAD_BIN"), "set FEED_LOAD_BIN to test the built coordinator")
+@unittest.skipUnless(os.environ.get("TWELVE_DOLLAR_BENCHMARK_BIN"), "set TWELVE_DOLLAR_BENCHMARK_BIN to test the built coordinator")
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="goose ssh ")
         self.root = Path(self.temp.name)
         self.addCleanup(self.cleanup)
-        self.binary = Path(os.environ["FEED_LOAD_BIN"]).resolve()
+        self.binary = Path(os.environ["TWELVE_DOLLAR_BENCHMARK_BIN"]).resolve()
         driver = self.root / "driver"
         driver.write_text("#!" + sys.executable + "\n" + REMOTE_DRIVER)
         driver.chmod(0o755)
@@ -431,6 +431,11 @@ class CoordinatorTests(unittest.TestCase):
         self.env.update(SOURCE_IPS="127.0.0.[1-2]", SUMMARY=str(self.root / "legacy.json"))
         run, report = self.run_coordinator(remote=False, extra=["--request-log", "native.log"])
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        first_table = next(line for line in run.stdout.splitlines() if line.startswith("|"))
+        self.assertIn("Requested VUs", first_table)
+        self.assertIn("HTTP errors %", first_table)
+        for heading in ["Requests/s", "Connection attempts/s", "Setup outcome", "RX packets/s", "Peak established sockets"]:
+            self.assertIn(heading, run.stdout)
         self.assertEqual(report["source_ips"], ["127.0.0.1", "127.0.0.2"])
         self.assertEqual(report, json.loads((self.root / "legacy.json").read_text()))
         for filename in ["summary.json", "samples.json", "output.log", "native.log"]:

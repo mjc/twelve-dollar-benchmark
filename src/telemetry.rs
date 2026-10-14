@@ -1,18 +1,18 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     error::Error,
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-pub(super) type Roles = BTreeMap<String, Vec<u32>>;
+pub type Roles = BTreeMap<String, Vec<u32>>;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Interface {
@@ -48,6 +48,8 @@ struct Point {
     tcp: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     interval_rates: Value,
+    #[serde(default)]
+    service: Value,
     errors: Vec<String>,
 }
 
@@ -77,21 +79,129 @@ fn interfaces(text: &str) -> Result<BTreeMap<String, Interface>> {
     Ok(result)
 }
 
-fn socket_inodes(pid: u32) -> Result<BTreeSet<String>> {
-    let mut result = BTreeSet::new();
-    for file in ["tcp", "tcp6"] {
-        let text = fs::read_to_string(format!("/proc/{pid}/net/{file}"))?;
-        for line in text.lines().skip(1) {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() < 10 {
-                return Err("incomplete TCP table row".into());
+fn socket_inodes() -> Result<HashSet<u64>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: no pointer arguments; OwnedFd takes ownership only on success.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_SOCK_DIAG,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let timeout = libc::timeval {
+        tv_sec: 2,
+        tv_usec: 0,
+    };
+    // SAFETY: the option pointer and length describe a live timeval.
+    if unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&timeout as *const libc::timeval).cast(),
+            size_of_val(&timeout) as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: an all-zero sockaddr_nl is valid before assigning its family.
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    let mut inodes = HashSet::new();
+    for family in [libc::AF_INET, libc::AF_INET6] {
+        // nlmsghdr (16 bytes), inet_diag_req_v2 (8), inet_diag_sockid (48).
+        let mut request = [0_u8; 72];
+        request[..4].copy_from_slice(&72_u32.to_ne_bytes());
+        request[4..6].copy_from_slice(&20_u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
+        request[6..8].copy_from_slice(&0x301_u16.to_ne_bytes()); // REQUEST | DUMP
+        request[8..12].copy_from_slice(&(family as u32).to_ne_bytes());
+        request[16] = family as u8;
+        request[17] = libc::IPPROTO_TCP as u8;
+        request[20..24].copy_from_slice(&2_u32.to_ne_bytes()); // 1 << TCP_ESTABLISHED
+        // SAFETY: request and kernel are live buffers of their stated sizes.
+        if unsafe {
+            libc::sendto(
+                socket.as_raw_fd(),
+                request.as_ptr().cast(),
+                request.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                size_of_val(&kernel) as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut buffer = [0_u8; 65536];
+        'dump: loop {
+            // SAFETY: buffer is writable for its entire stated length.
+            let received = unsafe {
+                libc::recv(
+                    socket.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_TRUNC,
+                )
+            };
+            if received < 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
-            if fields[3] == "01" {
-                result.insert(format!("socket:[{}]", fields[9]));
+            let received = usize::try_from(received)?;
+            if received == 0 || received > buffer.len() {
+                return Err("truncated socket diagnostic dump".into());
+            }
+            let mut offset = 0;
+            while offset + 16 <= received {
+                let header = &buffer[offset..offset + 16];
+                let length = u32::from_ne_bytes(header[..4].try_into()?) as usize;
+                if length < 16 || length > received - offset {
+                    return Err("invalid socket diagnostic message".into());
+                }
+                let flags = u16::from_ne_bytes(header[6..8].try_into()?);
+                if flags & 0x10 != 0 {
+                    return Err("socket diagnostic dump interrupted".into());
+                }
+                let payload = &buffer[offset + 16..offset + length];
+                match u16::from_ne_bytes(header[4..6].try_into()?) {
+                    3 => break 'dump, // NLMSG_DONE
+                    2 => {
+                        // NLMSG_ERROR
+                        let code = i32::from_ne_bytes(
+                            payload
+                                .get(..4)
+                                .ok_or("truncated diagnostic error")?
+                                .try_into()?,
+                        );
+                        if code != 0 {
+                            return Err(std::io::Error::from_raw_os_error(
+                                code.checked_neg().ok_or("invalid diagnostic error")?,
+                            )
+                            .into());
+                        }
+                    }
+                    20 => {
+                        // inet_diag_msg inode is a native-endian u32 at offset 68.
+                        let inode = u32::from_ne_bytes(
+                            payload
+                                .get(68..72)
+                                .ok_or("truncated socket diagnostic entry")?
+                                .try_into()?,
+                        );
+                        inodes.insert(u64::from(inode));
+                    }
+                    _ => {}
+                }
+                offset += (length + 3) & !3;
             }
         }
     }
-    Ok(result)
+    Ok(inodes)
 }
 
 fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
@@ -115,19 +225,31 @@ fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
     ))
 }
 
-fn process(pid: u32, ticks: f64, page_size: u64) -> Result<Process> {
+fn process(
+    pid: u32,
+    ticks: f64,
+    page_size: u64,
+    sockets: &Result<HashSet<u64>>,
+) -> Result<Process> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let (name, start_ticks, cpu_ticks, resident_pages) = process_stat(&text)?;
     let mut errors = Vec::new();
-    let sockets = socket_inodes(pid).map_err(|error| {
+    let sockets = sockets.as_ref().map_err(|error| {
         errors.push(format!("established sockets: {error}"));
     });
+    let same_namespace = fs::read_link(format!("/proc/{pid}/ns/net"))
+        .ok()
+        .zip(fs::read_link("/proc/self/ns/net").ok())
+        .is_some_and(|(process, observer)| process == observer);
+    if !same_namespace {
+        errors.push("established sockets unavailable: process network namespace differs from observer or cannot be read".into());
+    }
     let (open_descriptors, established_sockets) = match fs::read_dir(format!("/proc/{pid}/fd")) {
         Ok(entries) => {
             let mut count = 0;
             let mut descriptors_complete = true;
             let mut established = BTreeSet::new();
-            let mut socket_complete = sockets.is_ok();
+            let mut socket_complete = sockets.is_ok() && same_namespace;
             for entry in entries {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -142,9 +264,14 @@ fn process(pid: u32, ticks: f64, page_size: u64) -> Result<Process> {
                 if let Ok(sockets) = &sockets {
                     match fs::read_link(entry.path()) {
                         Ok(link) => {
-                            let link = link.to_string_lossy().into_owned();
-                            if sockets.contains(&link) {
-                                established.insert(link);
+                            if let Some(inode) = link
+                                .to_str()
+                                .and_then(|s| s.strip_prefix("socket:["))
+                                .and_then(|s| s.strip_suffix(']'))
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .filter(|inode| sockets.contains(inode))
+                            {
+                                established.insert(inode);
                             }
                         }
                         // An FD can close between the directory listing and readlink.
@@ -197,6 +324,117 @@ fn process(pid: u32, ticks: f64, page_size: u64) -> Result<Process> {
     })
 }
 
+fn service_resources(roles: &Roles) -> Value {
+    let read = || -> Result<Value> {
+        let mut paths = BTreeSet::new();
+        for role in ["application", "proxy"] {
+            for pid in roles.get(role).into_iter().flatten() {
+                let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+                let group = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::"))
+                    .ok_or("cgroup v2 membership unavailable")?;
+                paths.insert(Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')));
+            }
+        }
+        let mut groups = BTreeMap::new();
+        for path in &paths {
+            if paths
+                .iter()
+                .any(|parent| parent != path && path.starts_with(parent))
+            {
+                continue;
+            }
+            let memory: u64 = fs::read_to_string(path.join("memory.current"))?
+                .trim()
+                .parse()?;
+            let cpu: u64 = fs::read_to_string(path.join("cpu.stat"))?
+                .lines()
+                .find_map(|line| line.strip_prefix("usage_usec ").map(str::to_owned))
+                .ok_or("cgroup CPU usage unavailable")?
+                .parse()?;
+            groups.insert(
+                path.to_string_lossy().into_owned(),
+                json!({"memory_current_bytes": memory, "cpu_usage_us": cpu}),
+            );
+        }
+        Ok(json!({"groups": groups}))
+    };
+    read().unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}))
+}
+
+/// Summarize counters between samples wholly inside the full-load hold.
+pub fn summarize_hold(
+    path: &Path,
+    start: chrono::DateTime<Utc>,
+    finish: chrono::DateTime<Utc>,
+) -> Result<Value> {
+    let mut first: Option<Point> = None;
+    let mut last: Option<Point> = None;
+    let mut peak_memory = None;
+    for line in BufReader::new(File::open(path)?).lines() {
+        let point: Point = serde_json::from_str(&line?)?;
+        let at = chrono::DateTime::parse_from_rfc3339(&point.timestamp)?;
+        if at < start || at > finish {
+            continue;
+        }
+        if let Some(groups) = point.service["groups"]
+            .as_object()
+            .filter(|groups| !groups.is_empty())
+        {
+            let memory: Option<u64> = groups
+                .values()
+                .map(|group| group["memory_current_bytes"].as_u64())
+                .sum();
+            peak_memory = peak_memory.max(memory);
+        }
+        if first.is_none() {
+            first = Some(point.clone());
+        }
+        last = Some(point);
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        return Err("no telemetry samples inside full-load hold".into());
+    };
+    let seconds = (chrono::DateTime::parse_from_rfc3339(&last.timestamp)?
+        - chrono::DateTime::parse_from_rfc3339(&first.timestamp)?)
+    .num_microseconds()
+    .filter(|n| *n > 0)
+    .ok_or("not enough telemetry samples inside hold")? as f64
+        / 1_000_000.0;
+    let count = |point: &Point| -> Option<u64> {
+        point.activity["requests"]
+            .as_array()?
+            .iter()
+            .map(|row| row[0].as_u64())
+            .sum()
+    };
+    let requests = count(&last)
+        .zip(count(&first))
+        .and_then(|(end, begin)| end.checked_sub(begin));
+    let cpu = first.service["groups"]
+        .as_object()
+        .zip(last.service["groups"].as_object())
+        .filter(|(begin, end)| !begin.is_empty() && begin.keys().eq(end.keys()))
+        .and_then(|(begin, end)| {
+            begin
+                .iter()
+                .map(|(path, value)| {
+                    end[path]["cpu_usage_us"]
+                        .as_u64()?
+                        .checked_sub(value["cpu_usage_us"].as_u64()?)
+                })
+                .sum::<Option<u64>>()
+        });
+    Ok(
+        json!({"sample_started_at": first.timestamp, "sample_finished_at": last.timestamp,
+        "sample_duration_s": seconds, "requests_per_second": requests.map(|n| n as f64 / seconds),
+        "service_cpu_percent": cpu.map(|n| n as f64 / (seconds * 10_000.0)),
+        "sampled_peak_memory_bytes": peak_memory,
+        "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache"}),
+    )
+}
+
 fn limits() -> Value {
     let paths = [
         (
@@ -230,7 +468,7 @@ fn limits() -> Value {
 }
 
 #[cfg(test)]
-pub(super) fn listener_pids(port: u16) -> Result<Vec<u32>> {
+fn listener_pids(port: u16) -> Result<Vec<u32>> {
     listener_pids_for_ports(&[port])
 }
 
@@ -278,7 +516,106 @@ fn listener_pids_for_ports(ports: &[u16]) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-pub(super) struct Sampler {
+fn proc_address(value: &str) -> Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let (address, port) = value.split_once(':').ok_or("invalid TCP address")?;
+    let ip = match address.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(
+            u32::from_str_radix(address, 16)?.to_ne_bytes(),
+        )),
+        32 => {
+            let mut bytes = [0; 16];
+            for (chunk, output) in address
+                .as_bytes()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
+            {
+                output.copy_from_slice(
+                    &u32::from_str_radix(std::str::from_utf8(chunk)?, 16)?.to_ne_bytes(),
+                );
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        _ => return Err("invalid TCP address length".into()),
+    };
+    Ok(std::net::SocketAddr::new(
+        ip,
+        u16::from_str_radix(port, 16)?,
+    ))
+}
+
+fn discover_roles(ports: &[u16]) -> Result<Roles> {
+    let listeners = listener_pids_for_ports(ports)?;
+    let (proxy, mut application): (Vec<_>, Vec<_>) = listeners.into_iter().partition(|pid| {
+        fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|name| {
+            matches!(
+                name.trim(),
+                "nginx"
+                    | "haproxy"
+                    | "envoy"
+                    | "caddy"
+                    | "traefik"
+                    | "apache2"
+                    | "httpd"
+                    | "varnishd"
+                    | "h2o"
+            )
+        })
+    });
+    let mut backend_ports = BTreeSet::new();
+    for pid in &proxy {
+        let inodes: BTreeSet<_> = fs::read_dir(format!("/proc/{pid}/fd"))?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .collect();
+        for file in ["tcp", "tcp6"] {
+            for line in fs::read_to_string(format!("/proc/{pid}/net/{file}"))?
+                .lines()
+                .skip(1)
+            {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() < 10
+                    || fields[3] != "01"
+                    || !inodes.contains(&PathBuf::from(format!("socket:[{}]", fields[9])))
+                {
+                    continue;
+                }
+                let peer = proc_address(fields[2])?;
+                let unspecified = if peer.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                };
+                let local_peer = peer.ip().is_loopback()
+                    || std::net::UdpSocket::bind(unspecified)
+                        .and_then(|socket| {
+                            socket.connect(peer)?;
+                            socket.local_addr()
+                        })
+                        .is_ok_and(|address| address.ip() == peer.ip());
+                if local_peer && !ports.contains(&peer.port()) {
+                    backend_ports.insert(peer.port());
+                }
+            }
+        }
+    }
+    if !backend_ports.is_empty() {
+        application.extend(listener_pids_for_ports(
+            &backend_ports.into_iter().collect::<Vec<_>>(),
+        )?);
+        application.retain(|pid| !proxy.contains(pid));
+        application.sort_unstable();
+        application.dedup();
+    }
+    Ok(Roles::from([
+        ("application".into(), application),
+        ("proxy".into(), proxy),
+    ]))
+}
+
+pub struct Sampler {
     stop: mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<std::result::Result<(), String>>>,
     path: PathBuf,
@@ -314,10 +651,11 @@ impl Sampler {
                     .map_err(|e| errors.push(format!("network: {e}")))
                     .ok();
                 let mut processes = BTreeMap::new();
+                let sockets = socket_inodes();
                 for (role, pids) in &roles {
                     let mut data = Vec::new();
                     for pid in pids {
-                        match process(*pid, ticks as f64, page as u64) {
+                        match process(*pid, ticks as f64, page as u64, &sockets) {
                             Ok(data_point) => {
                                 let original =
                                     identities.entry(*pid).or_insert(data_point.start_ticks);
@@ -353,6 +691,7 @@ impl Sampler {
                     processes,
                     limits: limits(),
                     activity: activity(),
+                    service: service_resources(&roles),
                     tcp,
                     interval_rates: Value::Null,
                     errors,
@@ -578,7 +917,7 @@ fn add_errors(destination: &mut BTreeSet<String>, errors: impl IntoIterator<Item
     }
 }
 
-pub(super) fn summarize(path: &Path) -> Result<Value> {
+pub(crate) fn summarize(path: &Path) -> Result<Value> {
     // Keep only endpoint counters and peaks; a long trace must not become a second in-memory copy.
     let mut first: Option<Point> = None;
     let mut last: Option<Point> = None;
@@ -587,12 +926,18 @@ pub(super) fn summarize(path: &Path) -> Result<Value> {
     let mut processes: BTreeMap<(String, u32, u64), ProcessTotal> = BTreeMap::new();
     let mut errors = BTreeSet::new();
     let mut peak_established = None;
+    let mut peak_conntrack = None;
     for line in BufReader::new(File::open(path)?).lines() {
         let point: Point = serde_json::from_str(&line?)?;
         if first.is_none() {
             first = Some(point.clone());
         }
         samples += 1;
+        peak_conntrack = peak_conntrack.max(
+            point.limits["conntrack_count"]["value"]
+                .as_str()
+                .and_then(|n| n.parse::<u64>().ok()),
+        );
         add_errors(&mut errors, point.errors.clone());
         peak_established = peak_established.max(
             point
@@ -627,8 +972,9 @@ pub(super) fn summarize(path: &Path) -> Result<Value> {
         }
         last = Some(point);
     }
-    let first = first.ok_or("no telemetry samples")?;
-    let last = last.unwrap();
+    let (Some(first), Some(last)) = (first, last) else {
+        return Err("no telemetry samples".into());
+    };
     let mut process_report = BTreeMap::new();
     for role in roles {
         let collected: Vec<_> = processes.iter().filter(|((process_role, _, _), _)| process_role == &role).map(|((_, pid, start_ticks), aggregate)| {
@@ -646,32 +992,34 @@ pub(super) fn summarize(path: &Path) -> Result<Value> {
         "started_at": first.timestamp, "finished_at": last.timestamp, "observed_duration_s": last.elapsed_s-first.elapsed_s, "samples": samples,
         "network_scope": "per-interface host/network-namespace counters include unrelated traffic; do not add virtual links or both ends of a connection; packet counters can reflect offloads, not physical wire packets",
         "network": network_report(&first,&last), "tcp": tcp_report(&first,&last), "peak_namespace_established_sockets": peak_established, "activity": activity_report(&first,&last),
-        "processes": process_report, "limits": last.limits, "errors": errors,
+        "processes": process_report, "limits": last.limits, "peak_conntrack_count": peak_conntrack, "errors": errors,
         "process_scope": "CPU includes every process thread and is expressed relative to one CPU core; memory, descriptors and established sockets are sampled peaks"}),
     )
 }
 
-pub(super) fn observe(
+pub fn observe(
     control: &Path,
     application_pids: Vec<u32>,
     proxy_pids: Vec<u32>,
     ports: Vec<u16>,
     interval: Duration,
 ) -> Result<u8> {
-    let application = if application_pids.is_empty() {
-        listener_pids_for_ports(&ports)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|pid| !proxy_pids.contains(pid))
-            .collect()
-    } else {
-        application_pids
-    };
-    let roles = Roles::from([
-        ("application".into(), application),
-        ("proxy".into(), proxy_pids),
-        ("observer".into(), vec![std::process::id()]),
-    ]);
+    let discovery = discover_roles(&ports);
+    let discovery_error = discovery.as_ref().err().map(ToString::to_string);
+    let mut roles = discovery.unwrap_or_default();
+    if !application_pids.is_empty() {
+        roles.insert("application".into(), application_pids);
+    }
+    if !proxy_pids.is_empty() {
+        roles
+            .entry("application".into())
+            .or_default()
+            .retain(|pid| !proxy_pids.contains(pid));
+        roles.insert("proxy".into(), proxy_pids);
+    }
+    roles.entry("application".into()).or_default();
+    roles.entry("proxy".into()).or_default();
+    roles.insert("observer".into(), vec![std::process::id()]);
     let result = (|| {
         let lease_seconds: f64 = crate::setting("BENCH_OBSERVER_LEASE_SECONDS", "120").parse()?;
         if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
@@ -679,7 +1027,7 @@ pub(super) fn observe(
         }
         let lease_duration = Duration::try_from_secs_f64(lease_seconds)?;
         let observer_started = Instant::now();
-        let start_at = crate::runner::wait_start(control)?;
+        let start_at = crate::control::wait_start(control)?;
         while Utc::now().timestamp_millis() < start_at {
             if control.exists() {
                 return Err("target observation cancelled before start".into());
@@ -709,6 +1057,16 @@ pub(super) fn observe(
         }
         let timed_out = !control.exists();
         let mut summary = sampler.finish()?;
+        summary["process_discovery"] = json!({"method": "listening socket owners; recognized proxy processes and their observed local TCP backends",
+            "limitation": "custom proxies, remote backends, Unix sockets and idle proxy pools may not be identifiable; optional PID overrides remain available",
+            "error": discovery_error});
+        if summary["processes"]["proxy"]["processes"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            summary["processes"]["proxy"]["unavailable_reason"] =
+                json!("no recognized proxy detected among target listener processes");
+        }
         summary["stopped_by_lease_timeout"] = json!(timed_out);
         summary["observer_lease_seconds"] = json!(lease_seconds);
         if timed_out {
@@ -753,6 +1111,25 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn decodes_proc_tcp_addresses_and_discovers_direct_application() {
+        assert_eq!(
+            proc_address("0100007F:0C1C").unwrap().to_string(),
+            "127.0.0.1:3100"
+        );
+        assert_eq!(
+            proc_address("00000000000000000000000001000000:0C1C")
+                .unwrap()
+                .to_string(),
+            "[::1]:3100"
+        );
+        assert!(proc_address("bad").is_err());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let roles = discover_roles(&[listener.local_addr().unwrap().port()]).unwrap();
+        assert!(roles["application"].contains(&std::process::id()));
+        assert!(roles["proxy"].is_empty());
+    }
+
     fn fixture(elapsed: f64) -> Point {
         Point {
             timestamp: format!("sample-{elapsed}"),
@@ -794,6 +1171,7 @@ mod tests {
                 ("CurrEstab".into(), 2),
             ])),
             interval_rates: Value::Null,
+            service: Value::Null,
             errors: vec![],
         }
     }
@@ -947,9 +1325,11 @@ mod tests {
         assert_eq!(process["peak_established_sockets"], 6);
         assert_eq!(process["cpu_percent_of_one_core"], 50.0);
         assert_eq!(report["host_boot_id"], "boot-a");
-        assert!(report["processes"]["proxy"]["unavailable_reason"]
-            .as_str()
-            .is_some());
+        assert!(
+            report["processes"]["proxy"]["unavailable_reason"]
+                .as_str()
+                .is_some()
+        );
     }
 
     #[test]
@@ -979,10 +1359,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        assert!(listener_pids(listener.local_addr().unwrap().port())
-            .unwrap()
-            .contains(&std::process::id()));
-        let observed = process(std::process::id(), 100.0, 4096).unwrap();
+        assert!(
+            listener_pids(listener.local_addr().unwrap().port())
+                .unwrap()
+                .contains(&std::process::id())
+        );
+        let observed = process(std::process::id(), 100.0, 4096, &socket_inodes()).unwrap();
         assert!(observed.established_sockets.unwrap() >= 2);
         assert!(observed.open_descriptors.unwrap() >= 3);
         assert!(observed.descriptor_limits["soft"].as_str().is_some());

@@ -25,5 +25,5 @@ jobs:
       - name: Runner tests
         run: |
           cargo build --locked
-          FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_runner.py
-          FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_metrics.py
+          TWELVE_DOLLAR_BENCHMARK_BIN=target/debug/twelve-dollar-benchmark python3 tests/test_runner.py
+          TWELVE_DOLLAR_BENCHMARK_BIN=target/debug/twelve-dollar-benchmark python3 tests/test_metrics.py

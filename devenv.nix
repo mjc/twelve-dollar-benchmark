@@ -12,7 +12,9 @@
     openssh
     pkg-config
     python3
-  ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [iproute2 util-linux];
+    iproute2
+    util-linux
+  ];
 
   tasks."benchmark:check" = {
     description = "Run the same Rust and Python checks as CI";
@@ -22,8 +24,8 @@
       cargo clippy --locked --all-targets -- -D warnings
       cargo test --locked
       cargo build --locked
-      FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_runner.py
-      FEED_LOAD_BIN=target/debug/feed-load python3 tests/test_metrics.py
+      TWELVE_DOLLAR_BENCHMARK_BIN=target/debug/twelve-dollar-benchmark python3 tests/test_runner.py
+      TWELVE_DOLLAR_BENCHMARK_BIN=target/debug/twelve-dollar-benchmark python3 tests/test_metrics.py
     '';
   };
 }

@@ -1,6 +1,6 @@
-use super::{percentile, Samples};
+use super::{Samples, percentile};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
@@ -42,7 +42,7 @@ impl Connections {
         let total = all.len();
         let rate = |n: usize| seconds.filter(|s| *s > 0.0).map(|s| n as f64 / s);
         json!({
-            "scope": "client connection setup including DNS and TCP; pooled requests do not start a new attempt; an attempt may try multiple DNS addresses",
+            "scope": "client connection setup including DNS and TCP; pooled requests do not start a new attempt; an attempt may try multiple DNS addresses and source ports",
             "attempts": total, "established": self.successful_ms.len(), "failed": self.failed_ms.len(), "cancelled": self.cancelled,
             "attempts_per_second": rate(total), "connections_per_second": rate(self.successful_ms.len()), "failed_per_second": rate(self.failed_ms.len()),
             "setup_duration_ms": distribution(&mut all), "successful_setup_duration_ms": distribution(&mut self.successful_ms), "failed_setup_duration_ms": distribution(&mut self.failed_ms), "errors": self.errors,
@@ -192,11 +192,13 @@ mod tests {
             );
         }
         server.join().unwrap();
-        assert!(client
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .is_err());
+        assert!(
+            client
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .is_err()
+        );
         let pending = Attempt {
             metrics: metrics.clone(),
             start: Instant::now(),
