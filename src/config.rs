@@ -8,6 +8,7 @@ pub(super) struct Config {
     pub destination_ports: Vec<u16>,
     pub users: usize,
     pub start_users: usize,
+    pub step_users: Option<usize>,
     pub max_users: usize,
     pub ramp_up: String,
     pub duration: String,
@@ -33,6 +34,7 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --users N             Fixed-load run at N users; disables automatic scoring
   --score               Warm up, find the limit and confirm a five-minute score
   --start-users N       First search load (2500); positive multiple of 250
+  --step-users N        Increase search load by N instead of doubling; multiple of 250
   --max-users N         Search ceiling (300000); positive multiple of 250
   --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
@@ -57,6 +59,7 @@ Pass short diagnostic flags separately (for example, -v -v rather than -vv).
 Without --users or VUS, run the scoring workflow: 1,000-user two-minute
 unscored warm-up; five-minute searches from --start-users (2,500), doubling then narrowing to
 250 users; a separate five-minute confirmation, stepping down 250 on failure.
+--step-users selects fixed search increments; narrowing and confirmation remain at 250.
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
 
@@ -120,6 +123,7 @@ fn parse_with(
         destination_ports: vec![default_port],
         users: 100,
         start_users: 2500,
+        step_users: None,
         max_users: 300000,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
@@ -169,6 +173,7 @@ fn parse_with(
             "--destination-ports",
             "--max-users",
             "--start-users",
+            "--step-users",
             "--users",
             "--ramp-up",
             "--duration",
@@ -206,15 +211,15 @@ fn parse_with(
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
             }
-            "--start-users" | "--max-users" => {
+            "--start-users" | "--max-users" | "--step-users" => {
                 let users: usize = value.parse()?;
                 if users == 0 || !users.is_multiple_of(250) {
                     return Err(format!("{flag} must be a positive multiple of 250").into());
                 }
-                if flag == "--start-users" {
-                    config.start_users = users;
-                } else {
-                    config.max_users = users;
+                match flag {
+                    "--start-users" => config.start_users = users,
+                    "--step-users" => config.step_users = Some(users),
+                    _ => config.max_users = users,
                 }
             }
             "--users" => {

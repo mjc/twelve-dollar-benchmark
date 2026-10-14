@@ -74,6 +74,7 @@ struct Workflow {
 fn find_score(
     start_users: usize,
     max_users: usize,
+    step_users: Option<usize>,
     mut trial: impl FnMut(Stage, usize) -> Result<bool>,
 ) -> Result<usize> {
     // Warm-up thresholds do not contribute to the score.
@@ -85,7 +86,9 @@ fn find_score(
         if high == max_users {
             break;
         }
-        high = high.saturating_mul(2).min(max_users);
+        high = step_users
+            .map_or_else(|| high.saturating_mul(2), |step| high.saturating_add(step))
+            .min(max_users);
     }
     while high - low > 250 {
         let middle = (low + (high - low) / 2) / 250 * 250;
@@ -160,6 +163,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         finished_at: None,
         current: None,
         protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users, "maximum_search_users": cfg.max_users,
+            "search_step_users": cfg.step_users,
             "search_hold_s": 300, "confirmation_hold_s": 300, "resolution_users": 250,
             "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
         trials: Vec::new(),
@@ -168,7 +172,8 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     save_state(&root, &state)?;
     let mut confirmed = None;
     let mut last = None;
-    let score = find_score(cfg.start_users, cfg.max_users, |stage, users| {
+    let step = cfg.step_users;
+    let score = find_score(cfg.start_users, cfg.max_users, step, |stage, users| {
         if cancelled.load(Ordering::Relaxed) {
             return Err("scoring interrupted".into());
         }
@@ -339,7 +344,7 @@ mod tests {
     #[test]
     fn search_excludes_warmup_narrows_and_steps_down_on_confirmation_failure() {
         let mut calls = Vec::new();
-        let score = find_score(2500, 300000, |stage, users| {
+        let score = find_score(2500, 300000, None, |stage, users| {
             calls.push((stage, users));
             Ok(match stage {
                 Stage::Warmup => false,
@@ -363,9 +368,9 @@ mod tests {
 
     #[test]
     fn failures_at_the_smallest_candidate_produce_zero_without_false_confirmation() {
-        let score = find_score(2500, 300000, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
+        let score = find_score(2500, 300000, None, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
         assert_eq!(score, 0);
-        assert!(find_score(2500, 300000, |_, _| Err("control failure".into())).is_err());
+        assert!(find_score(2500, 300000, None, |_, _| Err("control failure".into())).is_err());
     }
 
     #[test]
