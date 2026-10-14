@@ -697,7 +697,11 @@ pub(super) fn render_score_table(report: &Value) -> String {
         "| Rank | PR | Implementation | Max users | Req/s | p50 | p95 | p99 | Errors | CPU | Peak memory | Limited by |\n\
 |---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n\
 | — | — | {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-        report["score"],
+        if report["score_is_lower_bound"] == true {
+            format!("≥ {}", report["score"])
+        } else {
+            report["score"].to_string()
+        },
         number(report["hold"]["requests_per_second"].as_f64(), ""),
         number(report["aggregate"]["med_ms"].as_f64(), " ms"),
         number(report["aggregate"]["p95_ms"].as_f64(), " ms"),
@@ -728,9 +732,17 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
             .map(|n| format!("{n:.2}"))
             .unwrap_or_else(|| "unavailable".into())
     };
-    let title = report["score"]
-        .as_u64()
-        .map_or_else(|| "results".into(), |score| format!("score: {score} VUs"));
+    let title = report["score"].as_u64().map_or_else(
+        || "results".into(),
+        |score| {
+            let bound = if report["score_is_lower_bound"] == true {
+                "≥ "
+            } else {
+                ""
+            };
+            format!("score: {bound}{score} VUs")
+        },
+    );
     let table = if report["score"].is_u64() {
         format!(
             "{}\nReq/s and CPU are means from samples inside the confirmed hold. Memory is sampled peak cgroup usage, including socket buffers and page cache. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",

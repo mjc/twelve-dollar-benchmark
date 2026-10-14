@@ -8,6 +8,7 @@ pub(super) struct Config {
     pub destination_ports: Vec<u16>,
     pub users: usize,
     pub start_users: usize,
+    pub max_users: usize,
     pub ramp_up: String,
     pub duration: String,
     pub tokens: PathBuf,
@@ -32,6 +33,7 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --users N             Fixed-load run at N users; disables automatic scoring
   --score               Warm up, find the limit and confirm a five-minute score
   --start-users N       First search load (2500); positive multiple of 250
+  --max-users N         Search ceiling (300000); positive multiple of 250
   --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
   --duration TIME       Hold at total users (5m); ramp-down remains 30s
@@ -118,6 +120,7 @@ fn parse_with(
         destination_ports: vec![default_port],
         users: 100,
         start_users: 2500,
+        max_users: 300000,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
@@ -164,6 +167,7 @@ fn parse_with(
             "--output-dir",
             "--source-ips",
             "--destination-ports",
+            "--max-users",
             "--start-users",
             "--users",
             "--ramp-up",
@@ -202,10 +206,15 @@ fn parse_with(
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
             }
-            "--start-users" => {
-                config.start_users = value.parse()?;
-                if config.start_users == 0 || !config.start_users.is_multiple_of(250) {
-                    return Err("--start-users must be a positive multiple of 250".into());
+            "--start-users" | "--max-users" => {
+                let users: usize = value.parse()?;
+                if users == 0 || !users.is_multiple_of(250) {
+                    return Err(format!("{flag} must be a positive multiple of 250").into());
+                }
+                if flag == "--start-users" {
+                    config.start_users = users;
+                } else {
+                    config.max_users = users;
                 }
             }
             "--users" => {
@@ -267,6 +276,9 @@ fn parse_with(
         config.users = users.parse()?;
         if config.users == 0 {
             return Err("--users must be positive".into());
+        }
+        if config.score && config.start_users > config.max_users {
+            return Err("--start-users must not exceed --max-users".into());
         }
         super::test_plan(config.users, &config.ramp_up, &config.duration)?;
         super::destinations::urls(&config.base_url, &config.destination_ports)?;

@@ -34,7 +34,10 @@ includes the configured ramp-up, 30-second ramp-down, and drain. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.
 
 Use `--score --start-users 100000` to start the search at 100,000 users.
-The warm-up stays at 1,000 users. Use `--users N` for a fixed-load run.
+The warm-up stays at 1,000 users. The search stops at `--max-users` (300,000 by
+default). If that load passes confirmation, the score is marked `≥`: the server
+limit has not been found. Increase the ceiling when the generator setup supports
+more users. Use `--users N` for a fixed-load run.
 `--duration` controls fixed-load holds. A fixed-load result is not presented as
 a confirmed score.
 
@@ -47,6 +50,7 @@ a confirmed score.
 | `--users N` | unset (scoring workflow) | Fixed total concurrent users across all generators |
 | `--score` | enabled when neither `--users` nor `VUS` is set | Find and confirm a score |
 | `--start-users N` | `2500` | First search load; positive multiple of 250 |
+| `--max-users N` | `300000` | Search ceiling; positive multiple of 250 |
 | `--label NAME` | target URL | Implementation name in the final table |
 | `--ramp-up TIME` | `60s` | Ramp to total users |
 | `--duration TIME` | `5m` | Hold at total users |

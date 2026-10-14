@@ -73,6 +73,7 @@ struct Workflow {
 
 fn find_score(
     start_users: usize,
+    max_users: usize,
     mut trial: impl FnMut(Stage, usize) -> Result<bool>,
 ) -> Result<usize> {
     // Warm-up thresholds do not contribute to the score.
@@ -81,9 +82,10 @@ fn find_score(
     let mut high = start_users;
     while trial(Stage::Search, high)? {
         low = high;
-        high = high
-            .checked_mul(2)
-            .ok_or("user count overflow during limit search")?;
+        if high == max_users {
+            break;
+        }
+        high = high.saturating_mul(2).min(max_users);
     }
     while high - low > 250 {
         let middle = (low + (high - low) / 2) / 250 * 250;
@@ -157,7 +159,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         started_at: Utc::now(),
         finished_at: None,
         current: None,
-        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users,
+        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users, "maximum_search_users": cfg.max_users,
             "search_hold_s": 300, "confirmation_hold_s": 300, "resolution_users": 250,
             "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
         trials: Vec::new(),
@@ -166,7 +168,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     save_state(&root, &state)?;
     let mut confirmed = None;
     let mut last = None;
-    let score = find_score(cfg.start_users, |stage, users| {
+    let score = find_score(cfg.start_users, cfg.max_users, |stage, users| {
         if cancelled.load(Ordering::Relaxed) {
             return Err("scoring interrupted".into());
         }
@@ -229,7 +231,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
             )
             .into());
         }
-        if cfg.monitor_user.is_some() || cfg.user.is_some() {
+        if passed && (cfg.monitor_user.is_some() || cfg.user.is_some()) {
             for metric in [
                 "requests_per_second",
                 "service_cpu_percent",
@@ -279,6 +281,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         confirmed.unwrap_or_else(|| (last.unwrap_or_default(), root.clone()));
     report["score"] = json!(score);
     report["passed"] = json!(score > 0);
+    report["score_is_lower_bound"] = json!(score == cfg.max_users);
     let limiting = state
         .trials
         .iter()
@@ -296,7 +299,9 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
             limits.push("error threshold");
         }
     }
-    report["limit_reached"] = json!(if limits.is_empty() {
+    report["limit_reached"] = json!(if score == cfg.max_users {
+        "search ceiling; server limit not found".into()
+    } else if limits.is_empty() {
         "not established".into()
     } else {
         limits.join(", ")
@@ -334,7 +339,7 @@ mod tests {
     #[test]
     fn search_excludes_warmup_narrows_and_steps_down_on_confirmation_failure() {
         let mut calls = Vec::new();
-        let score = find_score(2500, |stage, users| {
+        let score = find_score(2500, 300000, |stage, users| {
             calls.push((stage, users));
             Ok(match stage {
                 Stage::Warmup => false,
@@ -358,9 +363,9 @@ mod tests {
 
     #[test]
     fn failures_at_the_smallest_candidate_produce_zero_without_false_confirmation() {
-        let score = find_score(2500, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
+        let score = find_score(2500, 300000, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
         assert_eq!(score, 0);
-        assert!(find_score(2500, |_, _| Err("control failure".into())).is_err());
+        assert!(find_score(2500, 300000, |_, _| Err("control failure".into())).is_err());
     }
 
     #[test]
