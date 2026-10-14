@@ -98,14 +98,6 @@ fn scp() -> Command {
 }
 
 fn checked(cmd: &mut Command, cancelled: &AtomicBool) -> Result<()> {
-    checked_with_timeout(cmd, cancelled, Duration::from_secs(120))
-}
-
-fn checked_with_timeout(
-    cmd: &mut Command,
-    cancelled: &AtomicBool,
-    timeout: Duration,
-) -> Result<()> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -118,7 +110,7 @@ fn checked_with_timeout(
         let _ = stderr.read_to_string(&mut message);
         let _ = sender.send(message);
     });
-    let status = wait_child(&mut child, cancelled, Some(timeout));
+    let status = wait_child(&mut child, cancelled, Some(Duration::from_secs(120)));
     // A proxy descendant may retain stderr after its parent was terminated.
     let message = receiver
         .recv_timeout(Duration::from_secs(1))
@@ -131,7 +123,7 @@ fn checked_with_timeout(
 }
 
 fn execute(cmd: &mut Command, cancelled: &AtomicBool) -> Result<ExitStatus> {
-    // The coordinator forwards one SIGINT; terminal Ctrl-C must not also reach Goose.
+    // The coordinator forwards one SIGINT; the terminal sends Ctrl-C to this process group.
     let mut child = cmd.stdin(Stdio::null()).process_group(0).spawn()?;
     wait_child(&mut child, cancelled, None)
 }
@@ -177,8 +169,30 @@ fn wait_child(
     }
 }
 
+pub(super) fn wait_start(control: &Path) -> Result<i64> {
+    fs::write(control.with_extension("ready"), "ready\n")?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !control.with_extension("start").exists() {
+        if control.exists() || Instant::now() >= deadline {
+            fs::write(control.with_extension("done"), "not started\n")?;
+            return Err("coordinated start cancelled or timed out".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let start_at: i64 = fs::read_to_string(control.with_extension("start"))?
+        .trim()
+        .parse()?;
+    if Utc::now().timestamp_millis() - start_at > 250 {
+        fs::write(control.with_extension("done"), "missed start\n")?;
+        return Err(
+            "missed coordinated start; check SSH delay and host clock synchronization".into(),
+        );
+    }
+    Ok(start_at)
+}
+
 pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
-    let start_at = twelve_dollar_benchmark::control::wait_start(control)?;
+    let start_at = wait_start(control)?;
     let mut child = Command::new(env::current_exe()?)
         .args(args)
         .env("BENCH_START_AT", start_at.to_string())
@@ -203,6 +217,43 @@ pub(super) fn supervise(control: &Path, args: &[String]) -> Result<u8> {
     Ok(status.code().unwrap_or(2) as u8)
 }
 
+pub(super) fn ready_supervised(control: &Path) -> Result<u8> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !control.with_extension("ready").exists() {
+        if Instant::now() >= deadline {
+            return Err("remote generator did not become ready".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(0)
+}
+
+pub(super) fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
+    let _: i64 = timestamp.parse()?;
+    let temporary = control.with_extension("start.tmp");
+    fs::write(&temporary, timestamp)?;
+    refresh_observer(control)?;
+    fs::rename(temporary, control.with_extension("start"))?;
+    Ok(0)
+}
+
+pub(super) fn refresh_observer(control: &Path) -> Result<u8> {
+    fs::write(control.with_extension("lease"), "alive\n")?;
+    Ok(0)
+}
+
+pub(super) fn stop_supervised(control: &Path) -> Result<u8> {
+    fs::write(control, "cancel\n")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !control.with_extension("done").exists() {
+        if Instant::now() >= deadline {
+            return Err("remote supervisor did not confirm shutdown".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(0)
+}
+
 // A target observer uses the same start barrier as the generators, then stops
 // after their final responses. Network counters retain their own measured window.
 struct TargetMonitor {
@@ -222,7 +273,6 @@ impl TargetMonitor {
         output: &Path,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
-        let binary = binary.with_file_name("twelve-dollar-observer");
         let url = reqwest::Url::parse(&cfg.base_url)?;
         let host = url
             .host_str()
@@ -242,7 +292,7 @@ impl TargetMonitor {
                 user.clone(),
                 host.to_owned(),
                 format!(
-                    "/tmp/twelve-dollar-observer-target-{}-{}",
+                    "/tmp/twelve-dollar-benchmark-target-{}-{}",
                     Utc::now().timestamp_millis(),
                     std::process::id()
                 ),
@@ -286,23 +336,23 @@ impl TargetMonitor {
                 cancelled,
             )?;
             checked(
-                scp().arg("--").arg(&binary).arg(destination(
+                scp().arg("--").arg(binary).arg(destination(
                     user,
                     host,
-                    &format!("{remote_dir}/twelve-dollar-observer"),
+                    &format!("{remote_dir}/twelve-dollar-benchmark"),
                 )),
                 cancelled,
             )?;
             checked(
                 ssh(user, host).arg(format!(
                     "{} --version",
-                    quote(&format!("{remote_dir}/twelve-dollar-observer"))
+                    quote(&format!("{remote_dir}/twelve-dollar-benchmark"))
                 )),
                 cancelled,
             )?;
             let mut command = ssh(user, host);
             command.arg(format!(
-                "cd {} || exit 2; trap '' HUP; exec env {} ./twelve-dollar-observer --observe metrics",
+                "cd {} || exit 2; trap '' HUP; exec env {} ./twelve-dollar-benchmark --observe metrics",
                 quote(remote_dir),
                 assignments
                     .iter()
@@ -312,7 +362,7 @@ impl TargetMonitor {
             ));
             command
         } else {
-            let mut command = Command::new(&binary);
+            let mut command = Command::new(binary);
             command.current_dir(&dir).arg("--observe").arg(&control);
             for assignment in &assignments {
                 let (key, value) = assignment.split_once('=').unwrap();
@@ -328,7 +378,7 @@ impl TargetMonitor {
             .spawn()?;
         Ok(Self {
             child: Some(child),
-            binary,
+            binary: binary.into(),
             dir,
             control,
             remote,
@@ -342,7 +392,7 @@ impl TargetMonitor {
             let mut cmd = ssh(user, host);
             cmd.arg(format!(
                 "{} {} {} {}",
-                quote(&format!("{remote_dir}/twelve-dollar-observer")),
+                quote(&format!("{remote_dir}/twelve-dollar-benchmark")),
                 action,
                 quote(&format!("{remote_dir}/metrics")),
                 timestamp.map(quote).unwrap_or_default()
@@ -386,7 +436,7 @@ impl TargetMonitor {
                     let mut command = ssh(user, host);
                     command.arg(format!(
                         "{} --refresh-observer {}",
-                        quote(&format!("{dir}/twelve-dollar-observer")),
+                        quote(&format!("{dir}/twelve-dollar-benchmark")),
                         quote(&format!("{dir}/metrics"))
                     ));
                     command
@@ -395,9 +445,7 @@ impl TargetMonitor {
                     command.arg("--refresh-observer").arg(&control);
                     command
                 };
-                // Leave time to retry stalled heartbeats within the 120-second lease.
-                if let Err(error) =
-                    checked_with_timeout(&mut command, &flag, Duration::from_secs(15))
+                if let Err(error) = checked(&mut command, &flag)
                     && !flag.load(Ordering::Relaxed)
                 {
                     eprintln!("Target telemetry lease refresh failed: {error}");
@@ -613,7 +661,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
                 finished = Some(finished.map_or(report.finished_at, |s| s.max(report.finished_at)));
                 hosts.extend(report.hosts);
                 source_ips.extend(report.source_ips);
-                if report.planned_hold_s > 0.0 {
+                if worker.remote_dir.is_some() && report.planned_hold_s > 0.0 {
                     required_hold = required_hold.max(report.planned_hold_s);
                     if let (Some(begin), Some(end)) =
                         (report.hold_started_at, report.hold_finished_at)
@@ -672,17 +720,16 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         .and_then(|(s, f)| (f - s).to_std().ok())
         .map(|d| d.as_secs_f64());
     json!({
-        "generator": "goose 0.18.1", "workers": workers,
+        "generator": "twelve-dollar-benchmark", "workers": workers,
         "completed": completed, "passed": completed && passes(&summary, runtime_errors),
         "runtime_errors": runtime_errors, "maximum_users": maximum_users,
         "runtime_error_details": runtime_error_details,
         "total_users": total_users, "hosts": hosts, "source_ips": source_ips,
         "started_at": started, "finished_at": finished,
         "common_hold_s": common_hold_s, "required_hold_s": required_hold,
-        "hold_started_at": hold_start, "hold_finished_at": hold_end,
         // An elapsed interval across all workers, not a sum of their durations.
         "duration_s": started.zip(finished).and_then(|(s, f)| (f-s).to_std().ok()).map(|d| d.as_secs_f64()),
-        "latency": "HTTP sending, waiting and receiving through the complete response body; excludes connection setup and pool wait",
+        "latency": "client wall time through complete response body, including connection setup",
         "percentiles": "k6 linear interpolation over all workers' unrounded samples",
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "aggregate": summary, "endpoints": endpoints,
@@ -692,49 +739,6 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     })
 }
 
-pub(super) fn render_score_table(report: &Value) -> String {
-    let number = |value: Option<f64>, suffix: &str| {
-        value
-            .map(|n| format!("{n:.2}{suffix}"))
-            .unwrap_or_else(|| "unavailable".into())
-    };
-    let label = report["implementation"]
-        .as_str()
-        .unwrap_or("target")
-        .replace('|', "\\|")
-        .replace(['\r', '\n'], " ");
-    format!(
-        "| Rank | PR | Implementation | Max users | Req/s | p50 | p95 | p99 | Errors | CPU | Peak memory | Limited by |\n\
-|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n\
-| — | — | {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-        if report["score_is_lower_bound"] == true {
-            format!("≥ {}", report["score"])
-        } else {
-            report["score"].to_string()
-        },
-        number(report["hold"]["requests_per_second"].as_f64(), ""),
-        number(report["aggregate"]["med_ms"].as_f64(), " ms"),
-        number(report["aggregate"]["p95_ms"].as_f64(), " ms"),
-        number(report["aggregate"]["p99_ms"].as_f64(), " ms"),
-        number(
-            report["aggregate"]["failure_rate"]
-                .as_f64()
-                .map(|n| n * 100.0),
-            "%"
-        ),
-        number(report["hold"]["service_cpu_percent"].as_f64(), "%"),
-        number(
-            report["hold"]["sampled_peak_memory_bytes"]
-                .as_f64()
-                .map(|n| n / 1_048_576.0),
-            " MiB"
-        ),
-        report["limit_reached"]
-            .as_str()
-            .unwrap_or("not established")
-    )
-}
-
 pub(super) fn render_report(report: &Value, compact: bool) -> String {
     let fmt = |value: &Value| {
         value
@@ -742,42 +746,29 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
             .map(|n| format!("{n:.2}"))
             .unwrap_or_else(|| "unavailable".into())
     };
-    let title = report["score"].as_u64().map_or_else(
-        || "results".into(),
-        |score| {
-            let bound = if report["score_is_lower_bound"] == true {
-                "≥ "
-            } else {
-                ""
-            };
-            format!("score: {bound}{score} VUs")
-        },
-    );
-    let table = if report["score"].is_u64() {
-        format!(
-            "{}\nReq/s and CPU are means from samples inside the confirmed hold. Memory is sampled peak cgroup usage, including socket buffers and page cache. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",
-            render_score_table(report)
-        )
+    let title = report["score"]
+        .as_u64()
+        .map_or_else(|| "results".into(), |score| format!("score: {score} VUs"));
+    let vu_label = if report["score"].is_u64() {
+        "Score"
     } else {
-        format!(
-            "| Requested VUs | Reached VUs | p95 ms | p99 ms | HTTP errors % | Result |\n|---:|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} | {} |",
-            report["requested_users"],
-            report["maximum_users"],
-            fmt(&report["aggregate"]["p95_ms"]),
-            fmt(&report["aggregate"]["p99_ms"]),
-            fmt(&report["aggregate"]["failure_rate"]
-                .as_f64()
-                .map(|rate| json!(rate * 100.0))
-                .unwrap_or(Value::Null)),
-            if report["passed"] == true {
-                "PASS"
-            } else {
-                "FAIL"
-            }
-        )
+        "Requested"
     };
     let mut text = format!(
-        "# Benchmark {title}\n\n{table}\n\nThresholds: p95 < 500 ms, p99 < 1,000 ms, HTTP errors < 1%.\n{} requests over {} seconds, including ramp and drain.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
+        "# Benchmark {title}\n\n| {vu_label} VUs | Reached VUs | p95 ms | p99 ms | HTTP errors % | Result |\n|---:|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} | {} |\n\nThresholds: p95 < 500 ms, p99 < 1,000 ms, HTTP errors < 1%.\n{} requests over {} seconds, including ramp and drain.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
+        report.get("score").unwrap_or(&report["requested_users"]),
+        report["maximum_users"],
+        fmt(&report["aggregate"]["p95_ms"]),
+        fmt(&report["aggregate"]["p99_ms"]),
+        fmt(&report["aggregate"]["failure_rate"]
+            .as_f64()
+            .map(|rate| json!(rate * 100.0))
+            .unwrap_or(Value::Null)),
+        if report["passed"] == true {
+            "PASS"
+        } else {
+            "FAIL"
+        },
         report["aggregate"]["requests"],
         fmt(&report["duration_s"])
     );
@@ -1002,7 +993,29 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
         text.push_str(&format!("- {}: {}\n", markdown_text(kind), count));
     }
     if let Some(examples) = value["examples"].as_array() {
-        for example in examples.iter().take(5) {
+        let mut shown = Vec::with_capacity(5);
+        let mut workers = BTreeSet::new();
+        for (index, example) in examples.iter().enumerate() {
+            if shown.len() == 5 {
+                break;
+            }
+            if let Some(worker) = example["worker"].as_str()
+                && workers.insert(worker)
+            {
+                shown.push(index);
+            }
+        }
+        for index in 0..examples.len() {
+            if shown.len() == 5 {
+                break;
+            }
+            if !shown.contains(&index) {
+                shown.push(index);
+            }
+        }
+        shown.sort_unstable();
+        for index in &shown {
+            let example = &examples[*index];
             let worker = example["worker"].as_str().map(markdown_text);
             let endpoint = example["endpoint"]
                 .as_str()
@@ -1050,7 +1063,7 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
                 ));
             }
         }
-        let hidden = examples.len().saturating_sub(5);
+        let hidden = examples.len().saturating_sub(shown.len());
         if hidden > 0 {
             text.push_str(&format!("- {hidden} stored examples not shown.\n"));
         }
@@ -1067,20 +1080,7 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         return Ok(0);
     }
     let username = cfg.user.clone();
-    let options = cfg.diagnostics.clone();
     let binary = env::current_exe()?;
-    if options.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--version" | "-V" | "--list" | "-l" | "--scenarios-list"
-        )
-    }) {
-        return Ok(Command::new(binary)
-            .args(options)
-            .status()?
-            .code()
-            .unwrap_or(2) as u8);
-    }
     if cfg.score {
         return super::scoring::run(&cfg, args, cancelled);
     }
@@ -1206,7 +1206,6 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
             for (worker, ip) in workers.into_iter().zip(ips) {
                 let output = output.clone();
                 let user = user.clone();
-                let options = options.clone();
                 let cancelled = cancelled.clone();
                 let base_url = cfg.base_url.clone();
                 let destination_ports = destination_ports.clone();
@@ -1233,14 +1232,9 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
                             "SOURCE_IPS=".into(),
                         ];
                         let command = format!(
-                            "cd {} || exit 2; trap '' HUP; exec env {} ../twelve-dollar-benchmark --supervise ../cancel {}",
+                            "cd {} || exit 2; trap '' HUP; exec env {} ../twelve-dollar-benchmark --supervise ../cancel",
                             quote(&format!("{remote_dir}/results")),
                             assignments
-                                .iter()
-                                .map(|v| quote(v))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                            options
                                 .iter()
                                 .map(|v| quote(v))
                                 .collect::<Vec<_>>()
@@ -1345,7 +1339,6 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
         start_monitor(&mut monitor, &mut target_unavailable, &start_at, &cancelled);
         let status = execute(
             Command::new(&binary)
-                .args(options)
                 .current_dir(&dir)
                 .env("TOKENS", tokens)
                 .env("BASE_URL", &cfg.base_url)
@@ -1400,33 +1393,6 @@ pub(super) fn run(args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
     aggregate["network_hosts"] =
         network_hosts(&aggregate["generator_telemetry"], &target_telemetry);
     aggregate["target_telemetry"] = target_telemetry;
-    aggregate["implementation"] = json!(cfg.label.as_deref().unwrap_or(&cfg.base_url));
-    let hold = (|| -> Result<Value> {
-        let start = serde_json::from_value(aggregate["hold_started_at"].clone())?;
-        let finish = serde_json::from_value(aggregate["hold_finished_at"].clone())?;
-        let mut requests_per_second = 0.0;
-        for worker in &workers {
-            let hold = twelve_dollar_benchmark::telemetry::summarize_hold(
-                &output.join(&worker.name).join("telemetry.jsonl"),
-                start,
-                finish,
-            )?;
-            requests_per_second += hold["requests_per_second"]
-                .as_f64()
-                .ok_or("hold request counters unavailable")?;
-        }
-        let mut target = twelve_dollar_benchmark::telemetry::summarize_hold(
-            &output.join("target/telemetry.jsonl"),
-            start,
-            finish,
-        )
-        .unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}));
-        target["requests_per_second"] = json!(requests_per_second);
-        Ok(target)
-    })();
-    aggregate["hold"] =
-        hold.unwrap_or_else(|error| json!({"unavailable_reason": error.to_string()}));
-
     aggregate["destination_ports"] = json!(cfg.destination_ports);
     aggregate["requested_users"] = json!(cfg.users);
     aggregate["source_port_allocation"] = json!({"first": 1024, "last": 65535,
@@ -1574,17 +1540,15 @@ mod tests {
             raw[0].failed = 101;
             for _ in 0..101 {
                 raw[0].errors.record(example(
-                    super::super::errors::ExampleContext {
-                        endpoint: "GET /feed",
-                        path: "/feed",
-                        user_index: worker.user_offset,
-                        destination: "http://fixture.test:3000",
-                        source_ip: Some("192.0.2.1".into()),
-                    },
+                    "GET /feed",
+                    "/feed",
                     Some(503),
                     "http",
                     "queue full",
                     Some(b"busy"),
+                    worker.user_offset,
+                    "http://fixture.test:3000",
+                    Some("192.0.2.1".into()),
                 ));
             }
             let mut aggregate = Samples {
@@ -1620,6 +1584,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(other).unwrap();
     }
+
     #[test]
     fn total_users_split_evenly_with_disjoint_token_offsets() {
         assert_eq!(split_users(10, 3).unwrap(), [(4, 0), (3, 4), (3, 7)]);

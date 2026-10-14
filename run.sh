@@ -5,7 +5,7 @@ export BENCH_CALLER_DIR="$PWD"
 bench_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$bench_dir"
 
-usage() { echo "Usage: $0 [IP PORTS] [options] [-- Goose diagnostics]; use --help for options" >&2; exit 2; }
+usage() { echo "Usage: $0 [IP PORTS] [options]; use --help for options" >&2; exit 2; }
 
 validate_ports() {
   local value=$1 item start end
@@ -32,7 +32,7 @@ validate_ports() {
   done
 }
 
-# Keep BASE_URL and Goose flags available, or accept an explicit target IP/port.
+# Keep BASE_URL defaults available, or accept an explicit target IP/port.
 if [[ $# -gt 0 && $1 != -* ]]; then
   if [[ $# -lt 2 ]] || ! validate_ports "$2"; then
     usage
@@ -72,7 +72,7 @@ fi
 if [[ -n ${SUMMARY:-} && $SUMMARY != /* ]]; then
   export SUMMARY="$BENCH_CALLER_DIR/$SUMMARY"
 elif [[ -z ${SUMMARY:-} ]]; then
-  export SUMMARY="$BENCH_CALLER_DIR/results/goose-summary.json"
+  export SUMMARY="$BENCH_CALLER_DIR/results/summary.json"
 fi
 
 # Give the launcher and its local generator a useful descriptor floor. This

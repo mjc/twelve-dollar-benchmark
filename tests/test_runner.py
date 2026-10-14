@@ -72,7 +72,7 @@ else:
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="goose runner ")
+        self.temp = tempfile.TemporaryDirectory(prefix="benchmark runner ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.bench = self.root / "checkout"
@@ -117,9 +117,11 @@ class RunnerTests(unittest.TestCase):
             self.skipTest("host hard limit cannot accommodate the descriptor floor")
         run = self.run_runner(self.bench, limits=(32, hard))
         self.assertEqual(run.returncode, 7, run.stderr)
-        soft, actual_hard = json.loads((self.root / "result").read_text())["nofile"]
+        result = json.loads((self.root / "result").read_text())
+        soft, actual_hard = result["nofile"]
         self.assertEqual(soft, 524288)
         self.assertEqual(actual_hard, hard)
+        self.assertEqual(result["summary"], str(self.bench / "results" / "summary.json"))
 
     def test_launcher_preserves_already_higher_soft_limit(self):
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
@@ -157,7 +159,7 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(cwd=cwd):
                 self.env.update(BASE_URL="http://example.test:9000", SOURCE_IPS="127.0.0.[1-5]",
                                 SUMMARY="../results/custom.json")
-                run = self.run_runner(cwd, *target, "--request-log", "file with spaces")
+                run = self.run_runner(cwd, *target, "--users=7")
                 self.assertEqual(run.returncode, 7, run.stderr)
                 result = json.loads((self.root / "result").read_text())
                 self.assertEqual(result["host"], host)
@@ -165,7 +167,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(Path(result["tokens"]).resolve(), self.root / "main/seed/tokens.json")
                 self.assertEqual(result["summary"], str(cwd / "../results/custom.json"))
                 self.assertEqual(result["source_ips"], "127.0.0.[1-5]")
-                self.assertEqual(result["args"], ["--request-log", "file with spaces"])
+                self.assertEqual(result["args"], ["--users=7"])
         self.assertFalse(any(call[0] in ["curl", "rustup"] for call in self.calls()))
 
     def test_rustup_bootstrap_and_pinned_toolchain_reuse(self):
@@ -249,7 +251,7 @@ else:
 @unittest.skipUnless(os.environ.get("TWELVE_DOLLAR_BENCHMARK_BIN"), "set TWELVE_DOLLAR_BENCHMARK_BIN to test the built coordinator")
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="goose ssh ")
+        self.temp = tempfile.TemporaryDirectory(prefix="benchmark ssh ")
         self.root = Path(self.temp.name)
         self.addCleanup(self.cleanup)
         self.binary = Path(os.environ["TWELVE_DOLLAR_BENCHMARK_BIN"]).resolve()
@@ -333,10 +335,13 @@ class CoordinatorTests(unittest.TestCase):
         report = json.loads((self.root / kwargs.get("output", "results") / "aggregate.json").read_text())
         return run, report
 
-    def test_https_targets_and_certificate_options_fail_before_load(self):
-        for args, host in [(self.command(), f"https://127.0.0.1:{self.server.server_port}"),
-                           ([str(self.binary), "--host", f"https://127.0.0.1:{self.server.server_port}"], None),
-                           (self.command(extra=["--", "--accept-invalid-certs"]), None)]:
+    def test_https_targets_and_unsupported_options_fail_before_load(self):
+        for args, host, message in [
+            (self.command(), f"https://127.0.0.1:{self.server.server_port}", "TLS"),
+            ([str(self.binary), "--host", f"https://127.0.0.1:{self.server.server_port}"], None, "unsupported option"),
+            (self.command(extra=["--accept-invalid-certs"]), None, "unsupported option"),
+            (self.command(extra=["--request-log", "trace.log"]), None, "unsupported option"),
+        ]:
             with self.subTest(args=args):
                 env = dict(self.env)
                 if host:
@@ -344,7 +349,7 @@ class CoordinatorTests(unittest.TestCase):
                 run = subprocess.run(args, env=env, cwd=self.root,
                                      capture_output=True, text=True, timeout=15)
                 self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
-                self.assertIn("TLS", run.stderr)
+                self.assertIn(message, run.stderr)
                 self.assertEqual(self.requests, 0)
                 self.assertFalse((self.root / "results").exists())
                 self.assertFalse((self.root / "calls").exists())
@@ -360,7 +365,7 @@ class CoordinatorTests(unittest.TestCase):
             second_thread.join()
         self.addCleanup(stop_second)
         ports = f"{self.server.server_port},{second.server_port}"
-        run, report = self.run_coordinator(extra=["--request-log", "native.log", "--destination-ports", ports])
+        run, report = self.run_coordinator(extra=["--destination-ports", ports])
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr + str(report))
         self.assertTrue(report["passed"])
         self.assertEqual(report["maximum_users"], 2)
@@ -372,7 +377,7 @@ class CoordinatorTests(unittest.TestCase):
         samples = []
         for index, worker in enumerate(report["workers"]):
             directory = self.root / "results" / worker["name"]
-            for filename in ["summary.json", "samples.json", "output.log", "native.log"]:
+            for filename in ["summary.json", "samples.json", "output.log"]:
                 self.assertTrue((directory / filename).exists(), filename)
             native = json.loads((directory / "summary.json").read_text())
             self.assertEqual(native["hosts"], [f"http://127.0.0.1:{[self.server.server_port, second.server_port][index]}/"])
@@ -393,8 +398,9 @@ class CoordinatorTests(unittest.TestCase):
         second_thread.start()
         self.addCleanup(lambda: (second.shutdown(), second.server_close(), second_thread.join()))
         self.error_bodies[second.server_port] = b"second host overloaded"
-        run, report = self.run_coordinator(extra=["--request-log", "native.log",
-                                                  "--destination-ports", f"{self.server.server_port},{second.server_port}"])
+        run, report = self.run_coordinator(extra=[
+            "--destination-ports", f"{self.server.server_port},{second.server_port}"
+        ])
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
         feed = report["endpoints"]["GET /feed"]["errors"]
         self.assertGreaterEqual(feed["counts"]["status:503"], 2)
@@ -427,9 +433,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertFalse(report["completed"])
         self.assertFalse(report["passed"])
 
-    def test_local_run_writes_samples_and_native_output_in_directory(self):
+    def test_local_run_writes_benchmark_outputs_in_directory(self):
         self.env.update(SOURCE_IPS="127.0.0.[1-2]", SUMMARY=str(self.root / "legacy.json"))
-        run, report = self.run_coordinator(remote=False, extra=["--request-log", "native.log"])
+        run, report = self.run_coordinator(remote=False)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         first_table = next(line for line in run.stdout.splitlines() if line.startswith("|"))
         self.assertIn("Requested VUs", first_table)
@@ -438,7 +444,7 @@ class CoordinatorTests(unittest.TestCase):
             self.assertIn(heading, run.stdout)
         self.assertEqual(report["source_ips"], ["127.0.0.1", "127.0.0.2"])
         self.assertEqual(report, json.loads((self.root / "legacy.json").read_text()))
-        for filename in ["summary.json", "samples.json", "output.log", "native.log"]:
+        for filename in ["summary.json", "samples.json", "output.log"]:
             self.assertTrue((self.root / "results" / "local" / filename).exists())
 
     def test_cancel_stops_remote_supervisors_and_never_passes(self):

@@ -1,15 +1,18 @@
-use std::{env, error::Error, net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    env,
+    error::Error,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(super) struct Config {
     pub base_url: String,
-    pub label: Option<String>,
     pub destination_ports: Vec<u16>,
     pub users: usize,
-    pub start_users: usize,
-    pub step_users: Option<usize>,
-    pub max_users: usize,
     pub ramp_up: String,
     pub duration: String,
     pub tokens: PathBuf,
@@ -17,16 +20,14 @@ pub(super) struct Config {
     pub user: Option<String>,
     pub monitor_user: Option<String>,
     pub output: Option<PathBuf>,
-    pub diagnostics: Vec<String>,
     pub application_pids: Vec<u32>,
     pub proxy_pids: Vec<u32>,
     pub sample_interval: Duration,
     pub help: bool,
     pub score: bool,
-    pub skip_warmup: bool,
 }
 
-pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diagnostics]
+pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options]
 
   --source-ips IPS       Local source IPs, or SSH generator hosts with --user
   --destination-ports PORTS  Destination ports, as a list or inclusive range
@@ -34,11 +35,6 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --monitor-user USER    Monitor the target over SSH while generating locally
   --users N             Fixed-load run at N users; disables automatic scoring
   --score               Warm up, find the limit and confirm a five-minute score
-  --skip-warmup         Reuse a warm-up already completed in this session
-  --start-users N       First search load (2500); positive multiple of 250
-  --step-users N        Increase search load by N instead of doubling; multiple of 250
-  --max-users N         Search ceiling (300000); positive multiple of 250
-  --label NAME          Implementation name in the final Markdown table
   --ramp-up TIME        Ramp to total users (60s)
   --duration TIME       Hold at total users (5m); ramp-down remains 30s
   --tokens PATH         Token file; explicit paths resolve from your directory
@@ -49,20 +45,16 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options] [-- Goose diag
   --help                Show this runner's help
 
 Target monitoring uses --monitor-user, falling back to --user. Without SSH, target
-monitoring is local for loopback targets. Application and recognized proxy
-processes are discovered from listeners and local TCP backends. PID flags are
-optional overrides. An undetected proxy is reported as unavailable, never as zero CPU.
+monitoring is local for loopback targets. Application PIDs default to accessible
+processes listening on the target port; identify the backend explicitly behind a
+proxy. An unselected proxy is reported as unavailable, never as zero CPU.
 
 Legacy BASE_URL, DESTINATION_PORTS, VUS, RAMP_UP, DURATION, TOKENS and SOURCE_IPS remain defaults.
-Explicit arguments win. Goose diagnostic flags may follow --; --host and native
-workload overrides are rejected so they cannot change the target or total load.
-Pass short diagnostic flags separately (for example, -v -v rather than -vv).
+Explicit arguments win. Unsupported options are rejected.
 
 Without --users or VUS, run the scoring workflow: 1,000-user two-minute
-unscored warm-up; one-minute searches from --start-users (2,500), doubling then narrowing to
+unscored warm-up; five-minute searches from 2,500, doubling then narrowing to
 250 users; a separate five-minute confirmation, stepping down 250 on failure.
---step-users selects fixed search increments; narrowing and confirmation remain at 250.
-Trials drain completely, then pause for one minute before the next search or confirmation.
 --score explicitly selects this workflow. --duration applies to fixed-load runs.
 ";
 
@@ -83,7 +75,44 @@ pub(super) fn pids(value: &str) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-pub(super) use twelve_dollar_benchmark::parse_destination_ports;
+pub(super) fn parse_destination_ports(value: &str) -> Result<Vec<u16>> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value);
+    if value.is_empty() {
+        return Err("destination ports must not be empty".into());
+    }
+
+    let mut ports = Vec::new();
+    let mut seen = BTreeSet::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err("destination ports must not contain empty entries".into());
+        }
+        let (start, end) = match item.split_once('-') {
+            Some((start, end)) => (start.trim().parse::<u16>()?, end.trim().parse::<u16>()?),
+            None => {
+                let port = item.parse::<u16>()?;
+                (port, port)
+            }
+        };
+        if start == 0 || end == 0 {
+            return Err("destination ports must be positive".into());
+        }
+        if start > end {
+            return Err("destination port ranges must be ascending".into());
+        }
+        for port in start..=end {
+            if seen.insert(port) {
+                ports.push(port);
+            }
+        }
+    }
+    Ok(ports)
+}
 
 fn interval(value: &str) -> Result<Duration> {
     let seconds: f64 = value.trim_end_matches('s').parse()?;
@@ -93,16 +122,73 @@ fn interval(value: &str) -> Result<Duration> {
     Ok(Duration::try_from_secs_f64(seconds)?)
 }
 
+pub(super) fn duration(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration must not be empty".into());
+    }
+    let mut total = Duration::ZERO;
+    let mut rest = value;
+    let mut previous_unit = 4;
+    while !rest.is_empty() {
+        let numeric_len = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+            .map(|(index, c)| index + c.len_utf8())
+            .last()
+            .ok_or("invalid duration")?;
+        let amount: f64 = rest[..numeric_len].parse()?;
+        if !amount.is_finite() || amount < 0.0 {
+            return Err("duration must be finite and nonnegative".into());
+        }
+        rest = &rest[numeric_len..];
+        let (unit, multiplier, rank) = match rest.chars().next() {
+            Some('h') => ("h", 3600.0, 3),
+            Some('m') => ("m", 60.0, 2),
+            Some('s') => ("s", 1.0, 1),
+            None if previous_unit == 4 => ("", 1.0, 0),
+            _ => return Err("duration units must be h, m, or s".into()),
+        };
+        if rank >= previous_unit && rank != 0 {
+            return Err("duration units must be ordered h, m, s without repeats".into());
+        }
+        let seconds = amount * multiplier;
+        if !seconds.is_finite() {
+            return Err("duration is too large".into());
+        }
+        let component =
+            Duration::try_from_secs_f64(seconds).map_err(|_| "duration is too large")?;
+        total = total
+            .checked_add(component)
+            .ok_or("duration is too large")?;
+        if rank == 0 {
+            if !rest.is_empty() {
+                return Err("invalid duration".into());
+            }
+            break;
+        }
+        previous_unit = rank;
+        rest = &rest[unit.len()..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    Instant::now()
+        .checked_add(total)
+        .ok_or("duration cannot be represented by the system clock")?;
+    Ok(total)
+}
+
 pub(super) fn parse(args: &[String]) -> Result<Config> {
     let caller = env::var_os("BENCH_CALLER_DIR")
         .map(PathBuf::from)
         .map_or_else(env::current_dir, Ok)?;
-    parse_with(args, caller, |key| env::var(key).ok())
+    parse_with(args, &caller, |key| env::var(key).ok())
 }
 
 fn parse_with(
     args: &[String],
-    caller: PathBuf,
+    caller: &Path,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Config> {
     let default = |key, fallback: &str| {
@@ -122,12 +208,8 @@ fn parse_with(
     let mut explicit_destination_ports = None;
     let mut config = Config {
         base_url,
-        label: None,
         destination_ports: vec![default_port],
         users: 100,
-        start_users: 2500,
-        step_users: None,
-        max_users: 300000,
         ramp_up: default("RAMP_UP", "60s"),
         duration: default("DURATION", "5m"),
         tokens: PathBuf::from(default("TOKENS", "seed/tokens.json")),
@@ -135,21 +217,15 @@ fn parse_with(
         user: None,
         monitor_user: None,
         output: None,
-        diagnostics: Vec::new(),
         application_pids: Vec::new(),
         proxy_pids: Vec::new(),
         sample_interval: interval(&default("BENCH_SAMPLE_INTERVAL", "1"))?,
         help: false,
         score: false,
-        skip_warmup: false,
     };
     let mut args = args.iter().peekable();
     let mut target = Vec::new();
     while let Some(arg) = args.next() {
-        if arg == "--" {
-            config.diagnostics.extend(args.cloned());
-            break;
-        }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
@@ -164,27 +240,16 @@ fn parse_with(
             explicit_score = true;
             continue;
         }
-        if flag == "--skip-warmup" {
-            if inline.is_some() {
-                return Err("--skip-warmup takes no value".into());
-            }
-            config.skip_warmup = true;
-            continue;
-        }
         if !flag.starts_with('-') {
             target.push(arg.clone());
             continue;
         }
         let takes_value = [
-            "--label",
             "--user",
             "--monitor-user",
             "--output-dir",
             "--source-ips",
             "--destination-ports",
-            "--max-users",
-            "--start-users",
-            "--step-users",
             "--users",
             "--ramp-up",
             "--duration",
@@ -195,15 +260,7 @@ fn parse_with(
         ]
         .contains(&flag);
         if !takes_value {
-            config.diagnostics.push(arg.clone());
-            if inline.is_none() && diagnostic_takes_value(flag) {
-                config.diagnostics.push(
-                    args.next()
-                        .ok_or("missing diagnostic option value")?
-                        .clone(),
-                );
-            }
-            continue;
+            return Err(format!("unsupported option: {arg}").into());
         }
         let value = inline
             .map(str::to_owned)
@@ -213,7 +270,6 @@ fn parse_with(
             return Err(format!("{flag} requires a non-empty value").into());
         }
         match flag {
-            "--label" => config.label = Some(value),
             "--user" => config.user = Some(value),
             "--monitor-user" => config.monitor_user = Some(value),
             "--output-dir" => config.output = Some(caller.join(value)),
@@ -221,17 +277,6 @@ fn parse_with(
             "--source-ips" => config.source_ips = value,
             "--destination-ports" => {
                 explicit_destination_ports = Some(parse_destination_ports(&value)?);
-            }
-            "--start-users" | "--max-users" | "--step-users" => {
-                let users: usize = value.parse()?;
-                if users == 0 || !users.is_multiple_of(250) {
-                    return Err(format!("{flag} must be a positive multiple of 250").into());
-                }
-                match flag {
-                    "--start-users" => config.start_users = users,
-                    "--step-users" => config.step_users = Some(users),
-                    _ => config.max_users = users,
-                }
             }
             "--users" => {
                 users = value;
@@ -242,21 +287,23 @@ fn parse_with(
             "--application-pids" => config.application_pids = pids(&value)?,
             "--proxy-pids" => config.proxy_pids = pids(&value)?,
             "--sample-interval" => config.sample_interval = interval(&value)?,
-            _ => unreachable!(),
+            _ => return Err(format!("unsupported option: {flag}").into()),
         }
     }
     let positional_destination_ports = if !target.is_empty() {
-        if target.len() != 2 {
+        let [target_ip, target_ports] = target.as_slice() else {
             return Err("supply target IP and port together".into());
-        }
-        let target_ip = target[0].as_str();
+        };
         let target_ip = target_ip
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
             .unwrap_or(target_ip);
         let ip: IpAddr = target_ip.parse()?;
-        let destination_ports = parse_destination_ports(&target[1])?;
-        let port = destination_ports[0];
+        let destination_ports = parse_destination_ports(target_ports)?;
+        let port = destination_ports
+            .first()
+            .copied()
+            .ok_or("destination ports must not be empty")?;
         config.base_url = match ip {
             IpAddr::V4(ip) => format!("http://{ip}:{port}"),
             IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
@@ -274,7 +321,6 @@ fn parse_with(
     } else {
         parse_destination_ports(&environment_ports)?
     };
-    validate_diagnostics(&config.diagnostics)?;
     config.score = explicit_score || !fixed_users;
     for user in config.user.iter().chain(config.monitor_user.iter()) {
         if user.is_empty()
@@ -289,111 +335,25 @@ fn parse_with(
     if config.help {
         config.users = users.parse().unwrap_or(100);
     } else {
-        config.users = users.parse()?;
+        config.users = users
+            .parse()
+            .map_err(|_| "--users must be a positive integer")?;
         if config.users == 0 {
             return Err("--users must be positive".into());
         }
-        if config.score && config.start_users > config.max_users {
-            return Err("--start-users must not exceed --max-users".into());
-        }
-        super::test_plan(config.users, &config.ramp_up, &config.duration)?;
+        duration(&config.ramp_up)
+            .map_err(|error| format!("invalid --ramp-up duration: {error}"))?;
+        let hold =
+            duration(&config.duration).map_err(|error| format!("invalid --duration: {error}"))?;
+        let full_hold = hold
+            .checked_add(Duration::from_secs(30))
+            .ok_or("duration plus ramp-down exceeds the system clock range")?;
+        Instant::now()
+            .checked_add(full_hold)
+            .ok_or("duration plus ramp-down exceeds the system clock range")?;
         super::destinations::urls(&config.base_url, &config.destination_ports)?;
     }
     Ok(config)
-}
-
-fn diagnostic_takes_value(flag: &str) -> bool {
-    [
-        "--host",
-        "-H",
-        "--users",
-        "-u",
-        "--test-plan",
-        "--run-time",
-        "-t",
-        "--startup-time",
-        "-s",
-        "--hatch-rate",
-        "-r",
-        "--iterations",
-        "--request-log",
-        "-R",
-        "--request-format",
-        "--transaction-log",
-        "-T",
-        "--transaction-format",
-        "--scenario-log",
-        "-S",
-        "--scenario-format",
-        "--error-log",
-        "-E",
-        "--error-format",
-        "--debug-log",
-        "-D",
-        "--debug-format",
-        "--report-file",
-        "--running-metrics",
-        "--timeout",
-        "--co-mitigation",
-        "--throttle-requests",
-        "--scenarios",
-        "--goose-log",
-        "-G",
-    ]
-    .contains(&flag)
-}
-
-fn validate_diagnostics(args: &[String]) -> Result<()> {
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let (flag, inline) = arg
-            .split_once('=')
-            .map_or((arg.as_str(), false), |(a, _)| (a, true));
-        if flag.starts_with('-') && !flag.starts_with("--") && flag.len() > 2 {
-            return Err(format!("combined short flags are unsupported: {flag}; pass each flag separately, such as -v -v").into());
-        }
-        if flag == "--accept-invalid-certs" {
-            return Err(
-                "--accept-invalid-certs is unavailable: this benchmark uses HTTP without TLS"
-                    .into(),
-            );
-        }
-        if [
-            "--host",
-            "-H",
-            "--users",
-            "-u",
-            "--test-plan",
-            "--run-time",
-            "-t",
-            "--startup-time",
-            "-s",
-            "--hatch-rate",
-            "-r",
-            "--iterations",
-            "--timeout",
-            "--throttle-requests",
-            "--no-gzip",
-            "--no-cookies",
-            "--sticky-follow",
-            "--no-autostart",
-            "--orchestrate",
-            "--supervise",
-            "--observe",
-            "--stop-supervised",
-            "--ready-supervised",
-            "--start-supervised",
-            "--refresh-observer",
-        ]
-        .contains(&flag)
-        {
-            return Err(format!("{flag} cannot override the runner; use target IP/port, --users, --ramp-up and --duration").into());
-        }
-        if diagnostic_takes_value(flag) && !inline {
-            args.next().ok_or("missing diagnostic option value")?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -403,7 +363,7 @@ mod tests {
     fn parse_args(args: &[&str], defaults: &[(&str, &str)]) -> Result<Config> {
         parse_with(
             &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
-            PathBuf::from("/caller"),
+            Path::new("/caller"),
             |key| {
                 defaults
                     .iter()
@@ -580,47 +540,38 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_values_are_not_mistaken_for_workload_overrides_or_targets() {
-        let config = parse_args(
-            &[
-                "--request-log",
-                "-trace.log",
-                "127.0.0.1",
-                "3000",
-                "--request-format=json",
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            config.diagnostics,
-            vec!["--request-log", "-trace.log", "--request-format=json"]
-        );
-        let config = parse_args(&["--", "--request-log", "-trace.log"], &[]).unwrap();
-        assert_eq!(config.diagnostics, vec!["--request-log", "-trace.log"]);
-        let config = parse_args(&["--", "--request-log=-file", "-v", "-v"], &[]).unwrap();
-        assert_eq!(config.diagnostics, vec!["--request-log=-file", "-v", "-v"]);
+    fn unsupported_options_are_rejected_instead_of_forwarded() {
         for args in [
-            vec!["--", "--host=http://other:3000"],
-            vec!["--", "--users=9"],
-            vec!["--", "-t5s"],
-            vec!["--", "--observe"],
-            vec!["--", "--start-supervised"],
-            vec!["--", "--refresh-observer"],
-            vec!["--", "--accept-invalid-certs"],
+            vec!["--report-file", "report.html"],
+            vec!["--", "--request-log", "trace.log"],
+            vec!["-vv"],
+            vec!["--host=http://other:3000"],
+            vec!["--orchestrate"],
         ] {
-            assert!(parse_args(&args, &[]).is_err(), "{args:?}");
+            let error = parse_args(&args, &[]).err().unwrap().to_string();
+            assert!(error.contains("unsupported option"), "{args:?}: {error}");
         }
     }
 
     #[test]
-    fn combined_short_flags_cannot_hide_runner_overrides() {
-        for flag in ["-vH", "-qu", "-vt", "-vRfile", "-vv"] {
-            for args in [vec![flag], vec!["--", flag]] {
-                let error = parse_args(&args, &[]).err().unwrap().to_string();
-                assert!(error.contains("combined short flags"), "{args:?}: {error}");
-            }
+    fn duration_parser_accepts_units_and_rejects_injection_and_overflow() {
+        assert_eq!(duration("2h3m4s").unwrap(), Duration::from_secs(7_384));
+        assert_eq!(duration("1.5s").unwrap(), Duration::from_millis(1_500));
+        assert_eq!(duration("0").unwrap(), Duration::ZERO);
+        for value in [
+            "",
+            "-1s",
+            "1s;2s",
+            "1m2h",
+            "1s2s",
+            "NaNs",
+            "1e100s",
+            "18446744073709551615s",
+            "9223372036854775808s",
+        ] {
+            assert!(duration(value).is_err(), "{value}");
         }
+        assert!(duration("1000000000h").is_ok());
     }
 
     #[test]
