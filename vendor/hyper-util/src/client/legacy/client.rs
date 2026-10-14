@@ -1554,6 +1554,8 @@ impl Builder {
     {
         #[cfg(feature = "http2")]
         self.h2_builder.timer(timer);
+        #[cfg(not(feature = "http2"))]
+        let _ = timer;
         self
     }
 

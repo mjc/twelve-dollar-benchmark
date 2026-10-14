@@ -3,9 +3,9 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::{Pin, pin};
-use std::sync::Arc;
-use std::task::{self, Poll, ready};
+use std::pin::{pin, Pin};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{self, ready, Poll};
 use std::time::Duration;
 
 use futures_util::future::Either;
@@ -16,9 +16,85 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Sleep;
 use tracing::{debug, trace, warn};
 
-use super::dns::{self, GaiResolver, Resolve, resolve};
+use super::dns::{self, resolve, GaiResolver, Resolve};
 use super::{Connected, Connection};
 use crate::rt::TokioIo;
+
+static SOURCE_PORTS: OnceLock<SourcePorts> = OnceLock::new();
+
+struct SourcePorts {
+    first: u16,
+    last: u16,
+    next: Mutex<std::collections::BTreeMap<(IpAddr, SocketAddr), u16>>,
+}
+
+impl SourcePorts {
+    fn count(&self) -> usize {
+        usize::from(self.last) - usize::from(self.first) + 1
+    }
+
+    fn next(&self, source: IpAddr, destination: SocketAddr) -> u16 {
+        let mut counters = self.next.lock().unwrap();
+        let port = counters.entry((source, destination)).or_insert(self.first);
+        let selected = *port;
+        *port = if selected == self.last {
+            self.first
+        } else {
+            selected + 1
+        };
+        selected
+    }
+}
+
+/// Opt this process into explicit, unprivileged source ports for outgoing TCP.
+/// Counters are shared across clients and independent for each source/destination
+/// pair. No host sysctls are changed. Call once before starting requests.
+pub fn set_source_port_range(first: u16, last: u16) -> io::Result<()> {
+    if first < 1024 || first > last {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid unprivileged source-port range",
+        ));
+    }
+    SOURCE_PORTS
+        .set(SourcePorts {
+            first,
+            last,
+            next: Mutex::new(std::collections::BTreeMap::new()),
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "source-port range already configured",
+            )
+        })
+}
+
+fn source_address(addr: SocketAddr, config: &Config) -> IpAddr {
+    match addr {
+        SocketAddr::V4(_) => config
+            .local_address_ipv4
+            .unwrap_or(Ipv4Addr::UNSPECIFIED)
+            .into(),
+        SocketAddr::V6(_) => config
+            .local_address_ipv6
+            .unwrap_or(Ipv6Addr::UNSPECIFIED)
+            .into(),
+    }
+}
+
+fn port_collision(error: &ConnectError) -> bool {
+    error
+        .cause
+        .as_deref()
+        .and_then(|cause| cause.downcast_ref::<io::Error>())
+        .is_some_and(|cause| {
+            matches!(
+                cause.kind(),
+                io::ErrorKind::AddrInUse | io::ErrorKind::AddrNotAvailable
+            )
+        })
+}
 
 /// A connector for the `http` scheme.
 ///
@@ -115,7 +191,11 @@ impl TcpKeepaliveConfig {
         if let Some(retries) = self.retries {
             ka = Self::ka_with_retries(ka, retries, &mut dirty)
         };
-        if dirty { Some(ka) } else { None }
+        if dirty {
+            Some(ka)
+        } else {
+            None
+        }
     }
 
     #[cfg(
@@ -784,17 +864,34 @@ impl ConnectingTcpRemote {
         let mut err = None;
         for addr in &mut self.addrs {
             debug!("connecting to {}", addr);
-            match connect(&addr, config, self.connect_timeout)?.await {
-                Ok(tcp) => {
-                    debug!("connected to {}", addr);
-                    return Ok(tcp);
-                }
-                Err(mut e) => {
-                    trace!("connect error for {}: {:?}", addr, e);
-                    e.addr = Some(addr);
-                    // only return the first error, we assume it's the most relevant
-                    if err.is_none() {
-                        err = Some(e);
+            let ports = SOURCE_PORTS.get();
+            let attempts = ports.map_or(1, SourcePorts::count);
+            for attempt in 0..attempts {
+                let port = ports.map(|ports| ports.next(source_address(addr, config), addr));
+                let result = match connect(&addr, config, self.connect_timeout, port) {
+                    Ok(future) => future.await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(tcp) => {
+                        debug!("connected to {}", addr);
+                        return Ok(tcp);
+                    }
+                    Err(mut e) => {
+                        let retry = ports.is_some() && port_collision(&e) && attempt + 1 < attempts;
+                        if retry {
+                            if attempt % 32 == 31 {
+                                tokio::task::yield_now().await;
+                            }
+                            continue;
+                        }
+                        trace!("connect error for {}: {:?}", addr, e);
+                        e.addr = Some(addr);
+                        // only return the first error, we assume it's the most relevant
+                        if err.is_none() {
+                            err = Some(e);
+                        }
+                        break;
                     }
                 }
             }
@@ -874,6 +971,7 @@ fn connect(
     addr: &SocketAddr,
     config: &Config,
     connect_timeout: Option<Duration>,
+    source_port: Option<u16>,
 ) -> Result<impl Future<Output = Result<TcpStream, ConnectError>>, ConnectError> {
     // TODO(eliza): if Tokio's `TcpSocket` gains support for setting the
     // keepalive timeout, it would be nice to use that instead of socket2,
@@ -964,13 +1062,24 @@ fn connect(
         }
     }
 
-    bind_local_address(
-        &socket,
-        addr,
-        &config.local_address_ipv4,
-        &config.local_address_ipv6,
-    )
-    .map_err(ConnectError::m("tcp bind local error"))?;
+    if let Some(port) = source_port {
+        // Permit one source port across different destination tuples. The
+        // kernel still rejects duplicate established four-tuples at connect.
+        socket
+            .set_reuse_address(true)
+            .map_err(ConnectError::m("tcp reuse source port error"))?;
+        socket
+            .bind(&SocketAddr::new(source_address(*addr, config), port).into())
+            .map_err(ConnectError::m("tcp bind source port error"))?;
+    } else {
+        bind_local_address(
+            &socket,
+            addr,
+            &config.local_address_ipv4,
+            &config.local_address_ipv6,
+        )
+        .map_err(ConnectError::m("tcp bind local error"))?;
+    }
 
     // Convert the `Socket` to a Tokio `TcpSocket`.
     let socket = TcpSocket::from_std_stream(socket.into());
@@ -1063,6 +1172,57 @@ mod tests {
     use super::{Config, ConnectError, HttpConnector};
 
     use super::set_port;
+
+    #[test]
+    fn source_port_counters_cover_full_range_and_reuse_other_destinations() {
+        let ports = super::SourcePorts {
+            first: 1024,
+            last: 65535,
+            next: std::sync::Mutex::new(Default::default()),
+        };
+        let source = "127.0.0.2".parse().unwrap();
+        let destination = "127.0.0.1:3100".parse().unwrap();
+        assert_eq!(ports.count(), 64512);
+        for expected in 1024..=65535 {
+            assert_eq!(ports.next(source, destination), expected);
+        }
+        assert_eq!(ports.next(source, destination), 1024);
+        assert_eq!(ports.next(source, "127.0.0.1:3101".parse().unwrap()), 1024);
+        assert_eq!(ports.next("127.0.0.3".parse().unwrap(), destination), 1024);
+    }
+
+    #[tokio::test]
+    async fn source_port_binding_shares_destinations_and_detects_collisions() {
+        use std::net::TcpListener;
+        let one = TcpListener::bind("127.0.0.1:0").unwrap();
+        let two = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = TcpListener::bind("127.0.0.2:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut connector = HttpConnector::new();
+        connector.set_local_address(Some("127.0.0.2".parse().unwrap()));
+        let a = one.local_addr().unwrap();
+        let b = two.local_addr().unwrap();
+        let collision = super::connect(&a, &connector.config, None, Some(port))
+            .err()
+            .unwrap();
+        assert!(super::port_collision(&collision));
+        drop(occupied);
+        let first = super::connect(&a, &connector.config, None, Some(port))
+            .unwrap()
+            .await
+            .unwrap();
+        let second = super::connect(&b, &connector.config, None, Some(port))
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(first.local_addr().unwrap().port(), port);
+        assert_eq!(second.local_addr().unwrap().port(), port);
+        let duplicate = super::connect(&a, &connector.config, None, Some(port))
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(super::port_collision(&duplicate));
+    }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
@@ -1267,8 +1427,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
         use std::time::{Duration, Instant};
 
-        use super::ConnectingTcp;
         use super::dns;
+        use super::ConnectingTcp;
 
         let server4 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server4.local_addr().unwrap();
