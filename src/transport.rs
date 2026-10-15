@@ -9,7 +9,7 @@ use std::{
     error::Error,
     net::IpAddr,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
 use tower::Service;
@@ -74,6 +74,7 @@ pub(super) struct Client {
     connected_authority: Option<Authority>,
     connection_task: Option<JoinHandle<()>>,
     request_started: Option<Instant>,
+    request_elapsed: Duration,
     connections: Arc<Mutex<super::connections::Connections>>,
 }
 
@@ -115,6 +116,7 @@ impl Client {
             connected_authority: None,
             connection_task: None,
             request_started: None,
+            request_elapsed: Duration::ZERO,
             connections,
         }
     }
@@ -134,6 +136,7 @@ impl Client {
         let mut token = token;
         let mut redirect_count = 0;
         self.request_started = None;
+        self.request_elapsed = Duration::ZERO;
         loop {
             let uri = if let Some(url) = &redirect_url {
                 url.as_str().parse()?
@@ -146,6 +149,7 @@ impl Client {
             let mut reconnects = 0;
             let response = loop {
                 if self.sender.is_none() {
+                    self.pause_request_latency();
                     Box::pin(self.connect(uri.clone())).await?;
                 }
                 if let Err(error) = self
@@ -155,6 +159,7 @@ impl Client {
                     .ready()
                     .await
                 {
+                    self.pause_request_latency();
                     self.discard_connection();
                     if reconnects == 0 {
                         reconnects += 1;
@@ -162,7 +167,7 @@ impl Client {
                     }
                     return Err(Box::new(error));
                 }
-                self.request_started.get_or_insert_with(Instant::now);
+                self.resume_request_latency();
                 let mut request = Request::builder()
                     .method(method.clone())
                     .uri(origin_form(&uri)?);
@@ -201,7 +206,7 @@ impl Client {
                         let can_retry = error.message().is_some() && reconnects == 0;
                         self.discard_connection();
                         if can_retry {
-                            self.request_started = None;
+                            self.pause_request_latency();
                             reconnects += 1;
                             continue;
                         }
@@ -282,9 +287,18 @@ impl Client {
     }
 
     pub fn take_request_latency_ms(&mut self) -> f64 {
-        self.request_started
-            .take()
-            .map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0)
+        self.pause_request_latency();
+        std::mem::take(&mut self.request_elapsed).as_secs_f64() * 1000.0
+    }
+
+    fn pause_request_latency(&mut self) {
+        if let Some(started) = self.request_started.take() {
+            self.request_elapsed = self.request_elapsed.saturating_add(started.elapsed());
+        }
+    }
+
+    fn resume_request_latency(&mut self) {
+        self.request_started.get_or_insert_with(Instant::now);
     }
 
     async fn connect(&mut self, uri: Uri) -> Result<(), BoxError> {
