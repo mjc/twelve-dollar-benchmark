@@ -546,11 +546,31 @@ fn stop_all(stops: &[AtomicBool]) {
 }
 
 async fn drain_users(context: &mut RunContext, users: &mut LiveUsers) {
+    // Leave room for the supervisor to write a report before its 10 s hard kill.
+    let mut abort_at = users
+        .interrupted
+        .then(|| tokio::time::Instant::now() + Duration::from_secs(5));
     while !users.tasks.is_empty() {
         let result = tokio::select! {
             result = users.tasks.join_next() => result,
-            _ = context.signals.interrupt.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
-            _ = context.signals.terminate.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
+            _ = context.signals.interrupt.recv(), if !users.interrupted => {
+                users.interrupted = true;
+                stop_all(&users.stops);
+                abort_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                None
+            },
+            _ = context.signals.terminate.recv(), if !users.interrupted => {
+                users.interrupted = true;
+                stop_all(&users.stops);
+                abort_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                None
+            },
+            () = async { tokio::time::sleep_until(abort_at.expect("enabled only when set")).await }, if abort_at.is_some() => {
+                abort_at = None;
+                users.tasks.abort_all();
+                users.expected_cancellations = users.tasks.len();
+                None
+            },
         };
         handle_user_result(context, users, result);
     }
