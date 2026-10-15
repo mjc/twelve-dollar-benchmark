@@ -75,14 +75,6 @@ enum Kind {
 pub(crate) use super::chan::Sender;
 
 impl Incoming {
-    /// Create a `Body` stream with an associated sender half.
-    ///
-    /// Useful when wanting to stream chunks from another thread.
-    #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
-    #[inline]
-
-
-
     #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
     pub(crate) fn new_channel(content_length: DecodedLength, wanter: bool) -> (Sender, Incoming) {
         let (tx, rx) = chan::channel(wanter);

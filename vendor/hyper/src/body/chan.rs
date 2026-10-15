@@ -75,13 +75,6 @@ impl Sender {
         }
     }
 
-
-
-
-
-    #[allow(dead_code)]
-
-
     pub(crate) fn try_send_data(&mut self, chunk: Bytes) -> Result<(), Bytes> {
         let mut state = self.shared.state.lock().panic_if_poisoned();
         if !state.receiver_open
