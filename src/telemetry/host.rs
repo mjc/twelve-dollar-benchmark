@@ -399,7 +399,7 @@ pub(super) fn process(
 pub(super) fn service_resources(roles: &Roles) -> Value {
     let read = || -> Result<Value> {
         let mut paths = BTreeSet::new();
-        for role in ["application", "proxy"] {
+        for role in ["application", "proxy", "generator"] {
             for pid in roles.get(role).into_iter().flatten() {
                 let text = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
                 let group = text
