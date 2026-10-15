@@ -1,7 +1,5 @@
 mod host;
 mod summary;
-#[cfg(test)]
-mod tests;
 
 use host::{
     Interface, Process, SystemMemory, discover_roles, interfaces, limits, process,

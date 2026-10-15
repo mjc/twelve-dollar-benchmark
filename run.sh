@@ -132,7 +132,7 @@ if (( ! skip_conntrack_tuning )) && [[ -r $conntrack_max ]]; then
   fi
 fi
 
-rust_version=1.99.0
+rust_version=1.99.1
 cargo_command=(cargo)
 rustc_command=(rustc)
 if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null ||

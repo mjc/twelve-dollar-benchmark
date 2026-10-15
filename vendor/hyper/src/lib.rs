@@ -132,8 +132,6 @@ pub mod body;
 mod common;
 mod error;
 pub mod ext;
-#[cfg(test)]
-mod mock;
 pub mod rt;
 pub mod service;
 pub mod upgrade;

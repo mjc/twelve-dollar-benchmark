@@ -55,15 +55,6 @@ by idle connections. Sending a request now allocates its envelope separately;
 queue ordering, readiness, cancellation, and retry ownership continue to follow
 the existing dispatch behavior.
 
-The adaptive-read tests use the new initial size. Added tests check initial read
-and lazy write-header capacities, unchanged maximums, and rejection of a
-configured maximum below 8,192 bytes. Additional tests cover scalar-write
-ordering, partial and pending writes, zero-write errors, pipeline-flush
-selection, and handler-future allocation and cleanup on success, error, and
-cancellation. Client-dispatch tests also check that rejected sends return the
-original request, receiver closure returns retryable requests, non-retryable
-sends report cancellation and return rejected requests to the sender.
-
 An optional `ext::RequestTiming` request extension records when HTTP/1 dispatch
 begins writing a request head. Requests without the extension keep the normal
 path. The benchmark uses this timestamp to exclude connection setup and pool

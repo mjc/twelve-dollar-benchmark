@@ -11,8 +11,8 @@ IP address and one or more ports:
 ```
 
 The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with Rust
-1.99.0 and locked dependencies. If
-that toolchain is missing, it installs rustup and Rust 1.99.0. The generator
+1.99.1 and locked dependencies. If
+that toolchain is missing, it installs rustup and Rust 1.99.1. The generator
 sends HTTP/1.1 traffic. It does not include HTTPS or TLS support.
 
 The build also produces `twelve-dollar-observer`. For remote target monitoring,
