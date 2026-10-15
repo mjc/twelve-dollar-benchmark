@@ -29,3 +29,8 @@ wraparound, sharing and collisions.
 
 `client/legacy/client.rs` also explicitly discards the HTTP/2 timer argument
 when HTTP/2 is disabled, avoiding an unused-variable warning in HTTP-only builds.
+
+An opt-in `REQUEST_TIMING` task scope forwards a shared timing extension to
+Hyper HTTP/1 dispatch. Within that scope, it also removes automatically generated
+`Accept-Encoding` so reqwest can decode unsolicited compressed responses without
+negotiating compression. Requests outside the benchmark scope are unchanged.

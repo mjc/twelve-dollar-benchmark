@@ -1,4 +1,5 @@
 //! Extensions for HTTP messages in Hyper.
+
 //!
 //! This module provides types and utilities that extend the capabilities of HTTP requests and responses
 //! in Hyper. Extensions are additional pieces of information or features that can be attached to HTTP
@@ -259,5 +260,22 @@ impl OriginalHeaderOrder {
     /// in the original order received.
     pub(crate) fn get_in_order(&self) -> impl Iterator<Item = &(HeaderName, usize)> {
         self.entry_order.iter()
+    }
+}
+
+/// Optional timing hook for the benchmark's HTTP/1 request interval.
+#[doc(hidden)]
+#[derive(Clone, Default, Debug)]
+pub struct RequestTiming(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
+
+impl RequestTiming {
+    /// Mark the beginning of HTTP/1 dispatch after acquiring a connection.
+    pub fn start(&self) {
+        *self.0.lock().unwrap() = Some(std::time::Instant::now());
+    }
+
+    /// Elapsed HTTP time, or zero when connection acquisition failed.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.0.lock().unwrap().map_or(std::time::Duration::ZERO, |start| start.elapsed())
     }
 }

@@ -376,6 +376,9 @@ where
                         self.body_rx.set(Some(body));
                         btype
                     };
+                    if let Some(timing) = head.extensions.get::<crate::ext::RequestTiming>() {
+                        timing.start();
+                    }
                     self.conn.write_head(head, body_type);
                 } else {
                     self.close();

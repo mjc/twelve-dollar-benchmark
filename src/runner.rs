@@ -682,7 +682,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "hold_started_at": hold_start, "hold_finished_at": hold_end,
         // An elapsed interval across all workers, not a sum of their durations.
         "duration_s": started.zip(finished).and_then(|(s, f)| (f-s).to_std().ok()).map(|d| d.as_secs_f64()),
-        "latency": "client wall time through complete response body, including connection setup",
+        "latency": "HTTP sending, waiting and receiving through the complete response body; excludes connection setup and pool wait",
         "percentiles": "k6 linear interpolation over all workers' unrounded samples",
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "aggregate": summary, "endpoints": endpoints,

@@ -227,13 +227,13 @@ error.
 
 Scoring p95/p99 use k6's linear interpolation over combined unrounded samples
 from all endpoints and hosts; per-host percentiles are never averaged. Latency
-includes the complete body and connection setup. k6 excludes DNS/connect/TLS
-setup, so new connections can measure slower. Goose's native header timings and
-rounded percentiles are diagnostic.
+measures HTTP sending, waiting and receiving through the complete response body,
+excluding connection setup and pool wait. Connection setup is reported separately.
+Goose's native header timings and rounded percentiles are diagnostic.
 
-During normal shutdown, Goose finishes an active browsing iteration; k6 allowed
-10 seconds before interrupting it. Shutdown can take longer here, and `duration_s`
-includes that time.
+During ramp-down, each retiring user has up to 10 seconds to finish its active
+iteration before cancellation, matching k6's `gracefulRampDown`. The remaining
+grace periods run concurrently; `duration_s` includes this drain time.
 
 On Linux/Android, a local connector patch uses `IP_BIND_ADDRESS_NO_PORT` so
 explicit source binding does not reserve a port before the destination is known.

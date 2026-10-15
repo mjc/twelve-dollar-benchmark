@@ -57,3 +57,8 @@ selection, and handler-future allocation and cleanup on success, error, and
 cancellation. Client-dispatch tests also check that rejected sends return the
 original request, receiver closure returns retryable requests, non-retryable
 sends report cancellation and return rejected requests to the sender.
+
+An optional `ext::RequestTiming` request extension records when HTTP/1 dispatch
+begins writing a request head. Requests without the extension keep the normal
+path. The benchmark uses this timestamp to exclude connection setup and pool
+wait from scored HTTP duration, and measures completion after the response body.

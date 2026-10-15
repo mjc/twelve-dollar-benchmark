@@ -17,13 +17,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 mod config;
 mod connections;
 mod destinations;
 mod errors;
+mod http_parity;
 mod runner;
 mod scoring;
 use twelve_dollar_benchmark::{ENDPOINTS, control, setting, telemetry};
@@ -34,11 +35,13 @@ struct Token {
     token: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct Feed {
     posts: Vec<Post>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct Post {
     id: u64,
@@ -177,13 +180,6 @@ fn http_success(status: u16) -> bool {
     (200..400).contains(&status)
 }
 
-fn request_failure_kind(error: &TransactionError) -> &'static str {
-    match error {
-        TransactionError::Reqwest(error) if error.is_builder() => "request_builder",
-        _ => "transport",
-    }
-}
-
 fn check_success(endpoint: usize, status: u16) -> bool {
     match endpoint {
         0 | 1 => status == 200,
@@ -257,6 +253,8 @@ fn build_client(
     reqwest::Client::builder()
         .no_proxy()
         .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_provider(Arc::new(http_parity::IterationCookies))
         .pool_idle_timeout(None)
         .pool_max_idle_per_host(1)
         .connector_layer(connections::ConnectLayer(connections))
@@ -266,13 +264,12 @@ fn build_client(
         .build()
 }
 
+#[derive(Clone, Copy)]
 struct RequestContext<'a> {
     user_offset: usize,
     source_ips: &'a [IpAddr],
 }
 
-// Read every body before stopping the score timer, including errors and writes.
-// Goose's native timer stops at headers and remains useful for diagnostics only.
 async fn request(
     user: &mut GooseUser,
     metrics: &Metrics,
@@ -282,197 +279,7 @@ async fn request(
     body: Option<&serde_json::Value>,
     context: RequestContext<'_>,
 ) -> Result<Option<Vec<u8>>, Box<TransactionError>> {
-    let RequestContext {
-        user_offset,
-        source_ips,
-    } = context;
-    let method = if endpoint < 2 {
-        GooseMethod::Get
-    } else {
-        GooseMethod::Post
-    };
-    let mut builder = match user.get_request_builder(&method, path) {
-        Ok(builder) => builder,
-        Err(error) => {
-            metrics.lock().unwrap()[endpoint]
-                .errors
-                .record(errors::example(
-                    errors::ExampleContext {
-                        endpoint: ENDPOINTS[endpoint],
-                        path,
-                        user_index: user_offset + user.weighted_users_index,
-                        destination: user.base_url.as_str(),
-                        source_ip: source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
-                    },
-                    None,
-                    "request_builder",
-                    errors::error_chain(&error),
-                    None,
-                ));
-            return Err(error);
-        }
-    };
-    if let Some(token) = auth {
-        builder = builder
-            .bearer_auth(&token.token)
-            .header("Content-Type", "application/json");
-    }
-    if let Some(body) = body {
-        builder = builder.json(body);
-    }
-    let goose_request = GooseRequest::builder()
-        .method(method)
-        .path(path)
-        .name(ENDPOINTS[endpoint].split_once(' ').unwrap().1)
-        .set_request_builder(builder)
-        .build();
-    let started = Instant::now();
-    let mut response = match user.request(goose_request).await {
-        Ok(response) => response,
-        Err(error) => {
-            let kind = request_failure_kind(&error);
-            metrics.lock().unwrap()[endpoint]
-                .errors
-                .record(errors::example(
-                    errors::ExampleContext {
-                        endpoint: ENDPOINTS[endpoint],
-                        path,
-                        user_index: user_offset + user.weighted_users_index,
-                        destination: user.base_url.as_str(),
-                        source_ip: source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
-                    },
-                    None,
-                    kind,
-                    errors::error_chain(&error),
-                    None,
-                ));
-            return Err(error);
-        }
-    };
-    let status = response.request.status_code;
-    let mut captured_latency_ms = None;
-    let bytes = match response.response {
-        Ok(response) => match response.bytes().await {
-            Ok(bytes) => Some(bytes.to_vec()),
-            Err(error) => {
-                let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-                captured_latency_ms = Some(latency_ms);
-                metrics.lock().unwrap()[endpoint].errors.record(
-                    errors::example(
-                        errors::ExampleContext {
-                            endpoint: ENDPOINTS[endpoint],
-                            path,
-                            user_index: user_offset + user.weighted_users_index,
-                            destination: user.base_url.as_str(),
-                            source_ip: source_ips
-                                .get(user.weighted_users_index % source_ips.len().max(1))
-                                .map(ToString::to_string),
-                        },
-                        Some(status),
-                        "body_read",
-                        errors::error_chain(&error.without_url()),
-                        None,
-                    )
-                    .with_latency(latency_ms),
-                );
-                None
-            }
-        },
-        Err(error) => {
-            let kind = if error.is_builder() {
-                "request_builder"
-            } else {
-                "transport"
-            };
-            let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-            captured_latency_ms = Some(latency_ms);
-            metrics.lock().unwrap()[endpoint].errors.record(
-                errors::example(
-                    errors::ExampleContext {
-                        endpoint: ENDPOINTS[endpoint],
-                        path,
-                        user_index: user_offset + user.weighted_users_index,
-                        destination: user.base_url.as_str(),
-                        source_ip: source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
-                    },
-                    None,
-                    kind,
-                    errors::error_chain(&error.without_url()),
-                    None,
-                )
-                .with_latency(latency_ms),
-            );
-            None
-        }
-    };
-    let latency_ms =
-        captured_latency_ms.unwrap_or_else(|| started.elapsed().as_secs_f64() * 1000.0);
-    let success = http_success(status) && bytes.is_some();
-    {
-        let mut metrics = metrics.lock().unwrap();
-        let samples = &mut metrics[endpoint];
-        samples.latency_ms.push(latency_ms);
-        samples.failed += usize::from(!success);
-        samples.checks_failed += usize::from(!check_success(endpoint, status) || bytes.is_none());
-        if !http_success(status) && bytes.is_some() {
-            samples.errors.record(
-                errors::example(
-                    errors::ExampleContext {
-                        endpoint: ENDPOINTS[endpoint],
-                        path,
-                        user_index: user_offset + user.weighted_users_index,
-                        destination: user.base_url.as_str(),
-                        source_ip: source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
-                    },
-                    Some(status),
-                    "http",
-                    format!("HTTP status {status}"),
-                    bytes.as_deref(),
-                )
-                .with_latency(latency_ms),
-            );
-        } else if bytes.is_some() && http_success(status) && !check_success(endpoint, status) {
-            samples.errors.record(
-                errors::example(
-                    errors::ExampleContext {
-                        endpoint: ENDPOINTS[endpoint],
-                        path,
-                        user_index: user_offset + user.weighted_users_index,
-                        destination: user.base_url.as_str(),
-                        source_ip: source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
-                    },
-                    Some(status),
-                    "check",
-                    format!("unexpected HTTP status {status}"),
-                    None,
-                )
-                .with_latency(latency_ms),
-            );
-        }
-    }
-    if !user.config.no_metrics && success {
-        user.set_success(&mut response.request)?;
-    } else if !user.config.no_metrics {
-        // set_failure returns a transaction error. Keep browsing after failed
-        // post/like/create requests, as the original k6 loop does.
-        let _ = user.set_failure(
-            "HTTP or response body failure",
-            &mut response.request,
-            None,
-            None,
-        );
-    }
-    Ok(bytes.filter(|_| check_success(endpoint, status)))
+    http_parity::request(user, metrics, endpoint, path, auth, body, context).await
 }
 
 async fn browse(
@@ -501,38 +308,26 @@ async fn browse(
         think(3.0, 7.0).await;
         return Ok(());
     };
-    let post_id = serde_json::from_slice::<Feed>(&feed)
-        .ok()
-        .filter(|feed| !feed.posts.is_empty() && feed.posts.iter().all(|post| post.id > 0))
-        .map(|feed| feed.posts[rand::rng().random_range(0..feed.posts.len())].id);
-    // A sleeping VU only needs the ID, not its complete feed response.
-    drop(feed);
-    let Some(post_id) = post_id else {
-        // A malformed/empty feed cannot produce a post request. Surface this as
-        // a check failure without changing k6's HTTP failure definition.
-        {
-            let mut metrics = metrics.lock().unwrap();
-            metrics[0].checks_failed += 1;
-            metrics[0].errors.record(errors::example(
-                errors::ExampleContext {
-                    endpoint: ENDPOINTS[0],
-                    path: "/feed",
-                    user_index,
-                    destination: user.base_url.as_str(),
-                    source_ip: source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
-                },
-                Some(200),
-                "check",
-                "feed body was empty or malformed",
-                None,
-            ));
-        }
-        think(3.0, 7.0).await;
+    // JS parses and selects before sleeping, then reads the chosen post's id.
+    // Parse/property exceptions end the iteration without changing HTTP checks.
+    let Ok(feed_json) = serde_json::from_slice::<serde_json::Value>(&feed) else {
         return Ok(());
     };
+    let Some(posts) = feed_json.get("posts").filter(|posts| !posts.is_null()) else {
+        return Ok(());
+    };
+    let selected = posts.as_array().and_then(|posts| {
+        (!posts.is_empty()).then(|| posts[rand::rng().random_range(0..posts.len())].clone())
+    });
+    drop(feed_json);
+    drop(feed);
     think(3.0, 7.0).await;
+    let Some(selected) = selected.filter(|post| !post.is_null()) else {
+        return Ok(());
+    };
+    let post_id = selected
+        .get("id")
+        .map_or_else(|| "undefined".into(), http_parity::js_string);
     request(
         user,
         metrics,
@@ -754,7 +549,9 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         let tokens = tokens.clone();
         let metrics = browse_metrics.clone();
         let source_ips = browse_source_ips.clone();
-        Box::pin(async move { browse(user, &tokens, &metrics, user_offset, &source_ips).await })
+        Box::pin(async move {
+            http_parity::iteration(browse(user, &tokens, &metrics, user_offset, &source_ips)).await
+        })
     });
     if let Ok(start_at) = env::var("BENCH_START_AT") {
         let remaining = start_at.parse::<i64>()? - Utc::now().timestamp_millis();
@@ -864,7 +661,7 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
         "native_metrics": native_metrics,
         "source_ips": source_ips.as_ref(),
-        "latency": "client wall time through complete response body, including connection setup",
+        "latency": "HTTP sending, waiting and receiving through the complete response body; excludes connection setup and pool wait",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
         "scope": "whole run including ramp-up, hold, ramp-down and drain",
         "coordinated_omission": "disabled for scoring; real requests only",
@@ -1004,6 +801,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[tokio::test]
     async fn client_factory_preserves_weighted_users_across_ramp_cycles() {
