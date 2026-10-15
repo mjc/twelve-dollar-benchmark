@@ -105,6 +105,14 @@ fn scp() -> Command {
 }
 
 fn checked(cmd: &mut Command, cancelled: &AtomicBool) -> Result<()> {
+    checked_with_timeout(cmd, cancelled, Duration::from_secs(120))
+}
+
+fn checked_with_timeout(
+    cmd: &mut Command,
+    cancelled: &AtomicBool,
+    timeout: Duration,
+) -> Result<()> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -117,7 +125,7 @@ fn checked(cmd: &mut Command, cancelled: &AtomicBool) -> Result<()> {
         let _ = stderr.read_to_string(&mut message);
         let _ = sender.send(message);
     });
-    let status = wait_child(&mut child, cancelled, Some(Duration::from_secs(120)));
+    let status = wait_child(&mut child, cancelled, Some(timeout));
     // A proxy descendant may retain stderr after its parent was terminated.
     let message = receiver
         .recv_timeout(Duration::from_secs(1))
@@ -364,7 +372,9 @@ impl TargetMonitor {
                     command.arg("--refresh-observer").arg(&control);
                     command
                 };
-                if let Err(error) = checked(&mut command, &flag)
+                // Bound a stalled refresh so the next heartbeat can retry well before lease expiry.
+                if let Err(error) =
+                    checked_with_timeout(&mut command, &flag, Duration::from_secs(15))
                     && !flag.load(Ordering::Relaxed)
                 {
                     eprintln!("Target telemetry lease refresh failed: {error}");
@@ -1776,6 +1786,19 @@ fn finish_run(run: RunOutput<'_>) -> Result<u8> {
 mod tests {
     use super::super::errors::example;
     use super::*;
+
+    #[test]
+    fn control_command_timeout_leaves_room_for_heartbeat_retries() {
+        let mut command = Command::new("sleep");
+        command.arg("2");
+        let error = checked_with_timeout(
+            &mut command,
+            &AtomicBool::new(false),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
 
     fn fixture(name: &str, samples: Vec<f64>, offset: i64) -> (PathBuf, Worker) {
         let dir = env::temp_dir().join(format!(
