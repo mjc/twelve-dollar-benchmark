@@ -1,4 +1,7 @@
-use super::{Samples, errors, samples::percentile};
+use super::{
+    errors,
+    samples::{Samples, distribution as latency_distribution},
+};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,13 +59,9 @@ fn rate(count: usize, seconds: Option<f64>) -> Option<f64> {
 }
 
 fn distribution(samples: &mut [f64]) -> Value {
-    samples.sort_unstable_by(f64::total_cmp);
-    let average = (!samples.is_empty())
-        .then(|| samples.len().to_f64())
-        .flatten()
-        .map(|count| samples.iter().sum::<f64>() / count);
-    json!({"samples": samples.len(), "avg_ms": average,
-        "med_ms": percentile(samples, 0.5), "p95_ms": percentile(samples, 0.95), "p99_ms": percentile(samples, 0.99), "max_ms": samples.last()})
+    let mut report = json!(latency_distribution(samples));
+    report["samples"] = json!(samples.len());
+    report
 }
 
 pub(super) fn request_rates(samples: &Samples, seconds: Option<f64>) -> Value {

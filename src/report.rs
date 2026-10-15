@@ -42,12 +42,13 @@ pub(super) fn render_score_table(report: &Value) -> String {
     )
 }
 
+fn number(value: &Value) -> String {
+    value
+        .as_f64()
+        .map_or_else(|| "unavailable".into(), |n| format!("{n:.2}"))
+}
+
 pub(super) fn render_report(report: &Value, compact: bool) -> String {
-    let fmt = |value: &Value| {
-        value
-            .as_f64()
-            .map_or_else(|| "unavailable".into(), |n| format!("{n:.2}"))
-    };
     let title = report["score"].as_u64().map_or("results".into(), |score| {
         let bound = if report["score_is_lower_bound"] == true {
             "≥ "
@@ -70,8 +71,8 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
             "| Requested VUs | Reached VUs | p95 ms | p99 ms | HTTP errors % | Result |\n|---:|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} | {} |",
             report["requested_users"],
             report["maximum_users"],
-            fmt(&report["aggregate"]["p95_ms"]),
-            fmt(&report["aggregate"]["p99_ms"]),
+            number(&report["aggregate"]["p95_ms"]),
+            number(&report["aggregate"]["p99_ms"]),
             error_rate,
             if report["passed"] == true {
                 "PASS"
@@ -83,35 +84,35 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
     let mut text = format!(
         "# Benchmark {title}\n\n{table}\n\nThresholds: p95 < 500 ms, p99 < 1,000 ms, HTTP errors < 1%.\n{} requests over {} seconds, including ramp and drain.\n\n| Endpoint | Requests/s | Successful/s | Failed/s | p95 ms | p99 ms |\n|---|---:|---:|---:|---:|---:|\n",
         report["aggregate"]["requests"],
-        fmt(&report["duration_s"])
+        number(&report["duration_s"])
     );
     let _ = writeln!(
         text,
         "| All endpoints | {} | {} | {} | {} | {} |",
-        fmt(&report["request_rates"]["requests_per_second"]),
-        fmt(&report["request_rates"]["successful_requests_per_second"]),
-        fmt(&report["request_rates"]["failed_requests_per_second"]),
-        fmt(&report["aggregate"]["p95_ms"]),
-        fmt(&report["aggregate"]["p99_ms"])
+        number(&report["request_rates"]["requests_per_second"]),
+        number(&report["request_rates"]["successful_requests_per_second"]),
+        number(&report["request_rates"]["failed_requests_per_second"]),
+        number(&report["aggregate"]["p95_ms"]),
+        number(&report["aggregate"]["p99_ms"])
     );
     if let Some(endpoints) = report["endpoints"].as_object() {
         for (name, endpoint) in endpoints {
             let _ = writeln!(
                 text,
                 "| {name} | {} | {} | {} | {} | {} |",
-                fmt(&endpoint["requests_per_second"]),
-                fmt(&endpoint["successful_requests_per_second"]),
-                fmt(&endpoint["failed_requests_per_second"]),
-                fmt(&endpoint["p95_ms"]),
-                fmt(&endpoint["p99_ms"])
+                number(&endpoint["requests_per_second"]),
+                number(&endpoint["successful_requests_per_second"]),
+                number(&endpoint["failed_requests_per_second"]),
+                number(&endpoint["p95_ms"]),
+                number(&endpoint["p99_ms"])
             );
         }
     }
     let _ = writeln!(
         text,
         "\nFull-load hold: {} s / {} s required.",
-        fmt(&report["common_hold_s"]),
-        fmt(&report["required_hold_s"])
+        number(&report["common_hold_s"]),
+        number(&report["required_hold_s"])
     );
     let _ = writeln!(
         text,
@@ -123,9 +124,9 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
     if !compact {
         render_request_errors(&mut text, report);
     }
-    render_connections(&mut text, report, &fmt);
-    render_network(&mut text, report, compact, &fmt);
-    render_processes(&mut text, report, compact, &fmt);
+    render_connections(&mut text, report);
+    render_network(&mut text, report, compact);
+    render_processes(&mut text, report, compact);
     text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
     text
 }
@@ -156,21 +157,21 @@ fn render_request_errors(text: &mut String, report: &Value) {
     render_error_details(text, "Runtime errors", &report["runtime_error_details"]);
 }
 
-fn render_connections<F: Fn(&Value) -> String>(text: &mut String, report: &Value, fmt: &F) {
+fn render_connections(text: &mut String, report: &Value) {
     let connections = &report["connections"];
     let _ = writeln!(
         text,
         "\n| Connection attempts/s | Established/s | Failed/s | Cancelled |\n|---:|---:|---:|---:|\n| {} | {} | {} | {} |",
-        fmt(&connections["attempts_per_second"]),
-        fmt(&connections["connections_per_second"]),
-        fmt(&connections["failed_per_second"]),
+        number(&connections["attempts_per_second"]),
+        number(&connections["connections_per_second"]),
+        number(&connections["failed_per_second"]),
         connections["cancelled"]
     );
     let _ = writeln!(
         text,
         "Connection attempts: {} ({} per second); {} established, {} failed, {} cancelled.\n\n| Setup outcome | Samples | Average ms | Median ms | p95 ms | p99 ms | Maximum ms |\n|---|---:|---:|---:|---:|---:|---:|",
         connections["attempts"],
-        fmt(&connections["attempts_per_second"]),
+        number(&connections["attempts_per_second"]),
         connections["established"],
         connections["failed"],
         connections["cancelled"]
@@ -185,11 +186,11 @@ fn render_connections<F: Fn(&Value) -> String>(text: &mut String, report: &Value
             text,
             "| {name} | {} | {} | {} | {} | {} | {} |",
             setup["samples"],
-            fmt(&setup["avg_ms"]),
-            fmt(&setup["med_ms"]),
-            fmt(&setup["p95_ms"]),
-            fmt(&setup["p99_ms"]),
-            fmt(&setup["max_ms"])
+            number(&setup["avg_ms"]),
+            number(&setup["med_ms"]),
+            number(&setup["p95_ms"]),
+            number(&setup["p99_ms"]),
+            number(&setup["max_ms"])
         );
     }
     if let Some(reason) = connections["unavailable_reason"].as_str() {
@@ -197,12 +198,7 @@ fn render_connections<F: Fn(&Value) -> String>(text: &mut String, report: &Value
     }
 }
 
-fn render_network<F: Fn(&Value) -> String>(
-    text: &mut String,
-    report: &Value,
-    compact: bool,
-    fmt: &F,
-) {
+fn render_network(text: &mut String, report: &Value, compact: bool) {
     text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |\n|---|---|---:|---:|---:|---:|\n");
     if let Some(hosts) = report["network_hosts"]["hosts"].as_object() {
         for host in hosts.values() {
@@ -229,10 +225,10 @@ fn render_network<F: Fn(&Value) -> String>(
                     let _ = writeln!(
                         text,
                         "| {observers} | {name} | {} | {} | {} | {} |",
-                        fmt(&mbps("receive_bits_per_second")),
-                        fmt(&mbps("transmit_bits_per_second")),
-                        fmt(&network["receive_packets_per_second"]),
-                        fmt(&network["transmit_packets_per_second"])
+                        number(&mbps("receive_bits_per_second")),
+                        number(&mbps("transmit_bits_per_second")),
+                        number(&network["receive_packets_per_second"]),
+                        number(&network["transmit_packets_per_second"])
                     );
                 }
             }
@@ -241,19 +237,17 @@ fn render_network<F: Fn(&Value) -> String>(
     text.push_str("\nCPU includes all process threads; 100% is one core. Memory, descriptors and established sockets are sampled peaks.\n\n| Observer | Role / PID | CPU % | Peak RSS MiB | Peak FDs | FD soft / hard limit | Peak established sockets |\n|---|---|---:|---:|---:|---|---:|\n");
 }
 
-fn render_processes<F: Fn(&Value) -> String>(
-    text: &mut String,
-    report: &Value,
-    compact: bool,
-    fmt: &F,
-) {
-    let observations = report["generator_telemetry"]
+fn observations(report: &Value) -> impl Iterator<Item = (&str, &Value)> {
+    report["generator_telemetry"]
         .as_object()
         .into_iter()
-        .flat_map(|m| m.iter())
+        .flat_map(|map| map.iter())
         .map(|(name, value)| (name.as_str(), value))
-        .chain(std::iter::once(("target", &report["target_telemetry"])));
-    for (observer, value) in observations {
+        .chain(std::iter::once(("target", &report["target_telemetry"])))
+}
+
+fn render_processes(text: &mut String, report: &Value, compact: bool) {
+    for (observer, value) in observations(report) {
         if let Some(reason) = value["unavailable_reason"].as_str() {
             let _ = writeln!(
                 text,
@@ -279,8 +273,8 @@ fn render_processes<F: Fn(&Value) -> String>(
                         text,
                         "| {observer} | {role} / {} | {} | {} | {} | {} / {} | {} |",
                         process["pid"],
-                        fmt(&process["cpu_percent_of_one_core"]),
-                        fmt(&rss),
+                        number(&process["cpu_percent_of_one_core"]),
+                        number(&rss),
                         process["peak_open_descriptors"],
                         process["descriptor_limits"]["soft"]
                             .as_str()
@@ -296,13 +290,7 @@ fn render_processes<F: Fn(&Value) -> String>(
     }
     if !compact {
         text.push_str("\nKernel counters are observations; conntrack count/max alone do not establish that these connections are tracked or that conntrack caused a limit.\n\n| Observer | Kernel setting | Value |\n|---|---|---|\n");
-        for (observer, value) in report["generator_telemetry"]
-            .as_object()
-            .into_iter()
-            .flat_map(|m| m.iter())
-            .map(|(n, v)| (n.as_str(), v))
-            .chain(std::iter::once(("target", &report["target_telemetry"])))
-        {
+        for (observer, value) in observations(report) {
             if let Some(limits) = value["limits"].as_object() {
                 for (name, limit) in limits {
                     let display = limit["value"]
@@ -400,45 +388,38 @@ fn render_error_counts(text: &mut String, counts: &serde_json::Map<String, Value
 }
 
 fn render_error_examples(text: &mut String, examples: &[Value]) {
-    let mut unique = Vec::with_capacity(examples.len());
     let mut contexts = BTreeSet::new();
-    let mut duplicates = 0;
-    for example in examples {
-        if contexts.insert(error_context(example)) {
-            unique.push(example);
-        } else {
-            duplicates += 1;
-        }
-    }
-
-    let mut shown_contexts = BTreeSet::new();
+    let unique = examples
+        .iter()
+        .filter(|example| contexts.insert(error_context(example)))
+        .collect::<Vec<_>>();
+    let duplicates = examples.len() - unique.len();
+    let mut shown = BTreeSet::new();
     let mut workers = BTreeSet::new();
-    for example in &unique {
+    for (index, example) in unique.iter().enumerate() {
         if let Some(worker) = string_field(example, "worker")
             && workers.insert(worker)
         {
-            shown_contexts.insert(error_context(example));
-            if shown_contexts.len() == 5 {
+            shown.insert(index);
+            if shown.len() == 5 {
                 break;
             }
         }
     }
-
-    let mut shown_count = shown_contexts.len().min(5);
-    for example in &unique {
-        if shown_count == 5 {
+    for index in 0..unique.len() {
+        if shown.len() == 5 {
             break;
         }
-        if shown_contexts.insert(error_context(example)) {
-            shown_count += 1;
-        }
+        shown.insert(index);
     }
+    let shown_count = shown.len();
     if shown_count > 0 {
         let _ = writeln!(text, "\nExamples:\n");
     }
-    for example in unique
+    for (_, example) in unique
         .iter()
-        .filter(|example| shown_contexts.contains(&error_context(example)))
+        .enumerate()
+        .filter(|(index, _)| shown.contains(index))
     {
         let worker = string_field(example, "worker").map(markdown_text);
         let endpoint = string_field(example, "endpoint")

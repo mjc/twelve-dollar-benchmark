@@ -36,8 +36,25 @@ pub(super) struct Response {
     pub status: u16,
     pub retained: Option<RetainedBody>,
     pub error_excerpt: Bytes,
-    pub failure: Option<String>,
+    pub failure: Option<(&'static str, String)>,
     pub latency_ms: f64,
+}
+
+impl Response {
+    pub(super) fn failed(
+        status: u16,
+        kind: &'static str,
+        reason: impl Into<String>,
+        latency_ms: f64,
+    ) -> Self {
+        Self {
+            status,
+            retained: None,
+            error_excerpt: Bytes::new(),
+            failure: Some((kind, reason.into())),
+            latency_ms,
+        }
+    }
 }
 
 impl Client {
@@ -214,13 +231,12 @@ impl Client {
                 }),
                 Err(error) => {
                     self.discard_connection();
-                    Ok(Response {
+                    Ok(Response::failed(
                         status,
-                        retained: None,
-                        error_excerpt: Bytes::new(),
-                        failure: Some(error.to_string()),
-                        latency_ms: self.take_request_latency_ms(),
-                    })
+                        "body_read",
+                        error.to_string(),
+                        self.take_request_latency_ms(),
+                    ))
                 }
             };
         }

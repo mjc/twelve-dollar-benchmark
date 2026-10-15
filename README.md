@@ -232,3 +232,19 @@ The [Hyper patch](vendor/hyper/LOCAL-PATCHES.md) starts adaptive HTTP/1 reads at
 1 KiB, allocates write headers on demand and reserves one slot for the first
 queued body. Read buffers still grow for larger responses; HTTP/1 limits remain
 unchanged.
+
+## Code layout
+
+The binary entry point in `src/main.rs` dispatches load, orchestration, and
+supervisor commands. `load.rs` owns user scheduling and shutdown; `workload.rs`
+owns the browsing sequence, request checks, and token preflight. `transport.rs`
+and `transport/body.rs` own HTTP connections and response buffers.
+
+`runner.rs` coordinates local or SSH generators. Its `process` module owns SSH
+quoting, transfers, and child cancellation; `monitor` owns the target observer
+and heartbeat; `aggregate` validates and combines worker artifacts. `samples.rs`
+shares sample merging and latency statistics, while `report.rs` renders reports.
+
+`telemetry.rs` owns sampling and the observer lease. Its `host` module reads
+Linux process, socket, network, and cgroup counters; `summary` computes interval,
+whole-run, and hold metrics. The observer binary uses this same library code.

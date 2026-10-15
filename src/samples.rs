@@ -21,16 +21,20 @@ pub(crate) struct Summary {
     failed: usize,
     failure_rate: Option<f64>,
     checks_failed: usize,
-    avg_ms: Option<f64>,
-    pub(crate) med_ms: Option<f64>,
-    pub(crate) p95_ms: Option<f64>,
-    pub(crate) p99_ms: Option<f64>,
-    max_ms: Option<f64>,
+    #[serde(flatten)]
+    pub(crate) latency: Distribution,
     errors: errors::ErrorDetails,
 }
 impl Samples {
+    pub(crate) fn merge(&mut self, other: &mut Self) {
+        self.latency_ms
+            .append(&mut std::mem::take(&mut other.latency_ms));
+        self.failed += other.failed;
+        self.checks_failed += other.checks_failed;
+        self.errors.merge(&other.errors);
+    }
+
     pub(crate) fn summary(&mut self) -> Summary {
-        self.latency_ms.sort_unstable_by(f64::total_cmp);
         let n = self.latency_ms.len();
         let count = n.to_f64();
         Summary {
@@ -40,15 +44,35 @@ impl Samples {
                 .filter(|_| n > 0)
                 .and_then(|count| self.failed.to_f64().map(|failed| failed / count)),
             checks_failed: self.checks_failed,
-            avg_ms: count
-                .filter(|_| n > 0)
-                .map(|count| self.latency_ms.iter().sum::<f64>() / count),
-            med_ms: percentile(&self.latency_ms, 0.5),
-            p95_ms: percentile(&self.latency_ms, 0.95),
-            p99_ms: percentile(&self.latency_ms, 0.99),
-            max_ms: self.latency_ms.last().copied(),
+            latency: distribution(&mut self.latency_ms),
             errors: self.errors.clone(),
         }
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub(crate) struct Distribution {
+    #[serde(rename = "avg_ms")]
+    pub(crate) average: Option<f64>,
+    #[serde(rename = "med_ms")]
+    pub(crate) median: Option<f64>,
+    #[serde(rename = "p95_ms")]
+    pub(crate) p95: Option<f64>,
+    #[serde(rename = "p99_ms")]
+    pub(crate) p99: Option<f64>,
+    #[serde(rename = "max_ms")]
+    pub(crate) maximum: Option<f64>,
+}
+
+pub(crate) fn distribution(samples: &mut [f64]) -> Distribution {
+    samples.sort_unstable_by(f64::total_cmp);
+    let count = samples.len().to_f64().filter(|_| !samples.is_empty());
+    Distribution {
+        average: count.map(|count| samples.iter().sum::<f64>() / count),
+        median: percentile(samples, 0.5),
+        p95: percentile(samples, 0.95),
+        p99: percentile(samples, 0.99),
+        maximum: samples.last().copied(),
     }
 }
 
@@ -64,14 +88,8 @@ pub(crate) fn aggregate_samples(samples: &mut [Samples]) -> Samples {
         latency_ms: std::mem::take(&mut samples[base_index].latency_ms),
         ..Samples::default()
     };
-    for (index, sample) in samples.iter_mut().enumerate() {
-        aggregate.failed += sample.failed;
-        aggregate.checks_failed += sample.checks_failed;
-        aggregate.errors.merge(&sample.errors);
-        if index != base_index {
-            let mut latency = std::mem::take(&mut sample.latency_ms);
-            aggregate.latency_ms.append(&mut latency);
-        }
+    for sample in samples {
+        aggregate.merge(sample);
     }
     aggregate
 }
@@ -89,8 +107,8 @@ pub(crate) fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
 #[must_use]
 pub(crate) fn passes(s: &Summary, runtime_errors: usize) -> bool {
     runtime_errors == 0
-        && s.p95_ms.is_some_and(|v| v < 500.0)
-        && s.p99_ms.is_some_and(|v| v < 1000.0)
+        && s.latency.p95.is_some_and(|v| v < 500.0)
+        && s.latency.p99.is_some_and(|v| v < 1000.0)
         && s.failure_rate.is_some_and(|v| v < 0.01)
 }
 pub(crate) fn endpoint_summaries(
@@ -111,4 +129,29 @@ pub(crate) fn endpoint_summaries(
             Ok((name.into(), summary))
         })
         .collect()
+}
+
+// Local runs and merged workers use the same scoring and statistics path.
+// Persist raw samples before calling this: aggregation consumes their buffers.
+pub(crate) fn report(
+    samples: &mut [Samples; 4],
+    seconds: Option<f64>,
+    runtime_errors: usize,
+    completed: bool,
+    mut report: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Error> {
+    use serde_json::json;
+    let endpoints = endpoint_summaries(samples, seconds)?;
+    let mut aggregate = aggregate_samples(samples);
+    let summary = aggregate.summary();
+    report["completed"] = json!(completed);
+    report["runtime_errors"] = json!(runtime_errors);
+    report["passed"] = json!(completed && passes(&summary, runtime_errors));
+    report["aggregate"] = serde_json::to_value(summary)?;
+    report["endpoints"] = serde_json::Value::Object(endpoints);
+    report["request_rates"] = connections::request_rates(&aggregate, seconds);
+    report["latency"] =
+        json!("HTTP send through complete response body, excluding DNS and TCP connection setup");
+    report["thresholds"] = json!({"p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01});
+    Ok(report)
 }
