@@ -28,15 +28,19 @@ directory.
 Without `--users` or `VUS`, the runner finds a score. It warms up at 1,000 users
 for two minutes without scoring, starts at `--start-users` (2,500 by default)
 and doubles until a run fails or reaches `--max-users` (300,000 by default),
-then narrows the passing/failing bracket to 250 users. Search runs use the
-workload's five-minute hold. A separate five-minute run confirms the result; if
-it fails, the runner steps down by 250 users and tries again. Each run also
-includes the configured ramp-up, 30-second ramp-down, and drain. A full search
+then narrows the passing/failing bracket to 250 users. Search runs hold for one
+minute. A separate five-minute run confirms the result; if it fails, the runner
+steps down by 250 users and tries again. Each run also includes the configured
+ramp-up, 30-second ramp-down, and drain. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.
 
 If the search ceiling passes confirmation, the result is a lower bound: the
 server limit was not found. Increase `--max-users` when generator capacity
 allows.
+
+Use `--step-users N` to search with fixed increments instead of doubling. For
+example, `--start-users 10000 --step-users 10000` tries 10,000, 20,000, 30,000,
+and so on. After a failure, the runner still narrows to 250-user steps.
 
 Use `--score` to select scoring explicitly, or `--users N` for a fixed-load run.
 `--duration` controls fixed-load holds. A fixed-load result is not presented as
@@ -51,6 +55,7 @@ a confirmed score.
 | `--users N` | unset (scoring workflow) | Fixed total concurrent users across all generators |
 | `--score` | enabled when neither `--users` nor `VUS` is set | Find and confirm a score |
 | `--start-users N` | `2500` | First search load; positive multiple of 250 |
+| `--step-users N` | doubling | Fixed search increment; positive multiple of 250 |
 | `--max-users N` | `300000` | Search ceiling; positive multiple of 250 |
 | `--label NAME` | target URL | Implementation name in the final score table |
 | `--ramp-up TIME` | `60s` | Ramp to total users |

@@ -14,6 +14,7 @@ pub(super) struct Config {
     pub destination_ports: Vec<u16>,
     pub users: usize,
     pub start_users: usize,
+    pub step_users: Option<usize>,
     pub max_users: usize,
     pub ramp_up: String,
     pub duration: String,
@@ -38,6 +39,8 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options]
   --users N                 Fixed-load run at N users; disables auto scoring
   --score                   Warm up, find the limit, confirm a five-minute score
   --start-users N           First search load (2500); positive multiple of 250
+  --step-users N            Search increment (default: double)
+                            Positive multiple of 250
   --max-users N             Search ceiling (300000); positive multiple of 250
   --label NAME              Implementation name in the final Markdown table
   --ramp-up TIME            Ramp to total users (60s)
@@ -63,10 +66,10 @@ SOURCE_IPS remain defaults. Explicit arguments win. Unsupported options are
 rejected.
 
 Without --users or VUS, scoring runs by default: a 1,000-user, two-minute
-unscored warm-up; five-minute searches from --start-users (2500), doubling and
-narrowing to 250-user steps; then a separate five-minute confirmation, stepping
-down 250 users on failure. --score explicitly selects this workflow. --duration
-applies to fixed-load runs.
+unscored warm-up; one-minute searches from --start-users (2500), doubling or
+using --step-users, then narrowing to 250-user steps; and a separate five-minute
+confirmation, stepping down 250 users on failure. --score explicitly selects
+this workflow. --duration applies to fixed-load runs.
 ";
 
 pub(super) use twelve_dollar_benchmark::{
@@ -201,6 +204,7 @@ fn defaults(lookup: &impl Fn(&str) -> Option<String>) -> Result<(Config, Overrid
             destination_ports: vec![default_port],
             users: 100,
             start_users: 2500,
+            step_users: None,
             max_users: 300_000,
             ramp_up: default("RAMP_UP", "60s"),
             duration: default("DURATION", "5m"),
@@ -281,6 +285,9 @@ fn parse_options(
                 overrides.explicit_destination_ports = Some(parse_destination_ports(&value)?);
             }
             Long("start-users") => config.start_users = users_bound(&mut parser, "--start-users")?,
+            Long("step-users") => {
+                config.step_users = Some(users_bound(&mut parser, "--step-users")?);
+            }
             Long("max-users") => config.max_users = users_bound(&mut parser, "--max-users")?,
             Long("users") => {
                 overrides.users = option_value(&mut parser, "--users")?;
@@ -474,6 +481,14 @@ mod tests {
         assert!(parse_args(&["--start-users=1001"], &[]).is_err());
         assert!(parse_args(&["--max-users=0"], &[]).is_err());
         assert!(parse_args(&["--start-users=5000", "--max-users=2500"], &[]).is_err());
+    }
+
+    #[test]
+    fn fixed_search_increment_must_be_a_positive_multiple_of_250() {
+        let config = parse_args(&["--start-users=2500", "--step-users=10000"], &[]).unwrap();
+        assert_eq!(config.step_users, Some(10_000));
+        assert!(parse_args(&["--step-users=0"], &[]).is_err());
+        assert!(parse_args(&["--step-users=1001"], &[]).is_err());
     }
 
     #[test]
