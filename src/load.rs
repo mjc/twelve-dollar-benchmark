@@ -99,7 +99,7 @@ struct Workload {
     ramp: Duration,
     hold: Duration,
     source_ips: Arc<Vec<IpAddr>>,
-    targets: Arc<Vec<Arc<url::Url>>>,
+    targets: Arc<Vec<Arc<transport::ParsedBase>>>,
     tokens: Arc<Vec<Token>>,
     user_offset: usize,
 }
@@ -156,7 +156,7 @@ fn prepare_workload(cfg: &config::Config) -> Result<Workload, Box<dyn std::error
     let targets = Arc::new(
         destinations::urls(&cfg.base_url, &cfg.destination_ports)?
             .into_iter()
-            .map(Arc::new)
+            .map(|url| transport::ParsedBase::new(Arc::new(url)))
             .collect::<Vec<_>>(),
     );
     let capacity = 64512usize
@@ -342,8 +342,8 @@ async fn launch_users(
             .copied();
         let client = transport::Client::new(base.clone(), source, context.connections.clone());
         let mut assigned = context.assigned.lock().unwrap();
-        if !assigned.contains(base.as_str()) {
-            assigned.insert(base.as_str().to_owned());
+        if !assigned.contains(base.url().as_str()) {
+            assigned.insert(base.url().as_str().to_owned());
         }
         drop(assigned);
         users.maximum += 1;
@@ -353,7 +353,7 @@ async fn launch_users(
         let tokens = context.workload.tokens.clone();
         let mut user = User {
             client,
-            base,
+            base: base.url().clone(),
             index,
             source,
             metrics: context.metrics.clone(),
@@ -645,8 +645,8 @@ fn build_report(
         "hold_finished_at": result.hold_finished_at,
         "planned_hold_s": context.workload.hold.as_secs_f64(),
         "hosts": &*context.assigned.lock().unwrap(),
-        "configured_hosts": context.workload.targets.iter().map(|url| url.as_str()).collect::<Vec<_>>(),
-        "destination_ports": context.workload.targets.iter().filter_map(|url| url.port_or_known_default()).collect::<Vec<_>>(),
+        "configured_hosts": context.workload.targets.iter().map(|base| base.url().as_str()).collect::<Vec<_>>(),
+        "destination_ports": context.workload.targets.iter().filter_map(|base| base.url().port_or_known_default()).collect::<Vec<_>>(),
         "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
         "source_ips": context.workload.source_ips.as_ref(),
         "percentiles": "k6 linear interpolation over unrounded milliseconds",

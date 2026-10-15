@@ -427,7 +427,7 @@ mod tests {
         let base = Arc::new(url::Url::parse(base).unwrap());
         User {
             client: transport::Client::new(
-                base.clone(),
+                transport::ParsedBase::new(base.clone()),
                 None,
                 Arc::new(Mutex::new(connections::Connections::default())),
             ),
@@ -757,7 +757,9 @@ mod tests {
         let connection_metrics = Arc::new(Mutex::new(connections::Connections::default()));
         for ip in &ips {
             let mut client = transport::Client::new(
-                Arc::new(url::Url::parse(&format!("http://{address}")).unwrap()),
+                transport::ParsedBase::new(Arc::new(
+                    url::Url::parse(&format!("http://{address}")).unwrap(),
+                )),
                 Some(*ip),
                 connection_metrics.clone(),
             );

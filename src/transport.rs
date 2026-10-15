@@ -5,9 +5,10 @@ use hyper::client::conn::http1;
 use hyper_util::client::legacy::connect::HttpConnector;
 use std::future::poll_fn;
 use std::{
+    collections::HashMap,
     error::Error,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 use tokio::task::JoinHandle;
@@ -19,11 +20,55 @@ pub(super) use body::RetainedBody;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-pub(super) struct Client {
+static CONNECTORS: OnceLock<Mutex<HashMap<Option<IpAddr>, HttpConnector>>> = OnceLock::new();
+
+fn connector_for(source: Option<IpAddr>) -> HttpConnector {
+    CONNECTORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(source)
+        .or_insert_with(|| {
+            let mut connector = HttpConnector::new();
+            connector.set_local_address(source);
+            connector
+        })
+        .clone()
+}
+
+pub(super) struct ParsedBase {
     base: Arc<Url>,
-    base_uri: Option<Uri>,
-    base_authority: Option<Authority>,
-    base_host: Option<HeaderValue>,
+    uri: Option<Uri>,
+    authority: Option<Authority>,
+    host: Option<HeaderValue>,
+}
+
+impl ParsedBase {
+    pub fn new(base: Arc<Url>) -> Arc<Self> {
+        let uri = base.as_str().parse::<Uri>().ok();
+        let authority = uri.as_ref().and_then(|uri| uri.authority().cloned());
+        let host = authority.as_ref().and_then(|authority| {
+            let host = authority
+                .as_str()
+                .rsplit_once('@')
+                .map_or(authority.as_str(), |(_, host)| host);
+            HeaderValue::from_str(host).ok()
+        });
+        Arc::new(Self {
+            base,
+            uri,
+            authority,
+            host,
+        })
+    }
+
+    pub fn url(&self) -> &Arc<Url> {
+        &self.base
+    }
+}
+
+pub(super) struct Client {
+    base: Arc<ParsedBase>,
     connector: HttpConnector,
     sender: Option<http1::SendRequest<Full<Bytes>>>,
     connected_authority: Option<Authority>,
@@ -59,27 +104,13 @@ impl Response {
 
 impl Client {
     pub fn new(
-        base: Arc<Url>,
+        base: Arc<ParsedBase>,
         source: Option<IpAddr>,
         connections: Arc<Mutex<super::connections::Connections>>,
     ) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_local_address(source);
-        let base_uri = base.as_str().parse::<Uri>().ok();
-        let base_authority = base_uri.as_ref().and_then(|uri| uri.authority().cloned());
-        let base_host = base_authority.as_ref().and_then(|authority| {
-            let host = authority
-                .as_str()
-                .rsplit_once('@')
-                .map_or(authority.as_str(), |(_, host)| host);
-            HeaderValue::from_str(host).ok()
-        });
         Self {
             base,
-            base_uri,
-            base_authority,
-            base_host,
-            connector,
+            connector: connector_for(source),
             sender: None,
             connected_authority: None,
             connection_task: None,
@@ -107,7 +138,7 @@ impl Client {
             let uri = if let Some(url) = &redirect_url {
                 url.as_str().parse()?
             } else {
-                request_uri(self.base_uri.as_ref().ok_or("invalid base HTTP URI")?, path)?
+                request_uri(self.base.uri.as_ref().ok_or("invalid base HTTP URI")?, path)?
             };
             if self.connected_authority.as_ref() != uri.authority() {
                 self.discard_connection();
@@ -115,7 +146,7 @@ impl Client {
             let mut reconnects = 0;
             let response = loop {
                 if self.sender.is_none() {
-                    self.connect(uri.clone()).await?;
+                    Box::pin(self.connect(uri.clone())).await?;
                 }
                 if let Err(error) = self
                     .sender
@@ -137,10 +168,10 @@ impl Client {
                     .uri(origin_form(&uri)?);
                 let headers = request.headers_mut().expect("valid request builder");
                 let authority = uri.authority().ok_or("missing authority")?;
-                if self.base_authority.as_ref() == Some(authority) {
+                if self.base.authority.as_ref() == Some(authority) {
                     headers.insert(
                         header::HOST,
-                        self.base_host.as_ref().expect("base host parses").clone(),
+                        self.base.host.as_ref().expect("base host parses").clone(),
                     );
                 } else {
                     let host = authority
@@ -186,7 +217,7 @@ impl Client {
                 let location = std::str::from_utf8(location.as_bytes())?;
                 let current_url = match redirect_url.take() {
                     Some(url) => url,
-                    None => self.base.join(path)?,
+                    None => self.base.base.join(path)?,
                 };
                 let next = current_url.join(location)?;
                 let same_origin = current_url.origin() == next.origin();
@@ -262,7 +293,9 @@ impl Client {
         let result = async {
             poll_fn(|cx| self.connector.poll_ready(cx)).await?;
             let io = self.connector.call(uri).await?;
-            let (sender, connection) = http1::handshake(io).await?;
+            let mut builder = http1::Builder::new();
+            builder.read_buf_chunk_size(1024);
+            let (sender, connection) = builder.handshake(io).await?;
             Ok::<_, BoxError>((sender, connection))
         }
         .await;

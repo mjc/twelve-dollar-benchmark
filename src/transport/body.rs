@@ -91,6 +91,14 @@ pub(super) async fn read_response(
         return read_plain(body, retain, excerpt_cap).await;
     }
 
+    Box::pin(read_gzip(body, retain, excerpt_cap)).await
+}
+
+async fn read_gzip(
+    body: Incoming,
+    retain: bool,
+    excerpt_cap: usize,
+) -> Result<ResponseBody, BodyReadError> {
     let mut stream = body.into_data_stream().map_err(io::Error::other);
     let first = loop {
         match stream.try_next().await.map_err(BodyReadError)? {
