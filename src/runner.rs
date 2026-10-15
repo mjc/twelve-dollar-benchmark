@@ -1564,15 +1564,17 @@ mod tests {
             raw[0].failed = 101;
             for _ in 0..101 {
                 raw[0].errors.record(example(
-                    "GET /feed",
-                    "/feed",
+                    super::super::errors::ExampleContext {
+                        endpoint: "GET /feed",
+                        path: "/feed",
+                        user_index: worker.user_offset,
+                        destination: "http://fixture.test:3000",
+                        source_ip: Some("192.0.2.1".into()),
+                    },
                     Some(503),
                     "http",
                     "queue full",
                     Some(b"busy"),
-                    worker.user_offset,
-                    "http://fixture.test:3000",
-                    Some("192.0.2.1".into()),
                 ));
             }
             let mut aggregate = Samples {

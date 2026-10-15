@@ -130,17 +130,19 @@ fn track_errors(
                     .lock()
                     .unwrap()
                     .record(errors::example(
-                        "transaction",
-                        "",
+                        errors::ExampleContext {
+                            endpoint: "transaction",
+                            path: "",
+                            user_index: user_offset + user.weighted_users_index,
+                            destination: user.base_url.as_str(),
+                            source_ip: source_ips
+                                .get(user.weighted_users_index % source_ips.len().max(1))
+                                .map(ToString::to_string),
+                        },
                         None,
                         "runtime",
                         errors::error_chain(error),
                         None,
-                        user_offset + user.weighted_users_index,
-                        user.base_url.as_str(),
-                        source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
                     ));
             }
             result
@@ -264,9 +266,13 @@ fn build_client(
         .build()
 }
 
+struct RequestContext<'a> {
+    user_offset: usize,
+    source_ips: &'a [IpAddr],
+}
+
 // Read every body before stopping the score timer, including errors and writes.
 // Goose's native timer stops at headers and remains useful for diagnostics only.
-#[allow(clippy::too_many_arguments)] // Keep request inputs visible at the call sites.
 async fn request(
     user: &mut GooseUser,
     metrics: &Metrics,
@@ -274,9 +280,12 @@ async fn request(
     path: &str,
     auth: Option<&Token>,
     body: Option<&serde_json::Value>,
-    user_offset: usize,
-    source_ips: &[IpAddr],
+    context: RequestContext<'_>,
 ) -> Result<Option<Vec<u8>>, Box<TransactionError>> {
+    let RequestContext {
+        user_offset,
+        source_ips,
+    } = context;
     let method = if endpoint < 2 {
         GooseMethod::Get
     } else {
@@ -288,17 +297,19 @@ async fn request(
             metrics.lock().unwrap()[endpoint]
                 .errors
                 .record(errors::example(
-                    ENDPOINTS[endpoint],
-                    path,
+                    errors::ExampleContext {
+                        endpoint: ENDPOINTS[endpoint],
+                        path,
+                        user_index: user_offset + user.weighted_users_index,
+                        destination: user.base_url.as_str(),
+                        source_ip: source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    },
                     None,
                     "request_builder",
                     errors::error_chain(&error),
                     None,
-                    user_offset + user.weighted_users_index,
-                    user.base_url.as_str(),
-                    source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
                 ));
             return Err(error);
         }
@@ -325,17 +336,19 @@ async fn request(
             metrics.lock().unwrap()[endpoint]
                 .errors
                 .record(errors::example(
-                    ENDPOINTS[endpoint],
-                    path,
+                    errors::ExampleContext {
+                        endpoint: ENDPOINTS[endpoint],
+                        path,
+                        user_index: user_offset + user.weighted_users_index,
+                        destination: user.base_url.as_str(),
+                        source_ip: source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    },
                     None,
                     kind,
                     errors::error_chain(&error),
                     None,
-                    user_offset + user.weighted_users_index,
-                    user.base_url.as_str(),
-                    source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
                 ));
             return Err(error);
         }
@@ -350,17 +363,19 @@ async fn request(
                 captured_latency_ms = Some(latency_ms);
                 metrics.lock().unwrap()[endpoint].errors.record(
                     errors::example(
-                        ENDPOINTS[endpoint],
-                        path,
+                        errors::ExampleContext {
+                            endpoint: ENDPOINTS[endpoint],
+                            path,
+                            user_index: user_offset + user.weighted_users_index,
+                            destination: user.base_url.as_str(),
+                            source_ip: source_ips
+                                .get(user.weighted_users_index % source_ips.len().max(1))
+                                .map(ToString::to_string),
+                        },
                         Some(status),
                         "body_read",
                         errors::error_chain(&error.without_url()),
                         None,
-                        user_offset + user.weighted_users_index,
-                        user.base_url.as_str(),
-                        source_ips
-                            .get(user.weighted_users_index % source_ips.len().max(1))
-                            .map(ToString::to_string),
                     )
                     .with_latency(latency_ms),
                 );
@@ -377,17 +392,19 @@ async fn request(
             captured_latency_ms = Some(latency_ms);
             metrics.lock().unwrap()[endpoint].errors.record(
                 errors::example(
-                    ENDPOINTS[endpoint],
-                    path,
+                    errors::ExampleContext {
+                        endpoint: ENDPOINTS[endpoint],
+                        path,
+                        user_index: user_offset + user.weighted_users_index,
+                        destination: user.base_url.as_str(),
+                        source_ip: source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    },
                     None,
                     kind,
                     errors::error_chain(&error.without_url()),
                     None,
-                    user_offset + user.weighted_users_index,
-                    user.base_url.as_str(),
-                    source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
                 )
                 .with_latency(latency_ms),
             );
@@ -406,34 +423,38 @@ async fn request(
         if !http_success(status) && bytes.is_some() {
             samples.errors.record(
                 errors::example(
-                    ENDPOINTS[endpoint],
-                    path,
+                    errors::ExampleContext {
+                        endpoint: ENDPOINTS[endpoint],
+                        path,
+                        user_index: user_offset + user.weighted_users_index,
+                        destination: user.base_url.as_str(),
+                        source_ip: source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    },
                     Some(status),
                     "http",
                     format!("HTTP status {status}"),
                     bytes.as_deref(),
-                    user_offset + user.weighted_users_index,
-                    user.base_url.as_str(),
-                    source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
                 )
                 .with_latency(latency_ms),
             );
         } else if bytes.is_some() && http_success(status) && !check_success(endpoint, status) {
             samples.errors.record(
                 errors::example(
-                    ENDPOINTS[endpoint],
-                    path,
+                    errors::ExampleContext {
+                        endpoint: ENDPOINTS[endpoint],
+                        path,
+                        user_index: user_offset + user.weighted_users_index,
+                        destination: user.base_url.as_str(),
+                        source_ip: source_ips
+                            .get(user.weighted_users_index % source_ips.len().max(1))
+                            .map(ToString::to_string),
+                    },
                     Some(status),
                     "check",
                     format!("unexpected HTTP status {status}"),
                     None,
-                    user_offset + user.weighted_users_index,
-                    user.base_url.as_str(),
-                    source_ips
-                        .get(user.weighted_users_index % source_ips.len().max(1))
-                        .map(ToString::to_string),
                 )
                 .with_latency(latency_ms),
             );
@@ -470,8 +491,10 @@ async fn browse(
         "/feed",
         None,
         None,
-        user_offset,
-        source_ips,
+        RequestContext {
+            user_offset,
+            source_ips,
+        },
     )
     .await?;
     let Some(feed) = feed else {
@@ -491,17 +514,19 @@ async fn browse(
             let mut metrics = metrics.lock().unwrap();
             metrics[0].checks_failed += 1;
             metrics[0].errors.record(errors::example(
-                ENDPOINTS[0],
-                "/feed",
+                errors::ExampleContext {
+                    endpoint: ENDPOINTS[0],
+                    path: "/feed",
+                    user_index,
+                    destination: user.base_url.as_str(),
+                    source_ip: source_ips
+                        .get(user.weighted_users_index % source_ips.len().max(1))
+                        .map(ToString::to_string),
+                },
                 Some(200),
                 "check",
                 "feed body was empty or malformed",
                 None,
-                user_index,
-                user.base_url.as_str(),
-                source_ips
-                    .get(user.weighted_users_index % source_ips.len().max(1))
-                    .map(ToString::to_string),
             ));
         }
         think(3.0, 7.0).await;
@@ -515,8 +540,10 @@ async fn browse(
         &format!("/posts/{post_id}"),
         None,
         None,
-        user_offset,
-        source_ips,
+        RequestContext {
+            user_offset,
+            source_ips,
+        },
     )
     .await?;
     think(3.0, 8.0).await;
@@ -528,8 +555,10 @@ async fn browse(
             &format!("/posts/{post_id}/like"),
             Some(token),
             None,
-            user_offset,
-            source_ips,
+            RequestContext {
+                user_offset,
+                source_ips,
+            },
         )
         .await?;
     }
@@ -548,8 +577,10 @@ async fn browse(
             "/posts",
             Some(token),
             Some(&body),
-            user_offset,
-            source_ips,
+            RequestContext {
+                user_offset,
+                source_ips,
+            },
         )
         .await?;
     }
@@ -1426,8 +1457,10 @@ mod tests {
                     "/posts/42/like",
                     Some(&token),
                     None,
-                    0,
-                    &[],
+                    RequestContext {
+                        user_offset: 0,
+                        source_ips: &[],
+                    },
                 )
                 .await?;
                 Ok(())
@@ -1559,19 +1592,41 @@ mod tests {
             username: "test-user".into(),
             token: "test-token".into(),
         };
-        let feed = request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
-            .await
-            .unwrap()
-            .unwrap();
+        let feed = request(
+            &mut user,
+            &metrics,
+            0,
+            "/feed",
+            None,
+            None,
+            RequestContext {
+                user_offset: 0,
+                source_ips: &[],
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             serde_json::from_slice::<Feed>(&feed).unwrap().posts[0].id,
             42
         );
         assert!(
-            request(&mut user, &metrics, 1, "/posts/42", None, None, 0, &[])
-                .await
-                .unwrap()
-                .is_none()
+            request(
+                &mut user,
+                &metrics,
+                1,
+                "/posts/42",
+                None,
+                None,
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                }
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(
             request(
@@ -1581,8 +1636,10 @@ mod tests {
                 "/posts/42/like",
                 Some(&token),
                 None,
-                0,
-                &[]
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                }
             )
             .await
             .unwrap()
@@ -1596,32 +1653,67 @@ mod tests {
                 "/posts",
                 Some(&token),
                 Some(&serde_json::json!({"body":"test post"})),
-                0,
-                &[],
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                },
             )
             .await
             .unwrap()
             .is_some()
         );
         assert!(
-            request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
-                .await
-                .unwrap()
-                .is_none()
+            request(
+                &mut user,
+                &metrics,
+                0,
+                "/feed",
+                None,
+                None,
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                }
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(
-            request(&mut user, &metrics, 1, "/posts/42", None, None, 0, &[])
-                .await
-                .unwrap()
-                .is_none()
+            request(
+                &mut user,
+                &metrics,
+                1,
+                "/posts/42",
+                None,
+                None,
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                }
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         server.join().unwrap();
         // The listener is now closed: connection failures still contribute a sample.
         assert!(
-            request(&mut user, &metrics, 0, "/feed", None, None, 0, &[])
-                .await
-                .unwrap()
-                .is_none()
+            request(
+                &mut user,
+                &metrics,
+                0,
+                "/feed",
+                None,
+                None,
+                RequestContext {
+                    user_offset: 0,
+                    source_ips: &[]
+                }
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         let metrics = metrics.lock().unwrap();
         assert_eq!(metrics[0].latency_ms.len(), 3);

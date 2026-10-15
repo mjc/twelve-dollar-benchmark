@@ -112,20 +112,23 @@ fn sanitize_message_urls(message: &str) -> String {
     sanitized
 }
 
-#[allow(clippy::too_many_arguments)] // Keep the report's explicit fields at this boundary.
+pub struct ExampleContext<'a> {
+    pub endpoint: &'a str,
+    pub path: &'a str,
+    pub user_index: usize,
+    pub destination: &'a str,
+    pub source_ip: Option<String>,
+}
+
 pub fn example(
-    endpoint: &str,
-    path: &str,
+    context: ExampleContext<'_>,
     status_code: Option<u16>,
     kind: &str,
     reason: impl Into<String>,
     body: Option<&[u8]>,
-    user_index: usize,
-    destination: &str,
-    source_ip: Option<String>,
 ) -> ErrorExample {
-    let (destination, _) = sanitize_url(destination);
-    let (path, _) = sanitize_path(path);
+    let (destination, _) = sanitize_url(context.destination);
+    let (path, _) = sanitize_path(context.path);
     let (body_excerpt, body_truncated) = body.map_or((None, false), |bytes| {
         let clipped = bytes.len() > MAX_BODY_BYTES;
         let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BODY_BYTES)]);
@@ -134,7 +137,7 @@ pub fn example(
     });
     ErrorExample {
         timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        endpoint: endpoint.to_owned(),
+        endpoint: context.endpoint.to_owned(),
         path,
         status_code,
         kind: kind.to_owned(),
@@ -142,9 +145,9 @@ pub fn example(
         body_excerpt,
         body_truncated,
         latency_ms: None,
-        user_index,
+        user_index: context.user_index,
         destination,
-        source_ip,
+        source_ip: context.source_ip,
         worker: None,
     }
 }
@@ -203,15 +206,17 @@ mod tests {
 
     fn sample(kind: &str, status: Option<u16>) -> ErrorExample {
         example(
-            "GET /feed",
-            "/a?token=x",
+            ExampleContext {
+                endpoint: "GET /feed",
+                path: "/a?token=x",
+                user_index: 4,
+                destination: "http://user:secret@example.test:3000?q=token",
+                source_ip: None,
+            },
             status,
             kind,
             "é".repeat(600),
             Some("x".repeat(1500).as_bytes()),
-            4,
-            "http://user:secret@example.test:3000?q=token",
-            None,
         )
     }
 
