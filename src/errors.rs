@@ -206,7 +206,7 @@ fn normalize_example(example: &mut ErrorExample) {
 }
 
 fn sanitize_url(value: &str) -> (String, bool) {
-    let Ok(mut url) = reqwest::Url::parse(value) else {
+    let Ok(mut url) = url::Url::parse(value) else {
         return (sanitize_unparsed_url(value), true);
     };
     let mut changed = false;

@@ -192,7 +192,7 @@ fn defaults(lookup: &impl Fn(&str) -> Option<String>) -> Result<(Config, Overrid
     let users = default("VUS", "100");
     let fixed_users = lookup("VUS").is_some_and(|value| !value.is_empty());
     let base_url = default("BASE_URL", "http://127.0.0.1:3000");
-    let default_port = reqwest::Url::parse(&base_url)
+    let default_port = url::Url::parse(&base_url)
         .ok()
         .and_then(|url| url.port_or_known_default())
         .unwrap_or(3000);

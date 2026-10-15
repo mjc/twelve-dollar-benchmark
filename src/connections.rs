@@ -4,14 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    fmt::{Debug, Display},
-    future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
     time::Instant,
 };
-use tower::{Layer, Service};
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct Connections {
@@ -75,30 +70,21 @@ pub(super) fn request_rates(samples: &Samples, seconds: Option<f64>) -> Value {
     json!({"requests_per_second": rate(n, seconds), "successful_requests_per_second": rate(n.saturating_sub(samples.failed), seconds), "failed_requests_per_second": rate(samples.failed, seconds)})
 }
 
-#[derive(Clone)]
-pub(super) struct ConnectLayer(pub Arc<Mutex<Connections>>);
-#[derive(Clone)]
-pub(super) struct ConnectService<S> {
-    inner: S,
-    metrics: Arc<Mutex<Connections>>,
-}
-impl<S> Layer<S> for ConnectLayer {
-    type Service = ConnectService<S>;
-    fn layer(&self, inner: S) -> Self::Service {
-        ConnectService {
-            inner,
-            metrics: self.0.clone(),
-        }
-    }
-}
-
-struct Attempt {
+pub(super) struct ConnectionAttempt {
     metrics: Arc<Mutex<Connections>>,
     start: Instant,
     finished: bool,
 }
-impl Attempt {
-    fn finish(&mut self, error: Option<String>) {
+impl ConnectionAttempt {
+    pub(super) fn start(metrics: Arc<Mutex<Connections>>) -> Self {
+        Self {
+            metrics,
+            start: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(super) fn finish(&mut self, error: Option<String>) {
         let elapsed = self.start.elapsed().as_secs_f64() * 1000.0;
         let mut metrics = self.metrics.lock().unwrap();
         if let Some(error) = error {
@@ -118,7 +104,7 @@ impl Attempt {
         self.finished = true;
     }
 }
-impl Drop for Attempt {
+impl Drop for ConnectionAttempt {
     fn drop(&mut self) {
         if !self.finished {
             {
@@ -132,39 +118,6 @@ impl Drop for Attempt {
         }
     }
 }
-impl<S, T> Service<T> for ConnectService<S>
-where
-    S: Service<T>,
-    S::Future: Send + 'static,
-    S::Response: Send + 'static,
-    S::Error: Display + Debug + Send + 'static,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-    fn call(&mut self, request: T) -> Self::Future {
-        let mut attempt = Attempt {
-            metrics: self.metrics.clone(),
-            start: Instant::now(),
-            finished: false,
-        };
-        let future = self.inner.call(request);
-        Box::pin(async move {
-            let result = future.await;
-            attempt.finish(
-                result
-                    .as_ref()
-                    .err()
-                    .map(|error| format!("{error}; {error:?}")),
-            );
-            result
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,11 +125,7 @@ mod tests {
     #[test]
     fn connection_error_keys_redact_url_credentials_and_secrets() {
         let metrics = Arc::new(Mutex::new(Connections::default()));
-        let mut attempt = Attempt {
-            metrics: metrics.clone(),
-            start: Instant::now(),
-            finished: false,
-        };
+        let mut attempt = ConnectionAttempt::start(metrics.clone());
         attempt.finish(Some(
             "connect to https://alice:secret@example.test/path?token=hidden#fragment failed".into(),
         ));
@@ -239,72 +188,17 @@ mod tests {
         assert_eq!(first.errors["connect"], usize::MAX);
     }
 
-    #[tokio::test]
-    async fn connection_layer_counts_reuse_reconnect_failure_and_cancelled_futures() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            for _ in 0..2 {
-                let mut input = Vec::new();
-                let mut byte = [0];
-                while !input.ends_with(b"\r\n\r\n") {
-                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
-                    input.push(byte[0]);
-                }
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .unwrap();
-            }
-        });
+    #[test]
+    fn connection_attempt_records_success_failure_and_cancellation() {
         let metrics = Arc::new(Mutex::new(Connections::default()));
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connector_layer(ConnectLayer(metrics.clone()))
-            .build()
-            .unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                client
-                    .get(format!("http://{address}"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .text()
-                    .await
-                    .unwrap(),
-                "ok"
-            );
-        }
-        server.join().unwrap();
-        assert!(
-            client
-                .get(format!("http://{address}"))
-                .send()
-                .await
-                .is_err()
-        );
-        let pending = Attempt {
-            metrics: metrics.clone(),
-            start: Instant::now(),
-            finished: false,
-        };
-        drop(pending);
-        let mut collected = metrics.lock().unwrap();
-        assert_eq!(collected.successful_ms.len(), 1); // two requests reused one TCP connection
-        assert_ne!(collected.failed_ms.len(), 0);
-        assert_eq!(collected.cancelled, 1);
-        let report = std::mem::take(&mut *collected).report(Some(2.0));
-        assert_eq!(report["connections_per_second"], 0.5);
-        assert!(
-            report["failed_setup_duration_ms"]["p99_ms"]
-                .as_f64()
-                .unwrap()
-                >= 0.0
-        );
+        let mut success = ConnectionAttempt::start(metrics.clone());
+        success.finish(None);
+        let mut failure = ConnectionAttempt::start(metrics.clone());
+        failure.finish(Some("connection refused".into()));
+        drop(ConnectionAttempt::start(metrics.clone()));
+        let metrics = metrics.lock().unwrap();
+        assert_eq!(metrics.successful_ms.len(), 1);
+        assert_eq!(metrics.failed_ms.len(), 2);
+        assert_eq!(metrics.cancelled, 1);
     }
 }

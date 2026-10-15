@@ -197,13 +197,11 @@ feed, wait 3–7 seconds, fetch a random post, wait 3–8 seconds, like it with 
 probability, create a post with 2% probability, and idle 5–15 seconds. Each user
 owns an HTTP/1 client and retains its idle connection during think time. A server
 that closes the connection requires that user to reconnect.
-Feed response bodies are consumed and dropped before the user sleeps. HTTP
-pools and sockets remain separate.
+Feed response bodies are consumed and dropped before the user sleeps. Each
+user's connection remains independent.
 Connections go directly to the supplied target. The generator ignores outbound
 proxy environment variables such as `HTTP_PROXY` and `ALL_PROXY`.
-The Tokio user engine creates each user's client when that user starts. Pending
-users occupy only scenario indices; that storage is released after the last user
-starts.
+Each client and user task is created at its scheduled ramp-up time.
 
 `maximum_users` describes the load stage. Measured established sockets report
 the actual connection concurrency, which can differ during initial jitter,
@@ -220,8 +218,8 @@ error.
 
 Scoring p95/p99 use k6's linear interpolation over combined unrounded samples
 from all endpoints and hosts; per-host percentiles are never averaged. Latency
-includes the complete body and connection setup. New connections can measure
-slower because latency includes DNS and TCP setup.
+covers HTTP sending, waiting, and complete body reception, excluding DNS and TCP
+connection setup. Connection setup durations are reported separately.
 
 `duration_s` includes shutdown time.
 

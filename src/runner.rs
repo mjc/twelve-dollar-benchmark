@@ -229,7 +229,7 @@ impl TargetMonitor {
         output: &Path,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
-        let url = reqwest::Url::parse(&cfg.base_url)?;
+        let url = url::Url::parse(&cfg.base_url)?;
         let host = url
             .host_str()
             .ok_or("target URL has no host")?
@@ -636,7 +636,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "hold_started_at": hold_start, "hold_finished_at": hold_end,
         // An elapsed interval across all workers, not a sum of their durations.
         "duration_s": started.zip(finished).and_then(|(s, f)| (f-s).to_std().ok()).map(|d| d.as_secs_f64()),
-        "latency": "client wall time through complete response body, including connection setup",
+        "latency": "HTTP send through complete response body, excluding DNS and TCP connection setup",
         "percentiles": "k6 linear interpolation over all workers' unrounded samples",
         "thresholds": { "p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01 },
         "aggregate": summary, "endpoints": endpoints,
@@ -1680,7 +1680,7 @@ struct RunOutput<'a> {
     monitor: Option<&'a mut TargetMonitor>,
     target_unavailable: Option<String>,
     cancelled: &'a AtomicBool,
-    targets: &'a [reqwest::Url],
+    targets: &'a [url::Url],
     source_ip_count: usize,
 }
 
@@ -1740,8 +1740,7 @@ fn finish_run(run: RunOutput<'_>) -> Result<u8> {
         "policy": "explicit ports, shared per source/destination counters; no host sysctl changes",
         "tuple_capacity": 64512 * cfg.destination_ports.len() * if cfg.user.is_none() { source_ip_count } else { workers.len() },
         "capacity_scope": "upper bound before existing sockets and TIME_WAIT; assumes one source address per SSH generator"});
-    aggregate["configured_hosts"] =
-        json!(targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>());
+    aggregate["configured_hosts"] = json!(targets.iter().map(url::Url::as_str).collect::<Vec<_>>());
     if cancelled.load(Ordering::Relaxed) {
         aggregate["completed"] = json!(false);
         aggregate["passed"] = json!(false);

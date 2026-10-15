@@ -1,5 +1,5 @@
-use reqwest::Url;
 use std::error::Error;
+use url::Url;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 

@@ -11,11 +11,11 @@ use std::{
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use twelve_dollar_benchmark::{ENDPOINTS, control, setting, telemetry};
 
 mod config;
@@ -24,6 +24,7 @@ mod destinations;
 mod errors;
 mod runner;
 mod scoring;
+mod transport;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Endpoint {
@@ -46,10 +47,10 @@ impl Endpoint {
         }
     }
 
-    fn method(self) -> reqwest::Method {
+    fn method(self) -> http::Method {
         match self {
-            Self::Feed | Self::Post => reqwest::Method::GET,
-            Self::Like | Self::Create => reqwest::Method::POST,
+            Self::Feed | Self::Post => http::Method::GET,
+            Self::Like | Self::Create => http::Method::POST,
         }
     }
 
@@ -66,7 +67,10 @@ impl Endpoint {
 #[derive(Deserialize)]
 struct Token {
     username: String,
-    token: String,
+    #[serde(rename = "token")]
+    credential: String,
+    #[serde(skip)]
+    authorization: std::sync::OnceLock<http::HeaderValue>,
 }
 #[derive(Deserialize)]
 struct Feed {
@@ -89,8 +93,8 @@ struct Samples {
 type Metrics = Arc<Mutex<[Samples; 4]>>;
 
 struct User {
-    client: reqwest::Client,
-    base: Arc<reqwest::Url>,
+    client: transport::Client,
+    base: Arc<url::Url>,
     index: usize,
     source: Option<IpAddr>,
     metrics: Metrics,
@@ -247,13 +251,19 @@ fn load_tokens(path: &Path) -> Result<Vec<Token>, Box<dyn std::error::Error>> {
     if tokens.is_empty()
         || tokens
             .iter()
-            .any(|t| t.username.is_empty() || t.token.is_empty())
+            .any(|t| t.username.is_empty() || t.credential.is_empty())
     {
         return Err("TOKENS must contain a non-empty array of usernames and tokens".into());
     }
     for token in &tokens {
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.token))
-            .map_err(|_| "TOKENS contains an invalid bearer header value")?;
+        let mut authorization =
+            http::HeaderValue::from_str(&format!("Bearer {}", token.credential))
+                .map_err(|_| "TOKENS contains an invalid bearer header value")?;
+        authorization.set_sensitive(true);
+        token
+            .authorization
+            .set(authorization)
+            .map_err(|_| "unable to cache bearer header")?;
     }
     Ok(tokens)
 }
@@ -291,48 +301,15 @@ fn should_capture_http_excerpt(user: &User, endpoint: Endpoint) -> bool {
         < errors::MAX_ERROR_EXAMPLES
 }
 
-async fn read_response_body(
-    mut response: reqwest::Response,
-    keep_body: bool,
-    capture_excerpt: bool,
-) -> (Option<bytes::Bytes>, Option<reqwest::Error>) {
-    if keep_body {
-        return match response.bytes().await {
-            Ok(bytes) => (Some(bytes), None),
-            Err(error) => (None, Some(error.without_url())),
-        };
-    }
-
-    let mut excerpt = capture_excerpt.then(|| Vec::with_capacity(1025));
-    let read_result = async {
-        while let Some(chunk) = response.chunk().await? {
-            if let Some(excerpt) = &mut excerpt
-                && excerpt.len() < 1025
-            {
-                excerpt.extend_from_slice(&chunk[..chunk.len().min(1025 - excerpt.len())]);
-            }
-        }
-        Ok::<(), reqwest::Error>(())
-    }
-    .await;
-    match read_result {
-        Ok(()) => (
-            Some(excerpt.map_or_else(bytes::Bytes::new, bytes::Bytes::from)),
-            None,
-        ),
-        Err(error) => (None, Some(error.without_url())),
-    }
-}
-
 async fn request(
-    user: &User,
+    user: &mut User,
     endpoint: Endpoint,
     path: &str,
     auth: Option<&Token>,
     body: Option<&serde_json::Value>,
-) -> Option<bytes::Bytes> {
-    let url = match user.base.join(path) {
-        Ok(url) => url,
+) -> Option<transport::RetainedBody> {
+    let body = match body.map(serde_json::to_vec).transpose() {
+        Ok(body) => body.map(bytes::Bytes::from),
         Err(error) => {
             runtime_error(
                 &user.runtime_details,
@@ -342,97 +319,131 @@ async fn request(
                 user.base.as_str(),
                 user.source,
             );
-            sample_mut(&mut user.metrics.lock().unwrap(), endpoint)
-                .errors
-                .record_lazy(None, "request_builder", || {
-                    errors::example(
-                        errors::ErrorLocation {
-                            endpoint: endpoint.name(),
-                            path,
-                            user_index: user.index,
-                            destination: user.base.as_str(),
-                            source_ip: user.source.map(|v| v.to_string()),
-                        },
-                        None,
-                        "request_builder",
-                        errors::error_chain(&error),
-                        None,
-                    )
-                });
+            record_request_failure(user, endpoint, path, error.to_string());
             return None;
         }
     };
-    let mut builder = user.client.request(endpoint.method(), url);
-    if let Some(token) = auth {
-        builder = builder
-            .bearer_auth(&token.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
-    }
-    if let Some(body) = body {
-        builder = builder.json(body);
-    }
-    let started = Instant::now();
-    let result = builder.send().await;
-    if let Some(error) = result.as_ref().err().filter(|error| error.is_builder()) {
-        runtime_error(
-            &user.runtime_details,
-            &user.runtime_errors,
-            error,
-            user.index,
-            user.base.as_str(),
-            user.source,
-        );
-    }
-    let (status, bytes, failure) = match result {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let keep_body = endpoint == Endpoint::Feed && endpoint.successful_status(status);
-            let capture_excerpt =
-                !http_success(status) && should_capture_http_excerpt(user, endpoint);
-            let (bytes, error) = read_response_body(response, keep_body, capture_excerpt).await;
-            (status, bytes, error.map(|error| ("body_read", error)))
+    let capture_excerpt = should_capture_http_excerpt(user, endpoint);
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        user.client.request(
+            endpoint.method(),
+            path,
+            auth.map(|token| token.authorization.get().expect("preflighted token header")),
+            body,
+            endpoint == Endpoint::Feed,
+            capture_excerpt,
+        ),
+    )
+    .await;
+    let (status, retained, excerpt, body_complete, failure, latency_ms) = match result {
+        Ok(Ok(response)) => {
+            let latency_ms = response.latency_ms;
+            if let Some(error) = response.failure {
+                (
+                    response.status,
+                    None,
+                    response.error_excerpt,
+                    false,
+                    Some(("body_read", errors::sanitize_message_urls(&error))),
+                    latency_ms,
+                )
+            } else {
+                (
+                    response.status,
+                    response.retained,
+                    response.error_excerpt,
+                    true,
+                    None,
+                    latency_ms,
+                )
+            }
         }
-        Err(error) => (
+        Ok(Err(error)) => (
             0,
             None,
+            bytes::Bytes::new(),
+            false,
             Some((
-                if error.is_builder() {
-                    "request_builder"
-                } else {
-                    "transport"
-                },
-                error.without_url(),
+                "transport",
+                errors::sanitize_message_urls(&error.to_string()),
             )),
+            user.client.take_request_latency_ms(),
         ),
+        Err(_) => {
+            user.client.discard_connection();
+            (
+                0,
+                None,
+                bytes::Bytes::new(),
+                false,
+                Some((
+                    "transport",
+                    "whole-request timeout after 60 seconds".to_owned(),
+                )),
+                user.client.take_request_latency_ms(),
+            )
+        }
     };
-    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let body = retained
+        .as_deref()
+        .or_else(|| (!excerpt.is_empty()).then_some(excerpt.as_ref()));
     record_response(
         user,
+        ResponseSample {
+            endpoint,
+            path,
+            status,
+            body,
+            body_complete,
+            failure,
+            latency_ms,
+        },
+    );
+    retained.filter(|_| endpoint == Endpoint::Feed && endpoint.successful_status(status))
+}
+
+struct ResponseSample<'a> {
+    endpoint: Endpoint,
+    path: &'a str,
+    status: u16,
+    body: Option<&'a [u8]>,
+    body_complete: bool,
+    failure: Option<(&'static str, String)>,
+    latency_ms: f64,
+}
+
+fn record_request_failure(user: &User, endpoint: Endpoint, path: &str, reason: String) {
+    record_response(
+        user,
+        ResponseSample {
+            endpoint,
+            path,
+            status: 0,
+            body: None,
+            body_complete: false,
+            failure: Some(("request_builder", reason)),
+            latency_ms: 0.0,
+        },
+    );
+}
+
+fn record_response(user: &User, sample: ResponseSample<'_>) {
+    let ResponseSample {
         endpoint,
         path,
         status,
-        bytes.as_deref(),
+        body: bytes,
+        body_complete,
         failure,
         latency_ms,
-    );
-    bytes.filter(|_| endpoint.successful_status(status))
-}
-
-fn record_response(
-    user: &User,
-    endpoint: Endpoint,
-    path: &str,
-    status: u16,
-    bytes: Option<&[u8]>,
-    failure: Option<(&str, reqwest::Error)>,
-    latency_ms: f64,
-) {
-    let success = http_success(status) && bytes.is_some();
+    } = sample;
+    let success = http_success(status) && body_complete;
     let mut metrics = user.metrics.lock().unwrap();
     let samples = sample_mut(&mut metrics, endpoint);
     samples.latency_ms.push(latency_ms);
     samples.failed += usize::from(!success);
-    samples.checks_failed += usize::from(!endpoint.successful_status(status) || bytes.is_none());
+    samples.checks_failed += usize::from(!endpoint.successful_status(status) || !body_complete);
     let error = if let Some((kind, reason)) = failure {
         Some((kind, Some(reason), None))
     } else if !http_success(status) {
@@ -456,16 +467,13 @@ fn record_response(
                     },
                     (status != 0).then_some(status),
                     kind,
-                    failure.map_or_else(
-                        || {
-                            if kind == "http" {
-                                format!("HTTP status {status}")
-                            } else {
-                                format!("unexpected HTTP status {status}")
-                            }
-                        },
-                        |error| errors::error_chain(&error),
-                    ),
+                    failure.unwrap_or_else(|| {
+                        if kind == "http" {
+                            format!("HTTP status {status}")
+                        } else {
+                            format!("unexpected HTTP status {status}")
+                        }
+                    }),
                     body,
                 )
                 .with_latency(latency_ms)
@@ -482,7 +490,7 @@ fn choose_post_id(feed: &Feed) -> Option<u64> {
         .map(|post| post.id)
 }
 
-async fn browse(user: &User, tokens: &[Token], iteration: usize) {
+async fn browse(user: &mut User, tokens: &[Token], iteration: usize) {
     let Some(token) = tokens.get(user.index % tokens.len().max(1)) else {
         runtime_error(
             &user.runtime_details,
@@ -629,26 +637,18 @@ fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn build_client(
+    base: Arc<url::Url>,
     source: Option<IpAddr>,
     connections: Arc<Mutex<connections::Connections>>,
-) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .http1_only()
-        .pool_idle_timeout(None)
-        .pool_max_idle_per_host(1)
-        .connector_layer(connections::ConnectLayer(connections))
-        .local_address(source)
-        .gzip(true)
-        .timeout(Duration::from_secs(60))
-        .build()
+) -> transport::Client {
+    transport::Client::new(base, source, connections)
 }
 
 struct Workload {
     ramp: Duration,
     hold: Duration,
     source_ips: Arc<Vec<IpAddr>>,
-    targets: Arc<Vec<Arc<reqwest::Url>>>,
+    targets: Arc<Vec<Arc<url::Url>>>,
     tokens: Arc<Vec<Token>>,
     user_offset: usize,
 }
@@ -673,7 +673,10 @@ struct RunContext {
 
 struct LiveUsers {
     tasks: JoinSet<()>,
-    stops: Vec<tokio::sync::watch::Sender<bool>>,
+    stops: Arc<[AtomicBool]>,
+    aborts: Vec<AbortHandle>,
+    launched: usize,
+    expected_cancellations: usize,
     maximum: usize,
     interrupted: bool,
 }
@@ -838,7 +841,13 @@ async fn launch_users(
 ) -> Result<LiveUsers, Box<dyn std::error::Error>> {
     let mut users = LiveUsers {
         tasks: JoinSet::new(),
-        stops: Vec::with_capacity(context.cfg.users),
+        stops: (0..context.cfg.users)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into(),
+        aborts: Vec::with_capacity(context.cfg.users),
+        launched: 0,
+        expected_cancellations: 0,
         maximum: 0,
         interrupted: context.interrupted,
     };
@@ -880,31 +889,18 @@ async fn launch_users(
             .source_ips
             .get(index % context.workload.source_ips.len().max(1))
             .copied();
-        let client = match build_client(source, context.connections.clone()) {
-            Ok(client) => client,
-            Err(error) => {
-                runtime_error(
-                    &context.runtime_details,
-                    &context.runtime_errors,
-                    &error,
-                    index,
-                    base.as_str(),
-                    source,
-                );
-                users.interrupted = true;
-                break;
-            }
-        };
+        let client = build_client(base.clone(), source, context.connections.clone());
         let mut assigned = context.assigned.lock().unwrap();
         if !assigned.contains(base.as_str()) {
             assigned.insert(base.as_str().to_owned());
         }
         drop(assigned);
         users.maximum += 1;
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        users.stops.push(tx);
+        users.launched += 1;
+        let stops = users.stops.clone();
+        let stop_index = local;
         let tokens = context.workload.tokens.clone();
-        let user = User {
+        let mut user = User {
             client,
             base,
             index,
@@ -913,14 +909,23 @@ async fn launch_users(
             runtime_errors: context.runtime_errors.clone(),
             runtime_details: context.runtime_details.clone(),
         };
-        users.tasks.spawn(async move {
-            think(0.0, 5.0).await;
+        let abort = users.tasks.spawn(async move {
             let mut iteration = 0;
-            while !*rx.borrow() {
-                browse(&user, &tokens, iteration).await;
+            loop {
+                if iteration == 0 {
+                    think(0.0, 5.0).await;
+                }
+                browse(&mut user, &tokens, iteration).await;
                 iteration += 1;
+                if stops
+                    .get(stop_index)
+                    .is_some_and(|stop| stop.load(Ordering::Relaxed))
+                {
+                    break;
+                }
             }
         });
+        users.aborts.push(abort);
     }
     Ok(users)
 }
@@ -956,31 +961,136 @@ async fn ramp_down_users(
     hold_deadline: Instant,
     users: &mut LiveUsers,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (n, tx) in users.stops.iter().enumerate() {
-        let deadline = hold_deadline
-            .checked_add(ramp_offset(
-                n + 1,
-                users.stops.len() + 1,
-                Duration::from_secs(30),
-            ))
-            .ok_or("ramp-down deadline exceeds the system clock range")?;
-        users.interrupted = tokio::select! {
-            () = wait_ramp_slot(deadline) => false,
-            _ = context.signals.interrupt.recv() => true,
-            _ = context.signals.terminate.recv() => true,
+    enum Event {
+        Deadline,
+        Signal,
+        Joined(Option<Result<(), tokio::task::JoinError>>),
+    }
+
+    if users.launched == 0 {
+        return Ok(());
+    }
+    let mut soft_stopped = 0;
+    let mut hard_cancelled = 0;
+    let mut next_soft = Some(ramp_down_deadline(hold_deadline, 1, users.launched)?);
+    let mut next_hard = None;
+
+    while hard_cancelled < users.launched && !users.tasks.is_empty() {
+        let deadline = match next_hard {
+            Some(hard) if hard < next_soft.unwrap_or(hard) => hard,
+            _ => next_soft
+                .or(next_hard)
+                .expect("ramp-down has pending events"),
         };
-        if users.interrupted {
-            stop_all(&users.stops);
-            break;
+        let event = tokio::select! {
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Event::Deadline,
+            _ = context.signals.interrupt.recv() => Event::Signal,
+            _ = context.signals.terminate.recv() => Event::Signal,
+            result = users.tasks.join_next() => Event::Joined(result),
+        };
+        match event {
+            Event::Signal => {
+                users.interrupted = true;
+                stop_all(&users.stops);
+                break;
+            }
+            Event::Joined(result) => {
+                if handle_user_result(context, users, result) {
+                    break;
+                }
+                continue;
+            }
+            Event::Deadline => {}
         }
-        let _ = tx.send(true);
+
+        let now = Instant::now();
+        if next_hard.is_some_and(|hard| hard <= now) {
+            if let Some(abort) = users.aborts.get(users.launched - hard_cancelled - 1) {
+                abort.abort();
+                users.expected_cancellations += 1;
+            }
+            hard_cancelled += 1;
+            next_hard = if hard_cancelled < soft_stopped {
+                Some(graceful_cancel_deadline(ramp_down_deadline(
+                    hold_deadline,
+                    hard_cancelled + 1,
+                    users.launched,
+                )?)?)
+            } else {
+                None
+            };
+        }
+        if next_soft.is_some_and(|soft| soft <= now) {
+            stop_one(&users.stops, users.launched - soft_stopped - 1);
+            soft_stopped += 1;
+            let hard_deadline =
+                graceful_cancel_deadline(next_soft.expect("soft deadline was checked"))?;
+            next_hard = Some(next_hard.map_or(hard_deadline, |current| current.min(hard_deadline)));
+            next_soft = if soft_stopped < users.launched {
+                Some(ramp_down_deadline(
+                    hold_deadline,
+                    soft_stopped + 1,
+                    users.launched,
+                )?)
+            } else {
+                None
+            };
+        }
     }
     Ok(())
 }
 
-fn stop_all(stops: &[tokio::sync::watch::Sender<bool>]) {
+fn handle_user_result(
+    context: &RunContext,
+    users: &mut LiveUsers,
+    result: Option<Result<(), tokio::task::JoinError>>,
+) -> bool {
+    let Some(Err(error)) = result else {
+        return false;
+    };
+    if error.is_cancelled() && users.expected_cancellations > 0 {
+        users.expected_cancellations -= 1;
+        return false;
+    }
+    users.interrupted = true;
+    stop_all(&users.stops);
+    runtime_error(
+        &context.runtime_details,
+        &context.runtime_errors,
+        &error,
+        context.workload.user_offset,
+        &context.cfg.base_url,
+        None,
+    );
+    true
+}
+
+fn graceful_cancel_deadline(soft_deadline: Instant) -> Result<Instant, Box<dyn std::error::Error>> {
+    soft_deadline
+        .checked_add(Duration::from_secs(10))
+        .ok_or_else(|| "graceful ramp-down deadline exceeds the system clock range".into())
+}
+
+fn ramp_down_deadline(
+    hold_deadline: Instant,
+    step: usize,
+    users: usize,
+) -> Result<Instant, Box<dyn std::error::Error>> {
+    let offset = ramp_offset(step, users + 1, Duration::from_secs(30));
+    hold_deadline
+        .checked_add(offset)
+        .ok_or_else(|| "ramp-down deadline exceeds the system clock range".into())
+}
+
+fn stop_one(stops: &[AtomicBool], index: usize) {
+    if let Some(stop) = stops.get(index) {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn stop_all(stops: &[AtomicBool]) {
     for stop in stops {
-        let _ = stop.send(true);
+        stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -991,18 +1101,7 @@ async fn drain_users(context: &mut RunContext, users: &mut LiveUsers) {
             _ = context.signals.interrupt.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
             _ = context.signals.terminate.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
         };
-        if let Some(Err(error)) = result {
-            users.interrupted = true;
-            stop_all(&users.stops);
-            runtime_error(
-                &context.runtime_details,
-                &context.runtime_errors,
-                &error,
-                context.workload.user_offset,
-                &context.cfg.base_url,
-                None,
-            );
-        }
+        handle_user_result(context, users, result);
     }
 }
 
@@ -1092,7 +1191,7 @@ fn build_report(
     let connection_report =
         std::mem::take(&mut *context.connections.lock().unwrap()).report(elapsed);
     let report = serde_json::json!({
-        "generator": "reqwest",
+        "generator": "hyper-http1",
         "requested_users": context.cfg.users,
         "source_port_allocation": {
             "first": 1024,
@@ -1112,7 +1211,7 @@ fn build_report(
         "destination_ports": context.workload.targets.iter().filter_map(|url| url.port_or_known_default()).collect::<Vec<_>>(),
         "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
         "source_ips": context.workload.source_ips.as_ref(),
-        "latency": "client wall time through complete response body, including connection setup",
+        "latency": "HTTP send through complete response body, excluding DNS and TCP connection setup",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
         "scope": "whole run including ramp-up, hold, ramp-down and drain",
         "coordinated_omission": "disabled for scoring; real requests only",
@@ -1249,9 +1348,14 @@ mod tests {
     use std::io::{BufRead, Read, Write};
 
     fn user(base: &str, metrics: Metrics) -> User {
+        let base = Arc::new(url::Url::parse(base).unwrap());
         User {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            base: Arc::new(reqwest::Url::parse(base).unwrap()),
+            client: build_client(
+                base.clone(),
+                None,
+                Arc::new(Mutex::new(connections::Connections::default())),
+            ),
+            base,
             index: 7,
             source: None,
             metrics,
@@ -1417,8 +1521,8 @@ mod tests {
     #[tokio::test]
     async fn empty_validated_token_set_is_a_runtime_error_not_a_panic() {
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user("http://127.0.0.1:3000", metrics);
-        browse(&user, &[], 0).await;
+        let mut user = user("http://127.0.0.1:3000", metrics);
+        browse(&mut user, &[], 0).await;
         assert_eq!(user.runtime_errors.load(Ordering::Relaxed), 1);
     }
 
@@ -1464,21 +1568,25 @@ mod tests {
             stream.write_all(b"complete body").unwrap();
         });
         let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics.clone());
+        let mut user = user(&format!("http://{address}"), metrics.clone());
         let token = Token {
             username: "u".into(),
-            token: "secret".into(),
+            credential: "secret".into(),
+            authorization: std::sync::OnceLock::new(),
         };
+        let mut authorization = http::HeaderValue::from_static("Bearer secret");
+        authorization.set_sensitive(true);
+        token.authorization.set(authorization).unwrap();
         let payload = serde_json::json!({"body":"hello"});
         let response = request(
-            &user,
+            &mut user,
             Endpoint::Create,
             "/posts",
             Some(&token),
             Some(&payload),
         )
         .await;
-        assert!(response.unwrap().is_empty());
+        assert!(response.is_none());
         server.join().unwrap();
         let mut data = metrics.lock().unwrap();
         let create = sample_mut(&mut data, Endpoint::Create);
@@ -1548,10 +1656,10 @@ mod tests {
         });
 
         let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics);
-        let write_response = request(&user, Endpoint::Create, "/posts", None, None).await;
-        assert!(write_response.unwrap().is_empty());
-        let feed_response: bytes::Bytes = request(&user, Endpoint::Feed, "/feed", None, None)
+        let mut user = user(&format!("http://{address}"), metrics);
+        let write_response = request(&mut user, Endpoint::Create, "/posts", None, None).await;
+        assert!(write_response.is_none());
+        let feed_response = request(&mut user, Endpoint::Feed, "/feed", None, None)
             .await
             .unwrap();
         assert_eq!(&feed_response[..], br#"{"posts":[{"id":1}]}"#);
@@ -1564,12 +1672,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics.clone());
-        let response = request(&user, Endpoint::Feed, "/feed", None, None).await;
+        let mut user = user(&format!("http://{address}"), metrics.clone());
+        let response = request(&mut user, Endpoint::Feed, "/feed", None, None).await;
         assert!(response.is_none());
         let mut data = metrics.lock().unwrap();
         let feed = sample_mut(&mut data, Endpoint::Feed);
         assert_eq!(feed.failed, 1);
+        assert_eq!(feed.latency_ms, [0.0]);
         assert_eq!(feed.errors.counts["kind:transport"], 1);
     }
 
@@ -1593,9 +1702,9 @@ mod tests {
                 .unwrap();
         });
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics.clone());
+        let mut user = user(&format!("http://{address}"), metrics.clone());
         assert!(
-            request(&user, Endpoint::Feed, "/feed", None, None)
+            request(&mut user, Endpoint::Feed, "/feed", None, None)
                 .await
                 .is_none()
         );
@@ -1622,9 +1731,9 @@ mod tests {
             stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nunavailable").unwrap();
         });
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics.clone());
+        let mut user = user(&format!("http://{address}"), metrics.clone());
         assert!(
-            request(&user, Endpoint::Feed, "/feed", None, None)
+            request(&mut user, Endpoint::Feed, "/feed", None, None)
                 .await
                 .is_none()
         );
@@ -1660,9 +1769,9 @@ mod tests {
             stream.write_all(&body).unwrap();
         });
         let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-        let user = user(&format!("http://{address}"), metrics.clone());
+        let mut user = user(&format!("http://{address}"), metrics.clone());
         assert!(
-            request(&user, Endpoint::Feed, "/feed", None, None)
+            request(&mut user, Endpoint::Feed, "/feed", None, None)
                 .await
                 .is_none()
         );
@@ -1704,19 +1813,17 @@ mod tests {
         });
         let connection_metrics = Arc::new(Mutex::new(connections::Connections::default()));
         for ip in &ips {
-            let client = build_client(Some(*ip), connection_metrics.clone()).unwrap();
-            assert_eq!(
-                client
-                    .get(format!("http://{address}"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap()
-                    .as_ref(),
-                b"ok".as_slice()
+            let mut client = build_client(
+                Arc::new(url::Url::parse(&format!("http://{address}")).unwrap()),
+                Some(*ip),
+                connection_metrics.clone(),
             );
+            let response = client
+                .request(http::Method::GET, "/", None, None, true, false)
+                .await
+                .unwrap();
+            let retained = response.retained.unwrap();
+            assert_eq!(&*retained, b"ok".as_slice());
         }
         let peers = server.join().unwrap();
         assert_eq!(peers, ips);
@@ -1728,23 +1835,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn invalid_client_builder_counts_as_runtime_failure_and_fails_score() {
-        let error = reqwest::Client::builder()
-            .user_agent("\n")
-            .build()
-            .unwrap_err();
-        let count = AtomicUsize::new(0);
-        let details = Arc::new(Mutex::new(errors::ErrorDetails::default()));
-        runtime_error(&details, &count, &error, 1, "http://127.0.0.1:3000", None);
-        let mut samples = Samples {
-            latency_ms: vec![1.0],
-            ..Default::default()
-        };
-        assert!(!passes(&samples.summary(), count.load(Ordering::Relaxed)));
-        assert_eq!(details.lock().unwrap().counts["kind:runtime"], 1);
-    }
-
     #[test]
     fn scheduled_start_rejects_overflow_and_missed_deadlines() {
         assert!(scheduled_start_delay(i64::MIN, 0).is_err());
@@ -1754,6 +1844,75 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         assert_eq!(scheduled_start_delay(1_000, 1_000).unwrap(), None);
+    }
+
+    #[test]
+    fn stop_flags_use_local_indices_for_a_launched_prefix() {
+        let flags: Arc<[AtomicBool]> = (0..5)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+        let launched = 3;
+        let local_index = 2;
+        let global_index = global_user_index(700, local_index).unwrap();
+        stop_one(&flags, local_index);
+
+        assert_eq!(launched, 3);
+        assert_eq!(global_index, 702);
+        assert!(flags[local_index].load(Ordering::Relaxed));
+        assert!(!flags[3].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stop_all_sets_every_flag() {
+        let flags: Arc<[AtomicBool]> = (0..4)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+
+        stop_all(&flags);
+
+        assert!(flags.iter().all(|flag| flag.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn three_users_ramp_down_highest_local_user_first() {
+        let hold_end = Instant::now();
+        for (step, local_index, seconds) in [(1, 2, 10), (2, 1, 20), (3, 0, 30)] {
+            let deadline = ramp_down_deadline(hold_end, step, 3).unwrap();
+            assert_eq!(
+                deadline.duration_since(hold_end),
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(3 - step, local_index);
+        }
+    }
+
+    #[tokio::test]
+    async fn grace_cancel_drops_active_sample_and_keeps_completed_samples() {
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let soft_stop = Arc::new(AtomicBool::new(false));
+        let task_samples = samples.clone();
+        let task_stop = soft_stop.clone();
+        let mut tasks = JoinSet::new();
+        let abort = tasks.spawn(async move {
+            task_samples.lock().unwrap().push(1);
+            if !task_stop.load(Ordering::Relaxed) {
+                let response = std::future::pending::<Option<usize>>().await;
+                if let Some(sample) = response {
+                    task_samples.lock().unwrap().push(sample);
+                }
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(*samples.lock().unwrap(), [1]);
+        soft_stop.store(true, Ordering::Relaxed);
+        abort.abort();
+        let result = tasks.join_next().await.unwrap();
+
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(*samples.lock().unwrap(), [1]);
     }
 
     #[tokio::test]
