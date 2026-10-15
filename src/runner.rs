@@ -1,6 +1,6 @@
 use super::{
-    Samples, config, connections, destinations, errors::ErrorDetails, load_tokens,
-    parse_source_ips, passes,
+    Samples, aggregate_samples, config, connections, destinations, errors::ErrorDetails,
+    load_tokens, parse_source_ips, passes,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -618,7 +618,8 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     if required_hold > 0.0 {
         completed &= common_hold_s.is_some_and(|s| s + 0.25 >= required_hold);
     }
-    let (mut aggregate, endpoints) = endpoint_summaries(&mut samples, started, finished);
+    let endpoints = endpoint_summaries(&mut samples, started, finished);
+    let mut aggregate = aggregate_samples(&mut samples);
     let summary = aggregate.summary();
     let duration_s = started
         .zip(finished)
@@ -694,25 +695,22 @@ fn endpoint_summaries(
     samples: &mut [Samples; 4],
     started: Option<DateTime<Utc>>,
     finished: Option<DateTime<Utc>>,
-) -> (Samples, std::collections::BTreeMap<&'static str, Value>) {
-    let mut aggregate = Samples::default();
+) -> std::collections::BTreeMap<&'static str, Value> {
     let mut endpoints = std::collections::BTreeMap::new();
     let duration_s = started
         .zip(finished)
         .and_then(|(s, f)| (f - s).to_std().ok())
         .map(|d| d.as_secs_f64());
     for (endpoint_name, sample) in ENDPOINTS.iter().zip(samples.iter_mut()) {
-        aggregate.latency_ms.extend_from_slice(&sample.latency_ms);
-        aggregate.failed += sample.failed;
-        aggregate.checks_failed += sample.checks_failed;
-        aggregate.errors.merge(&sample.errors);
-        let mut endpoint = serde_json::to_value(sample.summary()).unwrap();
-        if let Value::Object(rates) = connections::request_rates(sample, duration_s) {
+        let endpoint_summary = sample.summary();
+        let rates = connections::request_rates(sample, duration_s);
+        let mut endpoint = serde_json::to_value(endpoint_summary).unwrap();
+        if let Value::Object(rates) = rates {
             endpoint.as_object_mut().unwrap().extend(rates);
         }
         endpoints.insert(*endpoint_name, endpoint);
     }
-    (aggregate, endpoints)
+    endpoints
 }
 
 pub(super) fn render_score_table(report: &Value) -> String {

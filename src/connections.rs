@@ -38,15 +38,18 @@ impl Connections {
             *total = total.saturating_add(count);
         }
     }
-    pub fn report(&mut self, seconds: Option<f64>) -> Value {
-        let mut all = self.successful_ms.clone();
-        all.extend_from_slice(&self.failed_ms);
-        let total = all.len();
+    pub fn report(mut self, seconds: Option<f64>) -> Value {
+        let established = self.successful_ms.len();
+        let failed = self.failed_ms.len();
+        let total = established + failed;
+        let established_distribution = distribution(&mut self.successful_ms);
+        let failed_distribution = distribution(&mut self.failed_ms);
+        self.successful_ms.append(&mut self.failed_ms);
         json!({
             "scope": "client connection setup including DNS and TCP; pooled requests do not start a new attempt; an attempt may try multiple DNS addresses and source ports",
-            "attempts": total, "established": self.successful_ms.len(), "failed": self.failed_ms.len(), "cancelled": self.cancelled,
-            "attempts_per_second": rate(total, seconds), "connections_per_second": rate(self.successful_ms.len(), seconds), "failed_per_second": rate(self.failed_ms.len(), seconds),
-            "setup_duration_ms": distribution(&mut all), "successful_setup_duration_ms": distribution(&mut self.successful_ms), "failed_setup_duration_ms": distribution(&mut self.failed_ms), "errors": self.errors,
+            "attempts": total, "established": established, "failed": failed, "cancelled": self.cancelled,
+            "attempts_per_second": rate(total, seconds), "connections_per_second": rate(established, seconds), "failed_per_second": rate(failed, seconds),
+            "setup_duration_ms": distribution(&mut self.successful_ms), "successful_setup_duration_ms": established_distribution, "failed_setup_duration_ms": failed_distribution, "errors": self.errors,
         })
     }
 }
@@ -202,6 +205,24 @@ mod tests {
     }
 
     #[test]
+    fn report_keeps_exact_distributions_without_copying_samples() {
+        let report = Connections {
+            successful_ms: vec![2.0, 1.0],
+            failed_ms: vec![20.0, 10.0],
+            ..Default::default()
+        }
+        .report(Some(2.0));
+
+        assert_eq!(report["setup_duration_ms"]["samples"], 4);
+        assert_eq!(report["setup_duration_ms"]["avg_ms"], 8.25);
+        assert_eq!(report["setup_duration_ms"]["med_ms"], 6.0);
+        assert!((report["setup_duration_ms"]["p95_ms"].as_f64().unwrap() - 18.5).abs() < 1e-12);
+        assert_eq!(report["setup_duration_ms"]["max_ms"], 20.0);
+        assert_eq!(report["successful_setup_duration_ms"]["med_ms"], 1.5);
+        assert_eq!(report["failed_setup_duration_ms"]["med_ms"], 15.0);
+    }
+
+    #[test]
     fn merging_connection_counters_saturates_instead_of_wrapping() {
         let mut first = Connections {
             cancelled: usize::MAX,
@@ -277,7 +298,7 @@ mod tests {
         assert_eq!(collected.successful_ms.len(), 1); // two requests reused one TCP connection
         assert_ne!(collected.failed_ms.len(), 0);
         assert_eq!(collected.cancelled, 1);
-        let report = collected.report(Some(2.0));
+        let report = std::mem::take(&mut *collected).report(Some(2.0));
         assert_eq!(report["connections_per_second"], 0.5);
         assert!(
             report["failed_setup_duration_ms"]["p99_ms"]

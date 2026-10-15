@@ -134,6 +134,30 @@ impl Samples {
         }
     }
 }
+fn aggregate_samples(samples: &mut [Samples]) -> Samples {
+    let Some((base_index, _)) = samples
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, sample)| sample.latency_ms.len())
+    else {
+        return Samples::default();
+    };
+    let mut aggregate = Samples {
+        latency_ms: std::mem::take(&mut samples[base_index].latency_ms),
+        ..Samples::default()
+    };
+    for (index, sample) in samples.iter_mut().enumerate() {
+        aggregate.failed += sample.failed;
+        aggregate.checks_failed += sample.checks_failed;
+        aggregate.errors.merge(&sample.errors);
+        if index != base_index {
+            let mut latency = std::mem::take(&mut sample.latency_ms);
+            aggregate.latency_ms.append(&mut latency);
+        }
+    }
+    aggregate
+}
+
 #[must_use]
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
@@ -921,12 +945,56 @@ async fn drain_users(context: &mut RunContext, users: &mut LiveUsers) {
     }
 }
 
+fn summary_path(context: &RunContext) -> std::path::PathBuf {
+    env::var("SUMMARY")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            context
+                .cfg
+                .output
+                .as_ref()
+                .map(|dir| dir.join("summary.json"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("results/summary.json"))
+}
+
+fn write_sample_artifacts(
+    samples: &[Samples; 4],
+    connections: &connections::Connections,
+    samples_path: &Path,
+    connections_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = BufWriter::new(fs::File::create(samples_path)?);
+    serde_json::to_writer(&mut file, samples)?;
+    file.flush()?;
+    let mut file = BufWriter::new(fs::File::create(connections_path)?);
+    serde_json::to_writer(&mut file, connections)?;
+    file.flush()?;
+    Ok(())
+}
+
 fn write_report(
     context: &RunContext,
     result: RunResult,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let path = summary_path(context);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(destination) = env::var("BENCH_SAMPLES") {
+        let cp = summary_path(context)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("connection-samples.json");
+        write_sample_artifacts(
+            &context.metrics.lock().unwrap(),
+            &context.connections.lock().unwrap(),
+            Path::new(&destination),
+            &cp,
+        )?;
+    }
     let mut collected = context.metrics.lock().unwrap();
-    let mut aggregate = Samples::default();
     let mut endpoints = serde_json::Map::new();
     let elapsed = Some(result.duration_s);
     for ((endpoint, name), samples) in Endpoint::ALL
@@ -935,21 +1003,18 @@ fn write_report(
         .zip(collected.iter_mut())
     {
         debug_assert_eq!(endpoint.name(), name);
-        aggregate.latency_ms.extend_from_slice(&samples.latency_ms);
-        aggregate.failed += samples.failed;
-        aggregate.checks_failed += samples.checks_failed;
-        aggregate.errors.merge(&samples.errors);
-        let mut summary = serde_json::to_value(samples.summary())?;
-        if let (Some(summary), serde_json::Value::Object(rates)) = (
-            summary.as_object_mut(),
-            connections::request_rates(samples, elapsed),
-        ) {
+        let endpoint_summary = samples.summary();
+        let rates = connections::request_rates(samples, elapsed);
+        let mut summary = serde_json::to_value(endpoint_summary)?;
+        if let (Some(summary), serde_json::Value::Object(rates)) = (summary.as_object_mut(), rates)
+        {
             summary.extend(rates);
         }
         endpoints.insert(name.into(), summary);
     }
+    let aggregate = aggregate_samples(&mut collected[..]);
     let (report, passed) = build_report(context, result, elapsed, aggregate, &endpoints);
-    save_report(context, &report, &collected, passed)
+    save_report(context, &report, passed)
 }
 
 fn build_report(
@@ -963,7 +1028,8 @@ fn build_report(
     let runtime_count = context.runtime_errors.load(Ordering::Relaxed);
     let completed = !result.interrupted;
     let passed = completed && passes(&summary, runtime_count);
-    let connection_report = context.connections.lock().unwrap().report(elapsed);
+    let connection_report =
+        std::mem::take(&mut *context.connections.lock().unwrap()).report(elapsed);
     let report = serde_json::json!({
         "generator": "reqwest",
         "requested_users": context.cfg.users,
@@ -981,8 +1047,8 @@ fn build_report(
         "hold_finished_at": result.hold_finished_at,
         "planned_hold_s": context.workload.hold.as_secs_f64(),
         "hosts": &*context.assigned.lock().unwrap(),
-        "configured_hosts": context.workload.targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
-        "destination_ports": context.workload.targets.iter().filter_map(reqwest::Url::port_or_known_default).collect::<Vec<_>>(),
+        "configured_hosts": context.workload.targets.iter().map(|url| url.as_str()).collect::<Vec<_>>(),
+        "destination_ports": context.workload.targets.iter().filter_map(|url| url.port_or_known_default()).collect::<Vec<_>>(),
         "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
         "source_ips": context.workload.source_ips.as_ref(),
         "latency": "client wall time through complete response body, including connection setup",
@@ -1009,38 +1075,15 @@ fn build_report(
 fn save_report(
     context: &RunContext,
     report: &serde_json::Value,
-    collected: &[Samples; 4],
     passed: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let output = serde_json::to_string_pretty(report)?;
     println!("\nScoring summary (full-body latency):\n{output}");
-    let path = env::var("SUMMARY")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            context
-                .cfg
-                .output
-                .as_ref()
-                .map(|dir| dir.join("summary.json"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("results/summary.json"));
+    let path = summary_path(context);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     fs::write(&path, format!("{output}\n"))?;
-    if let Ok(destination) = env::var("BENCH_SAMPLES") {
-        let mut file = BufWriter::new(fs::File::create(destination)?);
-        serde_json::to_writer(&mut file, collected)?;
-        file.flush()?;
-        let cp = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("connection-samples.json");
-        let mut file = BufWriter::new(fs::File::create(cp)?);
-        serde_json::to_writer(&mut file, &*context.connections.lock().unwrap())?;
-        file.flush()?;
-    }
     println!(
         "{} — summary: {}",
         if passed { "PASS" } else { "FAIL" },
@@ -1518,5 +1561,52 @@ mod tests {
             "ramp elapsed only {elapsed:?}"
         );
         assert!(elapsed < Duration::from_secs(1), "ramp took {elapsed:?}");
+    }
+
+    #[test]
+    fn aggregate_reuses_largest_endpoint_buffer_after_raw_samples_are_serialized() {
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[2].latency_ms = vec![9.0, 1.0, 5.0];
+        let raw = serde_json::to_value(&samples).unwrap();
+        let original_buffer = samples[2].latency_ms.as_ptr();
+
+        let mut aggregate = aggregate_samples(&mut samples);
+        let summary = aggregate.summary();
+
+        assert_eq!(raw[2]["latency_ms"], serde_json::json!([9.0, 1.0, 5.0]));
+        assert_eq!(aggregate.latency_ms.as_ptr(), original_buffer);
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.med_ms, Some(5.0));
+        assert!(samples.iter().all(|sample| sample.latency_ms.is_empty()));
+    }
+
+    #[test]
+    fn raw_sample_artifacts_survive_aggregation_and_connection_reporting() {
+        let directory = env::temp_dir().join(format!("benchmark-samples-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let samples_path = directory.join("samples.json");
+        let connections_path = directory.join("connection-samples.json");
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[0].latency_ms = vec![3.0, 1.0];
+        let connections = connections::Connections {
+            successful_ms: vec![2.0],
+            failed_ms: vec![4.0],
+            ..Default::default()
+        };
+
+        write_sample_artifacts(&samples, &connections, &samples_path, &connections_path).unwrap();
+        let mut aggregate = aggregate_samples(&mut samples);
+        let _ = aggregate.summary();
+        let report = connections.report(Some(1.0));
+
+        let raw: [Samples; 4] =
+            serde_json::from_reader(fs::File::open(&samples_path).unwrap()).unwrap();
+        let raw_connections: connections::Connections =
+            serde_json::from_reader(fs::File::open(&connections_path).unwrap()).unwrap();
+        assert_eq!(raw[0].latency_ms, [3.0, 1.0]);
+        assert_eq!(raw_connections.successful_ms, [2.0]);
+        assert_eq!(raw_connections.failed_ms, [4.0]);
+        assert_eq!(report["setup_duration_ms"]["samples"], 2);
+        fs::remove_dir_all(directory).unwrap();
     }
 }
