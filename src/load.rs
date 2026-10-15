@@ -572,7 +572,9 @@ async fn drain_users(context: &mut RunContext, users: &mut LiveUsers) {
                 None
             },
         };
-        handle_user_result(context, users, result);
+        if handle_user_result(context, users, result) && abort_at.is_none() {
+            abort_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        }
     }
 }
 
