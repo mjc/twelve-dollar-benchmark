@@ -440,7 +440,7 @@ class CoordinatorTests(unittest.TestCase):
         first_table = next(line for line in run.stdout.splitlines() if line.startswith("|"))
         self.assertIn("Requested VUs", first_table)
         self.assertIn("HTTP errors %", first_table)
-        for heading in ["Requests/s", "Connection attempts/s", "Setup outcome", "RX packets/s", "Peak established sockets"]:
+        for heading in ["Requests/s", "Connection attempts/s", "Setup outcome", "RX packets/s", "Peak open TCP connections"]:
             self.assertIn(heading, run.stdout)
         self.assertEqual(report["source_ips"], ["127.0.0.1", "127.0.0.2"])
         self.assertEqual(report, json.loads((self.root / "legacy.json").read_text()))
