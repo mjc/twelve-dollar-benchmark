@@ -96,8 +96,16 @@ source-address/destination tuple. Clients share this range, with
 source address, five destination ports provide a theoretical capacity of
 322,560 sockets before port collisions and `TIME_WAIT`; this is an upper bound,
 not a load guarantee.
-The runner does not change system-wide ephemeral-port settings. Connection
-tracking, memory, and server capacity still limit the load.
+The runner does not change system-wide ephemeral-port settings. On Linux, `run.sh`
+checks for `/proc/sys/net/netfilter/nf_conntrack_max` and raises it to the
+launcher process's effective soft descriptor limit only when conntrack is
+available and the current value is lower. This runtime sysctl change requires
+root, `doas`, or `sudo`; it is not persistent across reboot. If conntrack is
+unavailable or already has a higher limit, the runner leaves it unchanged.
+This applies on the launcher host only. SSH generator hosts run the binary
+directly, and server hosts are not changed by the launcher; both need their own
+conntrack capacity. Connection tracking, memory, and server capacity still
+limit the load.
 
 With `--user`, the source IPs select SSH generator hosts. The runner copies the
 release binary and tokens to every host and checks that the binary runs there.

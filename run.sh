@@ -91,6 +91,47 @@ if [[ $soft_nofile != unlimited ]] && (( soft_nofile < descriptor_floor )); then
   fi
 fi
 
+# Host tuning is unnecessary for help/version requests and must never lower a
+# larger conntrack table setting.
+skip_conntrack_tuning=0
+for arg in "$@"; do
+  if [[ $arg == --help || $arg == -h || $arg == --version || $arg == -V ]]; then
+    skip_conntrack_tuning=1
+    break
+  fi
+done
+
+conntrack_max=/proc/sys/net/netfilter/nf_conntrack_max
+if (( ! skip_conntrack_tuning )) && [[ -r $conntrack_max ]]; then
+  effective_nofile=$(ulimit -Sn)
+  if [[ $effective_nofile == unlimited ]]; then
+    effective_nofile=$(< /proc/sys/fs/nr_open)
+  fi
+  current_conntrack_max=$(< "$conntrack_max")
+  if (( current_conntrack_max < effective_nofile )); then
+    if ! command -v sysctl >/dev/null; then
+      echo "Conntrack is enabled but sysctl is unavailable; raise nf_conntrack_max to $effective_nofile as root" >&2
+      exit 1
+    fi
+    privilege=()
+    if (( EUID != 0 )); then
+      if command -v doas >/dev/null; then
+        privilege=(doas)
+      elif command -v sudo >/dev/null; then
+        privilege=(sudo)
+      else
+        echo "Conntrack is enabled but nf_conntrack_max is $current_conntrack_max; raise it to $effective_nofile as root" >&2
+        exit 1
+      fi
+    fi
+    if ! "${privilege[@]}" sysctl -w "net.netfilter.nf_conntrack_max=$effective_nofile" >/dev/null; then
+      echo "Conntrack is enabled but nf_conntrack_max could not be raised from $current_conntrack_max to $effective_nofile" >&2
+      exit 1
+    fi
+    echo "Raised nf_conntrack_max from $current_conntrack_max to $effective_nofile" >&2
+  fi
+fi
+
 rust_version=1.99.0
 cargo_command=(cargo)
 rustc_command=(rustc)
