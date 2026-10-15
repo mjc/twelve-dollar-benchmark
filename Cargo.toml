@@ -33,5 +33,5 @@ url = "2.5"
 flate2 = "1"
 
 [patch.crates-io]
-hyper = { path = "vendor/hyper" }
-hyper-util = { path = "vendor/hyper-util" }
+hyper = { git = "https://github.com/mjc/hyper.git", rev = "903ce8f3c54704c148c0967e4374c69707906dc8" }
+hyper-util = { git = "https://github.com/mjc/hyper-util.git", rev = "df185d6b535ca66198ebf8175e14b1ea4db75277" }

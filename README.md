@@ -237,15 +237,8 @@ connection setup. Connection setup durations are reported separately.
 
 `duration_s` includes shutdown time.
 
-On Linux/Android, a local connector patch uses `IP_BIND_ADDRESS_NO_PORT` so
-explicit source binding does not reserve a port before the destination is known.
-This lets the same source port serve distinct destination tuples. Provenance and
-the retained upstream license are in [the connector patch notes](vendor/hyper-util/LOCAL_PATCH.md).
-
-The [Hyper patch](vendor/hyper/LOCAL-PATCHES.md) starts adaptive HTTP/1 reads at
-1 KiB, allocates write headers on demand and reserves one slot for the first
-queued body. Read buffers still grow for larger responses; HTTP/1 limits remain
-unchanged.
+Pinned Hyper forks retain the benchmark's HTTP/1 and connector optimizations.
+See [patch provenance and upstream revisions](patches/README.md).
 
 ## Code layout
 

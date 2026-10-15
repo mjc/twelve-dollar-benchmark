@@ -253,6 +253,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hyper"
 version = "1.12.0"
+source = "git+https://github.com/mjc/hyper.git?rev=903ce8f3c54704c148c0967e4374c69707906dc8#903ce8f3c54704c148c0967e4374c69707906dc8"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -270,6 +271,7 @@ dependencies = [
 [[package]]
 name = "hyper-util"
 version = "0.1.21"
+source = "git+https://github.com/mjc/hyper-util.git?rev=df185d6b535ca66198ebf8175e14b1ea4db75277#df185d6b535ca66198ebf8175e14b1ea4db75277"
 dependencies = [
  "bytes",
  "futures-channel",
