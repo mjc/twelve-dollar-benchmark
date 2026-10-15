@@ -193,7 +193,10 @@ limits. The launcher and each generator raise their soft descriptor limit to at
 least 524,288, or as high as the inherited hard limit allows. A generator fails
 before load if its limit cannot cover its users and process overhead. Source
 addresses must already be assigned to that generator. CPU uses one core as
-100%. FD, memory, and socket peaks are sampled, so shorter spikes may be missed.
+100%. The rendered network table uses decimal MB/s and packets/s (pps); JSON
+retains raw bit-per-second counters. Open TCP connections and file descriptors
+are reported separately. FD, memory, and socket peaks are sampled, so shorter
+spikes may be missed.
 
 Interface counters include other traffic on the host. Offloads can change packet
 counts, and virtual interfaces can count the same traffic at several points.

@@ -199,7 +199,7 @@ fn render_connections(text: &mut String, report: &Value) {
 }
 
 fn render_network(text: &mut String, report: &Value, compact: bool) {
-    text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |\n|---|---|---:|---:|---:|---:|\n");
+    text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX MB/s | TX MB/s | RX packets/s (pps) | TX packets/s (pps) |\n|---|---|---:|---:|---:|---:|\n");
     if let Some(hosts) = report["network_hosts"]["hosts"].as_object() {
         for host in hosts.values() {
             let observers = host["observed_by"]
@@ -217,16 +217,18 @@ fn render_network(text: &mut String, report: &Value, compact: bool) {
                     {
                         continue;
                     }
-                    let mbps = |key| {
+                    let megabytes_per_second = |key| {
                         network[key]
                             .as_f64()
-                            .map_or(Value::Null, |n| json!(n / 1_000_000.0))
+                            .map_or(Value::Null, |bits_per_second| {
+                                json!(bits_per_second / 8_000_000.0)
+                            })
                     };
                     let _ = writeln!(
                         text,
                         "| {observers} | {name} | {} | {} | {} | {} |",
-                        number(&mbps("receive_bits_per_second")),
-                        number(&mbps("transmit_bits_per_second")),
+                        number(&megabytes_per_second("receive_bits_per_second")),
+                        number(&megabytes_per_second("transmit_bits_per_second")),
                         number(&network["receive_packets_per_second"]),
                         number(&network["transmit_packets_per_second"])
                     );
@@ -234,7 +236,7 @@ fn render_network(text: &mut String, report: &Value, compact: bool) {
             }
         }
     }
-    text.push_str("\nCPU includes all process threads; 100% is one core. Memory, descriptors and established sockets are sampled peaks.\n\n| Observer | Role / PID | CPU % | Peak RSS MiB | Peak FDs | FD soft / hard limit | Peak established sockets |\n|---|---|---:|---:|---:|---|---:|\n");
+    text.push_str("\nCPU includes all process threads; 100% is one core. Memory, descriptors and open TCP connections are sampled peaks.\n\n| Observer | Role / PID | CPU % | Peak RSS MiB | Peak FDs | FD soft / hard limit | Peak open TCP connections |\n|---|---|---:|---:|---:|---|---:|\n");
 }
 
 fn observations(report: &Value) -> impl Iterator<Item = (&str, &Value)> {
@@ -563,8 +565,7 @@ mod tests {
     #[test]
     fn report_renders_the_network_header_once_with_left_aligned_observers() {
         let rendered = render_report(&json!({}), false);
-        let header =
-            "| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |";
+        let header = "| Observer(s) | Interface | RX MB/s | TX MB/s | RX packets/s (pps) | TX packets/s (pps) |";
         assert_eq!(rendered.matches(header).count(), 1);
         assert!(rendered.contains("|---|---|---:|---:|---:|---:|"));
     }
