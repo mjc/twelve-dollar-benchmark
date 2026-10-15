@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{self, Duration};
 
 use crate::goose::{GooseUser, GooseUserCommand, Scenario, TransactionFunction};
@@ -8,8 +9,35 @@ use crate::metrics::{GooseMetric, ScenarioMetric, TransactionMetric};
 pub(crate) async fn user_main(
     thread_number: usize,
     thread_scenario: Scenario,
-    mut thread_user: GooseUser,
+    thread_user: GooseUser,
     thread_receiver: flume::Receiver<GooseUserCommand>,
+) {
+    let stopping = AtomicBool::new(false);
+    let user = run_user(thread_number, thread_scenario, thread_user, &stopping);
+    tokio::pin!(user);
+    let exit = async {
+        while let Ok(command) = thread_receiver.recv_async().await {
+            if matches!(command, GooseUserCommand::Exit) {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = &mut user => {},
+        () = exit => {
+            stopping.store(true, Ordering::Relaxed);
+            // Match ramping-vus gracefulRampDown: finish this iteration for at
+            // most ten seconds; dropping the future cancels outstanding I/O.
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut user).await;
+        },
+    }
+}
+
+async fn run_user(
+    thread_number: usize,
+    thread_scenario: Scenario,
+    mut thread_user: GooseUser,
+    stopping: &AtomicBool,
 ) {
     info!(
         "[user {thread_number}]: launching user from {}",
@@ -65,7 +93,7 @@ pub(crate) async fn user_main(
                 )
                 .await;
 
-                if received_exit(&thread_receiver) {
+                if stopping.load(Ordering::Relaxed) {
                     break 'launch_transactions;
                 }
 
@@ -81,7 +109,7 @@ pub(crate) async fn user_main(
 
                     while wait_time > 0 {
                         // Exit immediately if message received from parent.
-                        if received_exit(&thread_receiver) {
+                        if stopping.load(Ordering::Relaxed) {
                             break 'launch_transactions;
                         }
 
@@ -172,25 +200,6 @@ pub(crate) async fn user_main(
         "[user {thread_number}]: exiting from {}",
         thread_scenario.name
     );
-}
-
-// Determine if the parent has sent a GooseUserCommand::Exit message.
-fn received_exit(thread_receiver: &flume::Receiver<GooseUserCommand>) -> bool {
-    let mut message = thread_receiver.try_recv();
-    while message.is_ok() {
-        match message.unwrap() {
-            // GooseUserCommand::Exit received.
-            GooseUserCommand::Exit => {
-                return true;
-            }
-            command => {
-                debug!("ignoring unexpected GooseUserCommand: {command:?}");
-            }
-        }
-        message = thread_receiver.try_recv();
-    }
-    // GooseUserCommand::Exit not received.
-    false
 }
 
 // Send scenario metric to parent and logger when enabled.
