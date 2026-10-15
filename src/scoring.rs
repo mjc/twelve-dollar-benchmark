@@ -10,6 +10,8 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -115,7 +117,7 @@ fn trial_args(args: &[String], users: usize, stage: Stage, output: &Path) -> Vec
         .unwrap_or(args.len());
     let mut result: Vec<_> = args[..split]
         .iter()
-        .filter(|arg| *arg != "--score")
+        .filter(|arg| *arg != "--score" && *arg != "--skip-warmup")
         .cloned()
         .collect();
     result.extend([
@@ -165,6 +167,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         current: None,
         protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users, "maximum_search_users": cfg.max_users,
             "search_step_users": cfg.step_users,
+            "cooldown_s": 60, "warmup_skipped": cfg.skip_warmup,
             "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
             "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
         trials: Vec::new(),
@@ -177,6 +180,22 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     let score = find_score(cfg.start_users, cfg.max_users, step, |stage, users| {
         if cancelled.load(Ordering::Relaxed) {
             return Err("scoring interrupted".into());
+        }
+        if stage == Stage::Warmup && cfg.skip_warmup {
+            println!("Reusing the warm-up already completed in this session.");
+            return Ok(true);
+        }
+        if stage != Stage::Warmup {
+            state.current = None;
+            save_state(&root, &state)?;
+            println!("Cooling down for 60 seconds at zero load before the next trial.");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("scoring interrupted during cooldown".into());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
         let index = state.trials.len() + 1;
         let directory = root
