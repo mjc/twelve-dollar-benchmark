@@ -118,7 +118,7 @@ pub(super) fn sanitize_message_urls(message: &str) -> String {
     sanitized
 }
 
-pub struct ExampleContext<'a> {
+pub struct ErrorLocation<'a> {
     pub endpoint: &'a str,
     pub path: &'a str,
     pub user_index: usize,
@@ -127,14 +127,14 @@ pub struct ExampleContext<'a> {
 }
 
 pub fn example(
-    context: ExampleContext<'_>,
+    location: ErrorLocation<'_>,
     status_code: Option<u16>,
     kind: &str,
     reason: impl Into<String>,
     body: Option<&[u8]>,
 ) -> ErrorExample {
-    let (destination, _) = sanitize_url(context.destination);
-    let (path, _) = sanitize_path(context.path);
+    let (destination, _) = sanitize_url(location.destination);
+    let (path, _) = sanitize_path(location.path);
     let (body_excerpt, body_truncated) = body.map_or((None, false), |bytes| {
         let clipped = bytes.len() > MAX_BODY_BYTES;
         let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BODY_BYTES)]);
@@ -143,7 +143,7 @@ pub fn example(
     });
     ErrorExample {
         timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        endpoint: context.endpoint.to_owned(),
+        endpoint: location.endpoint.to_owned(),
         path,
         status_code,
         kind: kind.to_owned(),
@@ -151,9 +151,9 @@ pub fn example(
         body_excerpt,
         body_truncated,
         latency_ms: None,
-        user_index: context.user_index,
+        user_index: location.user_index,
         destination,
-        source_ip: context.source_ip,
+        source_ip: location.source_ip,
         worker: None,
     }
 }
@@ -216,7 +216,7 @@ mod tests {
 
     fn sample(kind: &str, status: Option<u16>) -> ErrorExample {
         example(
-            ExampleContext {
+            ErrorLocation {
                 endpoint: "GET /feed",
                 path: "/a?token=x",
                 user_index: 4,

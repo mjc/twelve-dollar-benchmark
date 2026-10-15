@@ -1,4 +1,5 @@
 use chrono::{SecondsFormat, Utc};
+use num_traits::ToPrimitive;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -111,16 +112,20 @@ struct Summary {
     errors: errors::ErrorDetails,
 }
 impl Samples {
-    #[allow(clippy::cast_precision_loss)] // Report statistics are inherently floating point.
     fn summary(&mut self) -> Summary {
         self.latency_ms.sort_unstable_by(f64::total_cmp);
         let n = self.latency_ms.len();
+        let count = n.to_f64();
         Summary {
             requests: n,
             failed: self.failed,
-            failure_rate: (n > 0).then(|| self.failed as f64 / n as f64),
+            failure_rate: count
+                .filter(|_| n > 0)
+                .and_then(|count| self.failed.to_f64().map(|failed| failed / count)),
             checks_failed: self.checks_failed,
-            avg_ms: (n > 0).then(|| self.latency_ms.iter().sum::<f64>() / n as f64),
+            avg_ms: count
+                .filter(|_| n > 0)
+                .map(|count| self.latency_ms.iter().sum::<f64>() / count),
             med_ms: percentile(&self.latency_ms, 0.5),
             p95_ms: percentile(&self.latency_ms, 0.95),
             p99_ms: percentile(&self.latency_ms, 0.99),
@@ -130,18 +135,13 @@ impl Samples {
     }
 }
 #[must_use]
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)] // p is bounded to [0, 1]; checked slice access validates rounded ranks.
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
         return None;
     }
-    let rank = p * (sorted.len() - 1) as f64;
-    let low = *sorted.get(rank.floor() as usize)?;
-    let high = *sorted.get(rank.ceil() as usize)?;
+    let rank = p * (sorted.len() - 1).to_f64()?;
+    let low = *sorted.get(rank.floor().to_usize()?)?;
+    let high = *sorted.get(rank.ceil().to_usize()?)?;
     Some(low + (high - low) * rank.fract())
 }
 #[must_use]
@@ -242,19 +242,20 @@ fn runtime_error(
 ) {
     count.fetch_add(1, Ordering::Relaxed);
     details.lock().unwrap().record(errors::example(
-        "runtime",
-        "",
+        errors::ErrorLocation {
+            endpoint: "runtime",
+            path: "",
+            user_index,
+            destination: url,
+            source_ip: source.map(|v| v.to_string()),
+        },
         None,
         "runtime",
         errors::error_chain(error),
         None,
-        user_index,
-        url,
-        source.map(|v| v.to_string()),
     ));
 }
 
-#[allow(clippy::too_many_lines)] // Keep full-body timing and sample accounting in one request path.
 async fn request(
     user: &User,
     endpoint: Endpoint,
@@ -276,15 +277,17 @@ async fn request(
             sample_mut(&mut user.metrics.lock().unwrap(), endpoint)
                 .errors
                 .record(errors::example(
-                    endpoint.name(),
-                    path,
+                    errors::ErrorLocation {
+                        endpoint: endpoint.name(),
+                        path,
+                        user_index: user.index,
+                        destination: user.base.as_str(),
+                        source_ip: user.source.map(|v| v.to_string()),
+                    },
                     None,
                     "request_builder",
                     errors::error_chain(&error),
                     None,
-                    user.index,
-                    user.base.as_str(),
-                    user.source.map(|v| v.to_string()),
                 ));
             return None;
         }
@@ -336,6 +339,27 @@ async fn request(
         ),
     };
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    record_response(
+        user,
+        endpoint,
+        path,
+        status,
+        bytes.as_deref(),
+        failure,
+        latency_ms,
+    );
+    bytes.filter(|_| endpoint.successful_status(status))
+}
+
+fn record_response(
+    user: &User,
+    endpoint: Endpoint,
+    path: &str,
+    status: u16,
+    bytes: Option<&[u8]>,
+    failure: Option<(&str, String)>,
+    latency_ms: f64,
+) {
     let success = http_success(status) && bytes.is_some();
     let mut metrics = user.metrics.lock().unwrap();
     let samples = sample_mut(&mut metrics, endpoint);
@@ -345,7 +369,7 @@ async fn request(
     let example = if let Some((kind, reason)) = failure {
         Some((kind, reason, None))
     } else if !http_success(status) {
-        Some(("http", format!("HTTP status {status}"), bytes.as_deref()))
+        Some(("http", format!("HTTP status {status}"), bytes))
     } else if !endpoint.successful_status(status) {
         Some(("check", format!("unexpected HTTP status {status}"), None))
     } else {
@@ -354,20 +378,21 @@ async fn request(
     if let Some((kind, reason, body)) = example {
         samples.errors.record(
             errors::example(
-                endpoint.name(),
-                path,
+                errors::ErrorLocation {
+                    endpoint: endpoint.name(),
+                    path,
+                    user_index: user.index,
+                    destination: user.base.as_str(),
+                    source_ip: user.source.map(|v| v.to_string()),
+                },
                 (status != 0).then_some(status),
                 kind,
                 reason,
                 body,
-                user.index,
-                user.base.as_str(),
-                user.source.map(|v| v.to_string()),
             )
             .with_latency(latency_ms),
         );
     }
-    bytes.filter(|_| endpoint.successful_status(status))
 }
 
 fn choose_post_id(feed: &Feed) -> Option<u64> {
@@ -406,15 +431,17 @@ async fn browse(user: &User, tokens: &[Token], iteration: usize) {
             let samples = sample_mut(&mut metrics, Endpoint::Feed);
             samples.checks_failed += 1;
             samples.errors.record(errors::example(
-                Endpoint::Feed.name(),
-                "/feed",
+                errors::ErrorLocation {
+                    endpoint: Endpoint::Feed.name(),
+                    path: "/feed",
+                    user_index: user.index,
+                    destination: user.base.as_str(),
+                    source_ip: user.source.map(|v| v.to_string()),
+                },
                 Some(200),
                 "check",
                 "feed body was empty or malformed",
                 None,
-                user.index,
-                user.base.as_str(),
-                user.source.map(|v| v.to_string()),
             ));
         }
         think(3.0, 7.0).await;
@@ -456,12 +483,14 @@ fn global_user_index(offset: usize, local: usize) -> Option<usize> {
 }
 
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // Duration scaling needs a floating point user fraction.
 fn ramp_offset(user: usize, users: usize, ramp: Duration) -> Duration {
     if users <= 1 {
         Duration::ZERO
     } else {
-        ramp.mul_f64(user as f64 / (users - 1) as f64)
+        let user = user.to_f64().expect("usize is representable as f64");
+        let users = (users - 1).to_f64().expect("usize is representable as f64");
+        let fraction = user / users;
+        ramp.mul_f64(fraction)
     }
 }
 
@@ -535,13 +564,52 @@ fn build_client(
         .build()
 }
 
-#[allow(clippy::too_many_lines)] // Keep launch, cancellation, ramp-down, and drain ordering explicit.
-async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
-    let cfg = config::parse(args)?;
-    if cfg.help {
-        println!("{}", config::HELP);
-        return Ok(true);
-    }
+struct Workload {
+    ramp: Duration,
+    hold: Duration,
+    source_ips: Arc<Vec<IpAddr>>,
+    targets: Arc<Vec<reqwest::Url>>,
+    tokens: Arc<Vec<Token>>,
+    user_offset: usize,
+}
+
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+struct RunContext {
+    cfg: config::Config,
+    workload: Workload,
+    metrics: Metrics,
+    connections: Arc<Mutex<connections::Connections>>,
+    assigned: Arc<Mutex<BTreeSet<String>>>,
+    runtime_errors: Arc<AtomicUsize>,
+    runtime_details: Arc<Mutex<errors::ErrorDetails>>,
+    signals: Signals,
+    interrupted: bool,
+    sampler: Option<telemetry::Sampler>,
+}
+
+struct LiveUsers {
+    tasks: JoinSet<()>,
+    stops: Vec<tokio::sync::watch::Sender<bool>>,
+    maximum: usize,
+    interrupted: bool,
+}
+
+struct RunResult {
+    started_at: chrono::DateTime<Utc>,
+    finished_at: chrono::DateTime<Utc>,
+    duration_s: f64,
+    hold_started_at: Option<chrono::DateTime<Utc>>,
+    hold_finished_at: Option<chrono::DateTime<Utc>>,
+    maximum_users: usize,
+    interrupted: bool,
+    telemetry: Result<serde_json::Value, String>,
+}
+
+fn prepare_workload(cfg: &config::Config) -> Result<Workload, Box<dyn std::error::Error>> {
     if cfg.users == 0 {
         return Err("users must be positive".into());
     }
@@ -567,106 +635,200 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     if global_user_index(user_offset, cfg.users).is_none() {
         return Err("BENCH_USER_OFFSET plus user count exceeds the supported index range".into());
     }
-    let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
-    let connections = Arc::new(Mutex::new(connections::Connections::default()));
-    let assigned = Arc::new(Mutex::new(BTreeSet::new()));
-    let runtime_errors = Arc::new(AtomicUsize::new(0));
-    let runtime_details = Arc::new(Mutex::new(errors::ErrorDetails::default()));
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupted = false;
-    let env_start = env::var("BENCH_START_AT")
-        .ok()
-        .map(|s| s.parse::<i64>())
-        .transpose()?;
-    if let Some(start) = env_start
-        && let Some(delay) = scheduled_start_delay(start, Utc::now().timestamp_millis())?
-    {
-        interrupted = tokio::select! {
-            () = tokio::time::sleep(delay) => false,
-            _ = interrupt.recv() => true,
-            _ = terminate.recv() => true,
+    Ok(Workload {
+        ramp,
+        hold,
+        source_ips,
+        targets,
+        tokens,
+        user_offset,
+    })
+}
+
+impl RunContext {
+    async fn prepare(
+        cfg: config::Config,
+        workload: Workload,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+        let connections = Arc::new(Mutex::new(connections::Connections::default()));
+        let assigned = Arc::new(Mutex::new(BTreeSet::new()));
+        let runtime_errors = Arc::new(AtomicUsize::new(0));
+        let runtime_details = Arc::new(Mutex::new(errors::ErrorDetails::default()));
+        let signals = Signals {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
         };
+        let mut context = Self {
+            cfg,
+            workload,
+            metrics,
+            connections,
+            assigned,
+            runtime_errors,
+            runtime_details,
+            signals,
+            interrupted: false,
+            sampler: None,
+        };
+        context.wait_for_scheduled_start().await?;
+        context.start_sampler()?;
+        Ok(context)
     }
-    let telemetry_path = env::var("BENCH_TELEMETRY").unwrap_or_else(|_| "telemetry.jsonl".into());
-    let sample_interval = cfg.sample_interval;
-    let telemetry_metrics = metrics.clone();
-    let telemetry_connections = connections.clone();
-    let sampler = telemetry::Sampler::start(
-        telemetry_path.into(),
-        std::collections::BTreeMap::from([("generator".to_owned(), vec![std::process::id()])]),
-        sample_interval,
-        Arc::new(move || {
-            let m = telemetry_metrics.lock().unwrap();
-            serde_json::json!({"requests":m.iter().map(|s|[s.latency_ms.len(),s.failed]).collect::<Vec<_>>(),"connections":telemetry_connections.lock().unwrap().counts()})
-        }),
-    )?;
+
+    async fn wait_for_scheduled_start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let env_start = env::var("BENCH_START_AT")
+            .ok()
+            .map(|s| s.parse::<i64>())
+            .transpose()?;
+        if let Some(start) = env_start
+            && let Some(delay) = scheduled_start_delay(start, Utc::now().timestamp_millis())?
+        {
+            self.interrupted = tokio::select! {
+                () = tokio::time::sleep(delay) => false,
+                _ = self.signals.interrupt.recv() => true,
+                _ = self.signals.terminate.recv() => true,
+            };
+        }
+        Ok(())
+    }
+
+    fn start_sampler(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = env::var("BENCH_TELEMETRY").unwrap_or_else(|_| "telemetry.jsonl".into());
+        let sample_interval = self.cfg.sample_interval;
+        let telemetry_metrics = self.metrics.clone();
+        let telemetry_connections = self.connections.clone();
+        self.sampler = Some(telemetry::Sampler::start(
+            path.into(),
+            std::collections::BTreeMap::from([("generator".to_owned(), vec![std::process::id()])]),
+            sample_interval,
+            Arc::new(move || {
+                let metrics = telemetry_metrics.lock().unwrap();
+                serde_json::json!({"requests":metrics.iter().map(|s|[s.latency_ms.len(),s.failed]).collect::<Vec<_>>(),"connections":telemetry_connections.lock().unwrap().counts()})
+            }),
+        )?);
+        Ok(())
+    }
+}
+
+async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
+    let cfg = config::parse(args)?;
+    if cfg.help {
+        println!("{}", config::HELP);
+        return Ok(true);
+    }
+    let workload = prepare_workload(&cfg)?;
+    let mut context = RunContext::prepare(cfg, workload).await?;
+    let result = execute_load(&mut context).await?;
+    write_report(&context, result)
+}
+
+async fn execute_load(context: &mut RunContext) -> Result<RunResult, Box<dyn std::error::Error>> {
     let started_at = Utc::now();
     let start = Instant::now();
-    let mut tasks = JoinSet::new();
-    let mut stops = Vec::with_capacity(cfg.users);
-    let mut max_users = 0usize;
-    for local in 0..cfg.users {
-        if interrupted {
+    let mut users = launch_users(context, start).await?;
+    let hold_started_at = (!users.interrupted).then(Utc::now);
+    let hold_finished_at = finish_users(context, &mut users).await?;
+    let telemetry = context
+        .sampler
+        .take()
+        .ok_or("telemetry sampler was already finished")?
+        .finish()
+        .map_err(|error| error.to_string());
+    Ok(RunResult {
+        started_at,
+        finished_at: Utc::now(),
+        duration_s: start.elapsed().as_secs_f64(),
+        hold_started_at,
+        hold_finished_at,
+        maximum_users: users.maximum,
+        interrupted: users.interrupted,
+        telemetry,
+    })
+}
+
+async fn launch_users(
+    context: &mut RunContext,
+    start: Instant,
+) -> Result<LiveUsers, Box<dyn std::error::Error>> {
+    let mut users = LiveUsers {
+        tasks: JoinSet::new(),
+        stops: Vec::with_capacity(context.cfg.users),
+        maximum: 0,
+        interrupted: context.interrupted,
+    };
+    for local in 0..context.cfg.users {
+        if users.interrupted {
             break;
         }
         let at = start
-            .checked_add(ramp_offset(local, cfg.users, ramp))
+            .checked_add(ramp_offset(local, context.cfg.users, context.workload.ramp))
             .ok_or("ramp-up deadline exceeds the system clock range")?;
         tokio::select! {
             () = wait_ramp_slot(at) => {},
-            _ = interrupt.recv() => { interrupted = true; break; },
-            _ = terminate.recv() => { interrupted = true; break; },
+            _ = context.signals.interrupt.recv() => { users.interrupted = true; break; },
+            _ = context.signals.terminate.recv() => { users.interrupted = true; break; },
         }
-        let Some(index) = global_user_index(user_offset, local) else {
-            interrupted = true;
+        let Some(index) = global_user_index(context.workload.user_offset, local) else {
+            users.interrupted = true;
             break;
         };
-        let target_index = destinations::index(index, source_ips.len(), targets.len());
-        let Some(base) = targets.get(target_index).cloned() else {
+        let target_index = destinations::index(
+            index,
+            context.workload.source_ips.len(),
+            context.workload.targets.len(),
+        );
+        let Some(base) = context.workload.targets.get(target_index).cloned() else {
             runtime_error(
-                &runtime_details,
-                &runtime_errors,
+                &context.runtime_details,
+                &context.runtime_errors,
                 &std::io::Error::other("destination assignment exceeded configured targets"),
                 index,
-                &cfg.base_url,
+                &context.cfg.base_url,
                 None,
             );
-            interrupted = true;
+            users.interrupted = true;
             break;
         };
-        let source = source_ips.get(index % source_ips.len().max(1)).copied();
-        let client = match build_client(source, connections.clone()) {
+        let source = context
+            .workload
+            .source_ips
+            .get(index % context.workload.source_ips.len().max(1))
+            .copied();
+        let client = match build_client(source, context.connections.clone()) {
             Ok(client) => client,
             Err(error) => {
                 runtime_error(
-                    &runtime_details,
-                    &runtime_errors,
+                    &context.runtime_details,
+                    &context.runtime_errors,
                     &error,
                     index,
                     base.as_str(),
                     source,
                 );
-                interrupted = true;
+                users.interrupted = true;
                 break;
             }
         };
-        assigned.lock().unwrap().insert(base.as_str().to_owned());
-        max_users += 1;
+        context
+            .assigned
+            .lock()
+            .unwrap()
+            .insert(base.as_str().to_owned());
+        users.maximum += 1;
         let (tx, rx) = tokio::sync::watch::channel(false);
-        stops.push(tx);
-        let metrics = metrics.clone();
-        let tokens = tokens.clone();
+        users.stops.push(tx);
+        let tokens = context.workload.tokens.clone();
         let user = User {
             client,
             base,
             index,
             source,
-            metrics,
-            runtime_errors: runtime_errors.clone(),
-            runtime_details: runtime_details.clone(),
+            metrics: context.metrics.clone(),
+            runtime_errors: context.runtime_errors.clone(),
+            runtime_details: context.runtime_details.clone(),
         };
-        tasks.spawn(async move {
+        users.tasks.spawn(async move {
             think(0.0, 5.0).await;
             let mut iteration = 0;
             while !*rx.borrow() {
@@ -675,71 +837,98 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
             }
         });
     }
-    let hold_started_at = (!interrupted).then(Utc::now);
-    let hold_deadline = Instant::now()
-        .checked_add(hold)
+    Ok(users)
+}
+
+async fn finish_users(
+    context: &mut RunContext,
+    users: &mut LiveUsers,
+) -> Result<Option<chrono::DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(context.workload.hold)
         .ok_or("hold deadline exceeds the system clock range")?;
     let mut hold_finished_at = None;
-    if !interrupted {
-        interrupted = tokio::select! {
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(hold_deadline)) => {
+    if !users.interrupted {
+        users.interrupted = tokio::select! {
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 hold_finished_at = Some(Utc::now()); false
             },
-            _ = interrupt.recv() => true,
-            _ = terminate.recv() => true,
+            _ = context.signals.interrupt.recv() => true,
+            _ = context.signals.terminate.recv() => true,
         };
     }
-    if interrupted {
-        for tx in &stops {
-            let _ = tx.send(true);
-        }
+    if users.interrupted {
+        stop_all(&users.stops);
     } else {
-        for (n, tx) in stops.iter().enumerate() {
-            let deadline = hold_deadline
-                .checked_add(ramp_offset(n + 1, stops.len() + 1, Duration::from_secs(30)))
-                .ok_or("ramp-down deadline exceeds the system clock range")?;
-            interrupted = tokio::select! {
-                () = wait_ramp_slot(deadline) => false,
-                _ = interrupt.recv() => true,
-                _ = terminate.recv() => true,
-            };
-            if interrupted {
-                for stop in &stops {
-                    let _ = stop.send(true);
-                }
-                break;
-            }
-            let _ = tx.send(true);
-        }
+        ramp_down_users(context, deadline, users).await?;
     }
-    while !tasks.is_empty() {
+    drain_users(context, users).await;
+    Ok(hold_finished_at)
+}
+
+async fn ramp_down_users(
+    context: &mut RunContext,
+    hold_deadline: Instant,
+    users: &mut LiveUsers,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (n, tx) in users.stops.iter().enumerate() {
+        let deadline = hold_deadline
+            .checked_add(ramp_offset(
+                n + 1,
+                users.stops.len() + 1,
+                Duration::from_secs(30),
+            ))
+            .ok_or("ramp-down deadline exceeds the system clock range")?;
+        users.interrupted = tokio::select! {
+            () = wait_ramp_slot(deadline) => false,
+            _ = context.signals.interrupt.recv() => true,
+            _ = context.signals.terminate.recv() => true,
+        };
+        if users.interrupted {
+            stop_all(&users.stops);
+            break;
+        }
+        let _ = tx.send(true);
+    }
+    Ok(())
+}
+
+fn stop_all(stops: &[tokio::sync::watch::Sender<bool>]) {
+    for stop in stops {
+        let _ = stop.send(true);
+    }
+}
+
+async fn drain_users(context: &mut RunContext, users: &mut LiveUsers) {
+    while !users.tasks.is_empty() {
         let result = tokio::select! {
-            result = tasks.join_next() => result,
-            _ = interrupt.recv(), if !interrupted => { interrupted = true; for stop in &stops { let _ = stop.send(true); } None },
-            _ = terminate.recv(), if !interrupted => { interrupted = true; for stop in &stops { let _ = stop.send(true); } None },
+            result = users.tasks.join_next() => result,
+            _ = context.signals.interrupt.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
+            _ = context.signals.terminate.recv(), if !users.interrupted => { users.interrupted = true; stop_all(&users.stops); None },
         };
         if let Some(Err(error)) = result {
-            interrupted = true;
-            for stop in &stops {
-                let _ = stop.send(true);
-            }
+            users.interrupted = true;
+            stop_all(&users.stops);
             runtime_error(
-                &runtime_details,
-                &runtime_errors,
+                &context.runtime_details,
+                &context.runtime_errors,
                 &error,
-                user_offset,
-                &cfg.base_url,
+                context.workload.user_offset,
+                &context.cfg.base_url,
                 None,
             );
         }
     }
-    let telemetry_report = sampler.finish().map_err(|e| e.to_string());
-    let finished_at = Utc::now();
-    let run_duration_s = start.elapsed().as_secs_f64();
-    let mut collected = metrics.lock().unwrap();
+}
+
+fn write_report(
+    context: &RunContext,
+    result: RunResult,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut collected = context.metrics.lock().unwrap();
     let mut aggregate = Samples::default();
     let mut endpoints = serde_json::Map::new();
-    let elapsed = Some(run_duration_s);
+    let elapsed = Some(result.duration_s);
     for ((endpoint, name), samples) in Endpoint::ALL
         .into_iter()
         .zip(ENDPOINTS)
@@ -759,32 +948,43 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         }
         endpoints.insert(name.into(), summary);
     }
+    let (report, passed) = build_report(context, result, elapsed, aggregate, &endpoints);
+    save_report(context, &report, &collected, passed)
+}
+
+fn build_report(
+    context: &RunContext,
+    result: RunResult,
+    elapsed: Option<f64>,
+    mut aggregate: Samples,
+    endpoints: &serde_json::Map<String, serde_json::Value>,
+) -> (serde_json::Value, bool) {
     let summary = aggregate.summary();
-    let runtime_count = runtime_errors.load(Ordering::Relaxed);
-    let completed = !interrupted;
+    let runtime_count = context.runtime_errors.load(Ordering::Relaxed);
+    let completed = !result.interrupted;
     let passed = completed && passes(&summary, runtime_count);
-    let connection_report = connections.lock().unwrap().report(elapsed);
+    let connection_report = context.connections.lock().unwrap().report(elapsed);
     let report = serde_json::json!({
         "generator": "reqwest",
-        "requested_users": cfg.users,
+        "requested_users": context.cfg.users,
         "source_port_allocation": {
             "first": 1024,
             "last": 65535,
             "policy": "explicit per source/destination counters",
         },
-        "maximum_users": max_users,
-        "total_users": max_users,
+        "maximum_users": result.maximum_users,
+        "total_users": result.maximum_users,
         "duration_s": elapsed,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "hold_started_at": hold_started_at,
-        "hold_finished_at": hold_finished_at,
-        "planned_hold_s": hold.as_secs_f64(),
-        "hosts": &*assigned.lock().unwrap(),
-        "configured_hosts": targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
-        "destination_ports": targets.iter().filter_map(reqwest::Url::port_or_known_default).collect::<Vec<_>>(),
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "hold_started_at": result.hold_started_at,
+        "hold_finished_at": result.hold_finished_at,
+        "planned_hold_s": context.workload.hold.as_secs_f64(),
+        "hosts": &*context.assigned.lock().unwrap(),
+        "configured_hosts": context.workload.targets.iter().map(reqwest::Url::as_str).collect::<Vec<_>>(),
+        "destination_ports": context.workload.targets.iter().filter_map(reqwest::Url::port_or_known_default).collect::<Vec<_>>(),
         "assignment": "fixed per user, balanced over source IP and destination port combinations; SSH workers use global user offsets",
-        "source_ips": source_ips.as_ref(),
+        "source_ips": context.workload.source_ips.as_ref(),
         "latency": "client wall time through complete response body, including connection setup",
         "percentiles": "k6 linear interpolation over unrounded milliseconds",
         "scope": "whole run including ramp-up, hold, ramp-down and drain",
@@ -792,39 +992,53 @@ async fn run(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         "thresholds": {"p95_ms_lt": 500, "p99_ms_lt": 1000, "failure_rate_lt": 0.01},
         "completed": completed,
         "runtime_errors": runtime_count,
-        "runtime_error_details": &*runtime_details.lock().unwrap(),
+        "runtime_error_details": &*context.runtime_details.lock().unwrap(),
         "passed": passed,
         "aggregate": summary,
         "request_rates": connections::request_rates(&aggregate, elapsed),
         "connections": connection_report,
-        "telemetry": match telemetry_report {
+        "telemetry": match result.telemetry {
             Ok(value) => value,
             Err(error) => serde_json::json!({"unavailable_reason": error}),
         },
         "endpoints": endpoints,
     });
-    let output = serde_json::to_string_pretty(&report)?;
+    (report, passed)
+}
+
+fn save_report(
+    context: &RunContext,
+    report: &serde_json::Value,
+    collected: &[Samples; 4],
+    passed: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = serde_json::to_string_pretty(report)?;
     println!("\nScoring summary (full-body latency):\n{output}");
     let path = env::var("SUMMARY")
         .ok()
         .map(std::path::PathBuf::from)
-        .or_else(|| cfg.output.as_ref().map(|dir| dir.join("summary.json")))
+        .or_else(|| {
+            context
+                .cfg
+                .output
+                .as_ref()
+                .map(|dir| dir.join("summary.json"))
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("results/summary.json"));
-    let path = path.as_path();
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, format!("{output}\n"))?;
+    fs::write(&path, format!("{output}\n"))?;
     if let Ok(destination) = env::var("BENCH_SAMPLES") {
         let mut file = BufWriter::new(fs::File::create(destination)?);
-        serde_json::to_writer(&mut file, &*collected)?;
+        serde_json::to_writer(&mut file, collected)?;
         file.flush()?;
         let cp = path
             .parent()
             .unwrap_or(Path::new("."))
             .join("connection-samples.json");
         let mut file = BufWriter::new(fs::File::create(cp)?);
-        serde_json::to_writer(&mut file, &*connections.lock().unwrap())?;
+        serde_json::to_writer(&mut file, &*context.connections.lock().unwrap())?;
         file.flush()?;
     }
     println!(

@@ -1,4 +1,5 @@
 use chrono::Utc;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -79,8 +80,6 @@ fn interfaces(text: &str) -> Result<BTreeMap<String, Interface>> {
     Ok(result)
 }
 
-// Keep the netlink request and multipart decoder together so their bounds stay auditable.
-#[allow(clippy::too_many_lines)]
 fn socket_inodes() -> Result<HashSet<u64>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: no pointer arguments; OwnedFd takes ownership only on success.
@@ -140,70 +139,80 @@ fn socket_inodes() -> Result<HashSet<u64>> {
         {
             return Err(std::io::Error::last_os_error().into());
         }
-        let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
-        'dump: loop {
-            // SAFETY: buffer is writable for its entire stated length.
-            let received = unsafe {
-                libc::recv(
-                    socket.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    libc::MSG_TRUNC,
-                )
-            };
-            if received < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let received = usize::try_from(received)?;
-            if received == 0 || received > buffer.len() {
-                return Err("truncated socket diagnostic dump".into());
-            }
-            let mut offset = 0;
-            while offset + 16 <= received {
-                let header = &buffer[offset..offset + 16];
-                let length = u32::from_ne_bytes(header[..4].try_into()?) as usize;
-                if length < 16 || length > received - offset {
-                    return Err("invalid socket diagnostic message".into());
-                }
-                let flags = u16::from_ne_bytes(header[6..8].try_into()?);
-                if flags & 0x10 != 0 {
-                    return Err("socket diagnostic dump interrupted".into());
-                }
-                let payload = &buffer[offset + 16..offset + length];
-                match u16::from_ne_bytes(header[4..6].try_into()?) {
-                    3 => break 'dump, // NLMSG_DONE
-                    2 => {
-                        // NLMSG_ERROR
-                        let code = i32::from_ne_bytes(
-                            payload
-                                .get(..4)
-                                .ok_or("truncated diagnostic error")?
-                                .try_into()?,
-                        );
-                        if code != 0 {
-                            return Err(std::io::Error::from_raw_os_error(
-                                code.checked_neg().ok_or("invalid diagnostic error")?,
-                            )
-                            .into());
-                        }
-                    }
-                    20 => {
-                        // inet_diag_msg inode is a native-endian u32 at offset 68.
-                        let inode = u32::from_ne_bytes(
-                            payload
-                                .get(68..72)
-                                .ok_or("truncated socket diagnostic entry")?
-                                .try_into()?,
-                        );
-                        inodes.insert(u64::from(inode));
-                    }
-                    _ => {}
-                }
-                offset += (length + 3) & !3;
-            }
-        }
+        read_socket_dump(socket.as_raw_fd(), &mut inodes)?;
     }
     Ok(inodes)
+}
+
+fn read_socket_dump(fd: std::os::fd::RawFd, inodes: &mut HashSet<u64>) -> Result<()> {
+    let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    'dump: loop {
+        // SAFETY: buffer is writable for its entire stated length.
+        let received = unsafe {
+            libc::recv(
+                fd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_TRUNC,
+            )
+        };
+        if received < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let received = usize::try_from(received)?;
+        if received == 0 || received > buffer.len() {
+            return Err("truncated socket diagnostic dump".into());
+        }
+        let mut offset = 0;
+        while offset + 16 <= received {
+            let header = &buffer[offset..offset + 16];
+            let length = usize::try_from(u32::from_ne_bytes(header[..4].try_into()?))?;
+            if length < 16 || length > received - offset {
+                return Err("invalid socket diagnostic message".into());
+            }
+            let flags = u16::from_ne_bytes(header[6..8].try_into()?);
+            if flags & 0x10 != 0 {
+                return Err("socket diagnostic dump interrupted".into());
+            }
+            let payload = &buffer[offset + 16..offset + length];
+            match u16::from_ne_bytes(header[4..6].try_into()?) {
+                3 => break 'dump, // NLMSG_DONE
+                2 => check_diagnostic_error(payload)?,
+                20 => {
+                    inodes.insert(diagnostic_inode(payload)?);
+                }
+                _ => {}
+            }
+            offset += (length + 3) & !3;
+        }
+    }
+    Ok(())
+}
+
+fn check_diagnostic_error(payload: &[u8]) -> Result<()> {
+    let code = i32::from_ne_bytes(
+        payload
+            .get(..4)
+            .ok_or("truncated diagnostic error")?
+            .try_into()?,
+    );
+    if code != 0 {
+        return Err(std::io::Error::from_raw_os_error(
+            code.checked_neg().ok_or("invalid diagnostic error")?,
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn diagnostic_inode(payload: &[u8]) -> Result<u64> {
+    let inode = u32::from_ne_bytes(
+        payload
+            .get(68..72)
+            .ok_or("truncated socket diagnostic entry")?
+            .try_into()?,
+    );
+    Ok(u64::from(inode))
 }
 
 fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
@@ -227,7 +236,6 @@ fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
     ))
 }
 
-#[allow(clippy::cast_precision_loss)] // Kernel CPU ticks become floating-point report seconds.
 fn process(
     pid: u32,
     ticks: f64,
@@ -317,7 +325,10 @@ fn process(
         pid,
         name,
         start_ticks,
-        cpu_seconds: cpu_ticks as f64 / ticks,
+        cpu_seconds: cpu_ticks
+            .to_f64()
+            .ok_or("kernel CPU tick counter exceeds floating-point range")?
+            / ticks,
         resident_bytes: resident_pages.saturating_mul(page_size),
         open_descriptors,
         established_sockets,
@@ -371,16 +382,14 @@ fn checked_sum(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
         .try_fold(0_u64, |total, value| total.checked_add(value?))
 }
 
-#[allow(clippy::cast_precision_loss)] // Kernel clock rates are small practical values.
 fn ticks_per_second(ticks: libc::c_long) -> f64 {
-    ticks as f64
+    ticks.to_f64().expect("kernel tick rate fits in f64")
 }
 
 /// Summarize counters between samples wholly inside the full-load hold.
 ///
 /// # Errors
 /// Returns an error if the file or samples are malformed, or no valid interval exists.
-#[allow(clippy::cast_precision_loss)] // Benchmark rates and CPU share are floating-point estimates.
 pub fn summarize_hold(
     path: &Path,
     start: chrono::DateTime<Utc>,
@@ -447,7 +456,7 @@ pub fn summarize_hold(
         "sample_finished_at": last.timestamp,
         "sample_duration_s": seconds,
         "requests_per_second": rate(requests, seconds, 1.0),
-        "service_cpu_percent": cpu.map(|n| n as f64 / (seconds * 10_000.0)),
+        "service_cpu_percent": cpu.and_then(|n| n.to_f64()).map(|n| n / (seconds * 10_000.0)),
         "sampled_peak_memory_bytes": peak_memory,
         "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache"
     }))
@@ -807,10 +816,9 @@ fn tcp_counters(text: &str) -> Result<BTreeMap<String, u64>> {
         .collect()
 }
 
-#[allow(clippy::cast_precision_loss)] // Rates are reported as floating-point metrics.
 fn rate(delta: Option<u64>, seconds: f64, scale: f64) -> Option<f64> {
     if seconds > 0.0 {
-        delta.map(|n| n as f64 * scale / seconds)
+        delta.and_then(|n| n.to_f64()).map(|n| n * scale / seconds)
     } else {
         None
     }

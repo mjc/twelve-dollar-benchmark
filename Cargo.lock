@@ -930,6 +930,7 @@ dependencies = [
  "hyper-util",
  "lexopt",
  "libc",
+ "num-traits",
  "rand",
  "reqwest",
  "serde",

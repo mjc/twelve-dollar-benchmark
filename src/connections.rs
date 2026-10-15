@@ -1,4 +1,5 @@
 use super::{Samples, errors, percentile};
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -50,15 +51,19 @@ impl Connections {
     }
 }
 
-#[allow(clippy::cast_precision_loss)] // Rates are floating point report statistics.
 fn rate(count: usize, seconds: Option<f64>) -> Option<f64> {
-    seconds.filter(|s| *s > 0.0).map(|s| count as f64 / s)
+    seconds
+        .filter(|s| *s > 0.0)
+        .and_then(|s| count.to_f64().map(|count| count / s))
 }
 
-#[allow(clippy::cast_precision_loss)] // Averages are represented as floating point milliseconds.
 fn distribution(samples: &mut [f64]) -> Value {
     samples.sort_unstable_by(f64::total_cmp);
-    json!({"samples": samples.len(), "avg_ms": (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64),
+    let average = (!samples.is_empty())
+        .then(|| samples.len().to_f64())
+        .flatten()
+        .map(|count| samples.iter().sum::<f64>() / count);
+    json!({"samples": samples.len(), "avg_ms": average,
         "med_ms": percentile(samples, 0.5), "p95_ms": percentile(samples, 0.95), "p99_ms": percentile(samples, 0.99), "max_ms": samples.last()})
 }
 
