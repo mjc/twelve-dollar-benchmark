@@ -215,8 +215,6 @@ struct TargetMonitor {
     heartbeat: Option<thread::JoinHandle<()>>,
 }
 impl TargetMonitor {
-    // Setup spans local and remote observers; the shared protocol is kept together here.
-    #[allow(clippy::too_many_lines)]
     fn prepare(
         cfg: &config::Config,
         binary: &Path,
@@ -249,36 +247,7 @@ impl TargetMonitor {
             )
         });
         let control = dir.join("metrics");
-        let assignments = [
-            (
-                "BENCH_APPLICATION_PIDS",
-                cfg.application_pids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
-            (
-                "BENCH_PROXY_PIDS",
-                cfg.proxy_pids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
-            (
-                "BENCH_TARGET_PORTS",
-                cfg.destination_ports
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
-            (
-                "BENCH_SAMPLE_INTERVAL",
-                cfg.sample_interval.as_secs_f64().to_string(),
-            ),
-        ];
+        let assignments = target_assignments(cfg);
         let observer_binary = binary.with_file_name(OBSERVER_BINARY);
         let log = File::create(dir.join("output.log"))?;
         let mut command = if let Some((user, host, remote_dir)) = &remote {
@@ -451,6 +420,39 @@ impl Drop for TargetMonitor {
     }
 }
 
+fn target_assignments(cfg: &config::Config) -> [(&'static str, String); 4] {
+    [
+        (
+            "BENCH_APPLICATION_PIDS",
+            cfg.application_pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "BENCH_PROXY_PIDS",
+            cfg.proxy_pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "BENCH_TARGET_PORTS",
+            cfg.destination_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "BENCH_SAMPLE_INTERVAL",
+            cfg.sample_interval.as_secs_f64().to_string(),
+        ),
+    ]
+}
+
 fn prepare_monitor(
     cfg: &config::Config,
     binary: &Path,
@@ -530,8 +532,6 @@ fn split_users(total: usize, count: usize) -> Result<Vec<(usize, usize)>> {
         .collect())
 }
 
-// Worker report validation and aggregation form one ordered pass over each worker.
-#[allow(clippy::too_many_lines)]
 fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
     let mut maximum_users = 0;
@@ -550,54 +550,13 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     let mut hold_end = None;
     let mut required_hold = 0.0_f64;
     for worker in workers.iter_mut() {
-        let parsed = (|| -> Result<(Report, [Samples; 4])> {
-            let dir = output.join(&worker.name);
-            let report: Report =
-                serde_json::from_reader(BufReader::new(File::open(dir.join("summary.json"))?))?;
-            let raw: [Samples; 4] =
-                serde_json::from_reader(BufReader::new(File::open(dir.join("samples.json"))?))?;
-            if raw.iter().any(|s| {
-                s.failed > s.latency_ms.len()
-                    || s.latency_ms.iter().any(|ms| !ms.is_finite() || *ms < 0.0)
-            }) {
-                return Err("invalid latency samples or failure counts".into());
-            }
-            let requests: usize = raw.iter().map(|s| s.latency_ms.len()).sum();
-            let failed: usize = raw.iter().map(|s| s.failed).sum();
-            if report.aggregate["requests"].as_u64() != Some(requests as u64)
-                || report.aggregate["failed"].as_u64() != Some(failed as u64)
-                || report.finished_at < report.started_at
-                || (worker.remote_dir.is_some()
-                    && (report.maximum_users != worker.users || report.total_users != worker.users))
-            {
-                return Err("summary does not match raw samples or timestamps".into());
-            }
-            Ok((report, raw))
-        })();
+        let parsed = read_worker(output, worker);
         match parsed {
             Ok((report, raw)) => {
-                let connection_samples = output.join(&worker.name).join("connection-samples.json");
-                match File::open(connection_samples)
-                    .map_err(|error| error.to_string())
-                    .and_then(|file| {
-                        serde_json::from_reader::<_, connections::Connections>(BufReader::new(file))
-                            .map_err(|error| error.to_string())
-                    }) {
-                    Ok(samples)
-                        if samples.cancelled <= samples.failed_ms.len()
-                            && samples
-                                .successful_ms
-                                .iter()
-                                .chain(&samples.failed_ms)
-                                .all(|ms| ms.is_finite() && *ms >= 0.0)
-                            && report.connections["established"].as_u64()
-                                == Some(samples.successful_ms.len() as u64)
-                            && report.connections["failed"].as_u64()
-                                == Some(samples.failed_ms.len() as u64) =>
-                    {
-                        connection_data.merge(samples);
-                    }
-                    _ => connection_available = false,
+                if let Some(received) = read_connection_samples(output, worker, &report) {
+                    connection_data.merge(received);
+                } else {
+                    connection_available = false;
                 }
                 telemetry.insert(worker.name.clone(), report.telemetry);
                 completed &= report.completed && matches!(worker.exit_code, Some(0 | 1));
@@ -649,23 +608,7 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
     if required_hold > 0.0 {
         completed &= common_hold_s.is_some_and(|s| s + 0.25 >= required_hold);
     }
-    let mut aggregate = Samples::default();
-    let mut endpoints = std::collections::BTreeMap::new();
-    for (endpoint_name, sample) in ENDPOINTS.iter().zip(samples.iter_mut()) {
-        aggregate.latency_ms.extend_from_slice(&sample.latency_ms);
-        aggregate.failed += sample.failed;
-        aggregate.checks_failed += sample.checks_failed;
-        aggregate.errors.merge(&sample.errors);
-        let mut endpoint = serde_json::to_value(sample.summary()).unwrap();
-        let duration_s = started
-            .zip(finished)
-            .and_then(|(s, f)| (f - s).to_std().ok())
-            .map(|d| d.as_secs_f64());
-        if let Value::Object(rates) = connections::request_rates(sample, duration_s) {
-            endpoint.as_object_mut().unwrap().extend(rates);
-        }
-        endpoints.insert(*endpoint_name, endpoint);
-    }
+    let (mut aggregate, endpoints) = endpoint_summaries(&mut samples, started, finished);
     let summary = aggregate.summary();
     let duration_s = started
         .zip(finished)
@@ -690,6 +633,76 @@ fn collect(output: &Path, workers: &mut [Worker]) -> Value {
         "connections": if connection_available { connection_data.report(duration_s) } else { json!({"unavailable_reason": "missing or inconsistent per-worker connection samples"}) },
         "generator_telemetry": telemetry,
     })
+}
+
+fn read_worker(output: &Path, worker: &Worker) -> Result<(Report, [Samples; 4])> {
+    let dir = output.join(&worker.name);
+    let report: Report =
+        serde_json::from_reader(BufReader::new(File::open(dir.join("summary.json"))?))?;
+    let raw: [Samples; 4] =
+        serde_json::from_reader(BufReader::new(File::open(dir.join("samples.json"))?))?;
+    if raw.iter().any(|s| {
+        s.failed > s.latency_ms.len() || s.latency_ms.iter().any(|ms| !ms.is_finite() || *ms < 0.0)
+    }) {
+        return Err("invalid latency samples or failure counts".into());
+    }
+    let requests: usize = raw.iter().map(|s| s.latency_ms.len()).sum();
+    let failed: usize = raw.iter().map(|s| s.failed).sum();
+    if report.aggregate["requests"].as_u64() != Some(requests as u64)
+        || report.aggregate["failed"].as_u64() != Some(failed as u64)
+        || report.finished_at < report.started_at
+        || (worker.remote_dir.is_some()
+            && (report.maximum_users != worker.users || report.total_users != worker.users))
+    {
+        return Err("summary does not match raw samples or timestamps".into());
+    }
+    Ok((report, raw))
+}
+
+fn read_connection_samples(
+    output: &Path,
+    worker: &Worker,
+    report: &Report,
+) -> Option<connections::Connections> {
+    let path = output.join(&worker.name).join("connection-samples.json");
+    let samples = serde_json::from_reader::<_, connections::Connections>(BufReader::new(
+        File::open(path).ok()?,
+    ))
+    .ok()?;
+    (samples.cancelled <= samples.failed_ms.len()
+        && samples
+            .successful_ms
+            .iter()
+            .chain(&samples.failed_ms)
+            .all(|ms| ms.is_finite() && *ms >= 0.0)
+        && report.connections["established"].as_u64() == Some(samples.successful_ms.len() as u64)
+        && report.connections["failed"].as_u64() == Some(samples.failed_ms.len() as u64))
+    .then_some(samples)
+}
+
+fn endpoint_summaries(
+    samples: &mut [Samples; 4],
+    started: Option<DateTime<Utc>>,
+    finished: Option<DateTime<Utc>>,
+) -> (Samples, std::collections::BTreeMap<&'static str, Value>) {
+    let mut aggregate = Samples::default();
+    let mut endpoints = std::collections::BTreeMap::new();
+    let duration_s = started
+        .zip(finished)
+        .and_then(|(s, f)| (f - s).to_std().ok())
+        .map(|d| d.as_secs_f64());
+    for (endpoint_name, sample) in ENDPOINTS.iter().zip(samples.iter_mut()) {
+        aggregate.latency_ms.extend_from_slice(&sample.latency_ms);
+        aggregate.failed += sample.failed;
+        aggregate.checks_failed += sample.checks_failed;
+        aggregate.errors.merge(&sample.errors);
+        let mut endpoint = serde_json::to_value(sample.summary()).unwrap();
+        if let Value::Object(rates) = connections::request_rates(sample, duration_s) {
+            endpoint.as_object_mut().unwrap().extend(rates);
+        }
+        endpoints.insert(*endpoint_name, endpoint);
+    }
+    (aggregate, endpoints)
 }
 
 pub(super) fn render_score_table(report: &Value) -> String {
@@ -733,8 +746,6 @@ pub(super) fn render_score_table(report: &Value) -> String {
     )
 }
 
-// This is a linear document renderer; section order mirrors the published report.
-#[allow(clippy::too_many_lines)]
 pub(super) fn render_report(report: &Value, compact: bool) -> String {
     let fmt = |value: &Value| {
         value
@@ -814,34 +825,42 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         report["source_port_allocation"]["tuple_capacity"]
     );
     if !compact {
-        if let Some(endpoints) = report["endpoints"].as_object() {
-            for (endpoint, details) in endpoints {
-                if details["failed"].as_u64().unwrap_or(0) > 0
-                    && details["errors"]["counts"]
-                        .as_object()
-                        .is_none_or(serde_json::Map::is_empty)
-                {
-                    let _ = writeln!(
-                        text,
-                        "\nRequest errors — {}: {} failed requests; error details are unavailable in this legacy report.",
-                        markdown_text(endpoint),
-                        details["failed"]
-                    );
-                    continue;
-                }
-                render_error_details(
-                    &mut text,
-                    &format!("Request errors — {}", markdown_text(endpoint)),
-                    &details["errors"],
-                );
-            }
-        }
-        render_error_details(
-            &mut text,
-            "Runtime errors",
-            &report["runtime_error_details"],
-        );
+        render_request_errors(&mut text, report);
     }
+    render_connections(&mut text, report, &fmt);
+    render_network(&mut text, report, compact, &fmt);
+    render_processes(&mut text, report, compact, &fmt);
+    text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
+    text
+}
+
+fn render_request_errors(text: &mut String, report: &Value) {
+    if let Some(endpoints) = report["endpoints"].as_object() {
+        for (endpoint, details) in endpoints {
+            if details["failed"].as_u64().unwrap_or(0) > 0
+                && details["errors"]["counts"]
+                    .as_object()
+                    .is_none_or(serde_json::Map::is_empty)
+            {
+                let _ = writeln!(
+                    text,
+                    "\nRequest errors — {}: {} failed requests; error details are unavailable in this legacy report.",
+                    markdown_text(endpoint),
+                    details["failed"]
+                );
+                continue;
+            }
+            render_error_details(
+                text,
+                &format!("Request errors — {}", markdown_text(endpoint)),
+                &details["errors"],
+            );
+        }
+    }
+    render_error_details(text, "Runtime errors", &report["runtime_error_details"]);
+}
+
+fn render_connections<F: Fn(&Value) -> String>(text: &mut String, report: &Value, fmt: &F) {
     let connections = &report["connections"];
     let _ = writeln!(
         text,
@@ -880,6 +899,14 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
     if let Some(reason) = connections["unavailable_reason"].as_str() {
         let _ = writeln!(text, "Connection metrics unavailable: {reason}");
     }
+}
+
+fn render_network<F: Fn(&Value) -> String>(
+    text: &mut String,
+    report: &Value,
+    compact: bool,
+    fmt: &F,
+) {
     text.push_str("\nHost interface counters include background traffic. Packet counters may reflect offloads. Do not sum virtual links or both connection ends. Host aliases are deduplicated.\n\n| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |\n|---|---|---:|---:|---:|---:|\n");
     if let Some(hosts) = report["network_hosts"]["hosts"].as_object() {
         for host in hosts.values() {
@@ -916,6 +943,14 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         }
     }
     text.push_str("\nCPU includes all process threads; 100% is one core. Memory, descriptors and established sockets are sampled peaks.\n\n| Observer | Role / PID | CPU % | Peak RSS MiB | Peak FDs | FD soft / hard limit | Peak established sockets |\n|---|---|---:|---:|---:|---|---:|\n");
+}
+
+fn render_processes<F: Fn(&Value) -> String>(
+    text: &mut String,
+    report: &Value,
+    compact: bool,
+    fmt: &F,
+) {
     let observations = report["generator_telemetry"]
         .as_object()
         .into_iter()
@@ -988,8 +1023,6 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
             );
         }
     }
-    text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
-    text
 }
 
 fn markdown_text(value: &str) -> String {
@@ -1039,8 +1072,6 @@ fn error_context(example: &Value) -> ErrorContext<'_> {
     }
 }
 
-// Preserve the grouped and deduplicated error presentation in a single pass.
-#[allow(clippy::too_many_lines)]
 fn render_error_details(text: &mut String, title: &str, value: &Value) {
     let Some(counts) = value
         .get("counts")
@@ -1050,6 +1081,14 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
         return;
     };
     let _ = writeln!(text, "\n{title}:");
+    render_error_counts(text, counts);
+    if let Some(examples) = value.get("examples").and_then(Value::as_array) {
+        render_error_examples(text, examples);
+    }
+    render_omitted_errors(text, value);
+}
+
+fn render_error_counts(text: &mut String, counts: &serde_json::Map<String, Value>) {
     for (label, prefix) in [("Error type", "kind:"), ("HTTP status", "status:")] {
         let rows = counts
             .iter()
@@ -1062,97 +1101,100 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
             }
         }
     }
-    if let Some(examples) = value.get("examples").and_then(Value::as_array) {
-        let mut unique = Vec::with_capacity(examples.len());
-        let mut contexts = BTreeSet::new();
-        let mut duplicates = 0;
-        for example in examples {
-            if contexts.insert(error_context(example)) {
-                unique.push(example);
-            } else {
-                duplicates += 1;
-            }
-        }
+}
 
-        let mut shown_contexts = BTreeSet::new();
-        let mut workers = BTreeSet::new();
-        for example in &unique {
-            if let Some(worker) = string_field(example, "worker")
-                && workers.insert(worker)
-            {
-                shown_contexts.insert(error_context(example));
-                if shown_contexts.len() == 5 {
-                    break;
-                }
-            }
-        }
-
-        let mut shown_count = shown_contexts.len().min(5);
-        for example in &unique {
-            if shown_count == 5 {
-                break;
-            }
-            if shown_contexts.insert(error_context(example)) {
-                shown_count += 1;
-            }
-        }
-        if shown_count > 0 {
-            let _ = writeln!(text, "\nExamples:\n");
-        }
-        for example in unique
-            .iter()
-            .filter(|example| shown_contexts.contains(&error_context(example)))
-        {
-            let worker = string_field(example, "worker").map(markdown_text);
-            let endpoint = string_field(example, "endpoint")
-                .map(markdown_text)
-                .unwrap_or_default();
-            let path = string_field(example, "path")
-                .map(markdown_text)
-                .unwrap_or_default();
-            let kind = string_field(example, "kind")
-                .map(markdown_text)
-                .unwrap_or_default();
-            let reason = string_field(example, "reason")
-                .map(markdown_text)
-                .unwrap_or_default();
-            let status = example
-                .get("status_code")
-                .and_then(Value::as_u64)
-                .map_or_else(|| "no HTTP status".to_owned(), |n| n.to_string());
-            let worker = worker
-                .as_deref()
-                .map_or_else(String::new, |name| format!("{name}: "));
-            let _ = writeln!(
-                text,
-                "- {worker}{endpoint} {path} {status}: {kind} ({reason})"
-            );
-            if let Some(body) = string_field(example, "body_excerpt") {
-                let encoded =
-                    serde_json::to_string(body).unwrap_or_else(|_| "\"unavailable\"".into());
-                let truncated = if example
-                    .get("body_truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    " [truncated]"
-                } else {
-                    ""
-                };
-                let _ = writeln!(text, "    {}{truncated}", markdown_text(&encoded));
-            }
-        }
-        let hidden = unique.len().saturating_sub(shown_count);
-        if hidden > 0 {
-            let _ = writeln!(text, "- {hidden} distinct stored examples not shown.");
-        }
-        if duplicates > 0 {
-            let _ = writeln!(
-                text,
-                "- {duplicates} repeated stored examples omitted from display."
-            );
+fn render_error_examples(text: &mut String, examples: &[Value]) {
+    let mut unique = Vec::with_capacity(examples.len());
+    let mut contexts = BTreeSet::new();
+    let mut duplicates = 0;
+    for example in examples {
+        if contexts.insert(error_context(example)) {
+            unique.push(example);
+        } else {
+            duplicates += 1;
         }
     }
+
+    let mut shown_contexts = BTreeSet::new();
+    let mut workers = BTreeSet::new();
+    for example in &unique {
+        if let Some(worker) = string_field(example, "worker")
+            && workers.insert(worker)
+        {
+            shown_contexts.insert(error_context(example));
+            if shown_contexts.len() == 5 {
+                break;
+            }
+        }
+    }
+
+    let mut shown_count = shown_contexts.len().min(5);
+    for example in &unique {
+        if shown_count == 5 {
+            break;
+        }
+        if shown_contexts.insert(error_context(example)) {
+            shown_count += 1;
+        }
+    }
+    if shown_count > 0 {
+        let _ = writeln!(text, "\nExamples:\n");
+    }
+    for example in unique
+        .iter()
+        .filter(|example| shown_contexts.contains(&error_context(example)))
+    {
+        let worker = string_field(example, "worker").map(markdown_text);
+        let endpoint = string_field(example, "endpoint")
+            .map(markdown_text)
+            .unwrap_or_default();
+        let path = string_field(example, "path")
+            .map(markdown_text)
+            .unwrap_or_default();
+        let kind = string_field(example, "kind")
+            .map(markdown_text)
+            .unwrap_or_default();
+        let reason = string_field(example, "reason")
+            .map(markdown_text)
+            .unwrap_or_default();
+        let status = example
+            .get("status_code")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "no HTTP status".to_owned(), |n| n.to_string());
+        let worker = worker
+            .as_deref()
+            .map_or_else(String::new, |name| format!("{name}: "));
+        let _ = writeln!(
+            text,
+            "- {worker}{endpoint} {path} {status}: {kind} ({reason})"
+        );
+        if let Some(body) = string_field(example, "body_excerpt") {
+            let encoded = serde_json::to_string(body).unwrap_or_else(|_| "\"unavailable\"".into());
+            let truncated = if example
+                .get("body_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                " [truncated]"
+            } else {
+                ""
+            };
+            let _ = writeln!(text, "    {}{truncated}", markdown_text(&encoded));
+        }
+    }
+    let hidden = unique.len().saturating_sub(shown_count);
+    if hidden > 0 {
+        let _ = writeln!(text, "- {hidden} distinct stored examples not shown.");
+    }
+    if duplicates > 0 {
+        let _ = writeln!(
+            text,
+            "- {duplicates} repeated stored examples omitted from display."
+        );
+    }
+}
+
+fn render_omitted_errors(text: &mut String, value: &Value) {
     if let Some(omitted) = value
         .get("omitted")
         .and_then(Value::as_u64)
@@ -1166,7 +1208,6 @@ fn render_error_details(text: &mut String, title: &str, value: &Value) {
 }
 
 // Coordinates worker setup, execution, collection, and publication as one run lifecycle.
-#[allow(clippy::too_many_lines)]
 pub(super) fn run(args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
     let cfg = config::parse(args)?;
     if cfg.help {
@@ -1211,269 +1252,442 @@ pub(super) fn run(args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
         output.join("aggregate.json"),
         "{\"completed\":false,\"passed\":false,\"status\":\"running\"}\n",
     )?;
-    let mut target_unavailable = None;
-    let mut monitor = None;
-    let mut workers = Vec::new();
-    if let Some(user) = &username {
-        if user.is_empty()
-            || user.starts_with('-')
-            || !user
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
-        {
-            return Err("invalid SSH username".into());
-        }
-        if ips.iter().collect::<BTreeSet<_>>().len() != ips.len() {
-            return Err("SSH generator addresses must be unique".into());
-        }
-        for (index, (ip, (count, offset))) in
-            ips.iter().zip(split_users(users, ips.len())?).enumerate()
-        {
-            let name = format!("host-{:03}-{}", index + 1, ip.to_string().replace(':', "_"));
-            let dir = output.join(&name);
-            fs::create_dir(&dir)?;
-            let remote_dir = format!(
-                "/tmp/twelve-dollar-benchmark-{}-{}-{}",
-                Utc::now().timestamp_millis(),
-                std::process::id(),
-                index
-            );
-            let mut worker = Worker {
-                name,
-                users: count,
-                user_offset: offset,
-                remote_dir: Some(remote_dir.clone()),
-                exit_code: None,
-                error: None,
-            };
-            let upload = (|| -> Result<()> {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err("interrupted".into());
-                }
-                checked(
-                    ssh(user, &ip.to_string()).arg(format!(
-                        "umask 077; mkdir -- {} && mkdir -- {}",
-                        quote(&remote_dir),
-                        quote(&format!("{remote_dir}/results"))
-                    )),
-                    cancelled,
-                )?;
-                checked(
-                    scp().arg("--").arg(&binary).arg(destination(
-                        user,
-                        &ip.to_string(),
-                        &format!("{remote_dir}/twelve-dollar-benchmark"),
-                    )),
-                    cancelled,
-                )?;
-                checked(
-                    scp().arg("--").arg(&tokens).arg(destination(
-                        user,
-                        &ip.to_string(),
-                        &format!("{remote_dir}/tokens.json"),
-                    )),
-                    cancelled,
-                )?;
-                // Check the copied executable before launching any load on any host.
-                checked(
-                    ssh(user, &ip.to_string()).arg(format!(
-                        "{} --version",
-                        quote(&format!("{remote_dir}/twelve-dollar-benchmark"))
-                    )),
-                    cancelled,
-                )?;
-                Ok(())
-            })();
-            if let Err(error) = upload {
-                worker.error = Some(error.to_string());
-            }
-            workers.push(worker);
-        }
-        // Upload all hosts first; a failed copy must not start a partial load.
-        if workers.iter().all(|worker| worker.error.is_none()) {
-            let controls: Vec<_> = workers
-                .iter()
-                .zip(&ips)
-                .map(|(worker, ip)| (ip.to_string(), worker.remote_dir.clone().unwrap()))
-                .collect();
-            let mut joins = Vec::new();
-            for (worker, ip) in workers.into_iter().zip(ips) {
-                let output = output.clone();
-                let user = user.clone();
-                let cancelled = Arc::clone(cancelled);
-                let base_url = cfg.base_url.clone();
-                let destination_ports = destination_ports.clone();
-                let ramp = cfg.ramp_up.clone();
-                let duration = cfg.duration.clone();
-                let sample_interval = cfg.sample_interval.as_secs_f64();
-                joins.push(thread::spawn(move || {
-                    let mut worker = worker;
-                    let dir = output.join(&worker.name);
-                    let remote_dir = worker.remote_dir.as_ref().unwrap();
-                    let result = (|| -> Result<()> {
-                        let assignments = [
-                            format!("BASE_URL={base_url}"),
-                            format!("DESTINATION_PORTS={destination_ports}"),
-                            format!("VUS={}", worker.users),
-                            format!("RAMP_UP={ramp}"),
-                            format!("DURATION={duration}"),
-                            format!("BENCH_USER_OFFSET={}", worker.user_offset),
-                            "TOKENS=../tokens.json".into(),
-                            "SUMMARY=summary.json".into(),
-                            "BENCH_SAMPLES=samples.json".into(),
-                            "BENCH_TELEMETRY=telemetry.jsonl".into(),
-                            format!("BENCH_SAMPLE_INTERVAL={sample_interval}"),
-                            "SOURCE_IPS=".into(),
-                        ];
-                        let command = format!(
-                            "cd {} || exit 2; trap '' HUP; exec env {} ../twelve-dollar-benchmark --supervise ../cancel",
-                            quote(&format!("{remote_dir}/results")),
-                            assignments
-                                .iter()
-                                .map(|v| quote(v))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
-                        let log = File::create(dir.join("output.log"))?;
-                        let status = execute(
-                            ssh(&user, &ip.to_string())
-                                .arg(command)
-                                .stdout(Stdio::from(log.try_clone()?))
-                                .stderr(Stdio::from(log)),
-                            &cancelled,
-                        )?;
-                        worker.exit_code = status.code();
-                        if cancelled.load(Ordering::Relaxed) || !matches!(worker.exit_code, Some(0 | 1)) {
-                            checked(ssh(&user, &ip.to_string()).arg(format!("{} --stop-supervised {}", quote(&format!("{remote_dir}/twelve-dollar-benchmark")), quote(&format!("{remote_dir}/cancel")))), &AtomicBool::new(false))?;
-                        }
+    let setup = WorkerSetup {
+        cfg: &cfg,
+        username,
+        binary: &binary,
+        ips: &ips,
+        users,
+        destination_ports: &destination_ports,
+        tokens: &tokens,
+        output: &output,
+        cancelled,
+    };
+    let mut run = run_workers(&setup)?;
+    finish_run(RunOutput {
+        cfg: &cfg,
+        output: &output,
+        workers: &mut run.workers,
+        monitor: run.monitor.as_mut(),
+        target_unavailable: run.target_unavailable,
+        cancelled,
+        targets: &targets,
+        source_ip_count,
+    })
+}
 
-                        // Collect reports even when the benchmark failed a threshold.
-                        let remote = destination(&user, &ip.to_string(), remote_dir);
-                        checked(
-                            scp()
-                                .arg("-r")
-                                .arg("--")
-                                .arg(format!("{remote}/results/."))
-                                .arg(&dir),
-                            &AtomicBool::new(false),
-                        )?;
-                        if !matches!(worker.exit_code, Some(0 | 1)) {
-                            return Err(format!("remote execution failed: {status}").into());
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        worker.error = Some(error.to_string());
-                    }
-                    worker
-                }));
-            }
-            let coordination = (|| -> Result<()> {
-                for (ip, dir) in &controls {
-                    checked(
-                        ssh(user, ip).arg(format!(
-                            "{} --ready-supervised {}",
-                            quote(&format!("{dir}/twelve-dollar-benchmark")),
-                            quote(&format!("{dir}/cancel"))
-                        )),
-                        cancelled,
-                    )?;
-                }
-                (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, cancelled);
-                // All SSH sessions are ready before any generator starts.
-                let start_at = (Utc::now().timestamp_millis() + 5000).to_string();
-                start_monitor(&mut monitor, &mut target_unavailable, &start_at, cancelled);
-                let publications = thread::scope(|scope| {
-                    let mut handles = Vec::new();
-                    for (ip, dir) in &controls {
-                        let start_at = &start_at;
-                        handles.push(scope.spawn(move || {
-                            checked(
-                                ssh(user, ip).arg(format!(
-                                    "{} --start-supervised {} {}",
-                                    quote(&format!("{dir}/twelve-dollar-benchmark")),
-                                    quote(&format!("{dir}/cancel")),
-                                    quote(start_at)
-                                )),
-                                cancelled,
-                            )
-                            .map_err(|error| error.to_string())
-                        }));
-                    }
-                    handles
-                        .into_iter()
-                        .map(|handle| {
-                            handle
-                                .join()
-                                .unwrap_or_else(|_| Err("start publication panicked".into()))
-                        })
-                        .collect::<Vec<_>>()
-                });
-                for result in publications {
-                    result?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = coordination {
-                eprintln!("coordinated start failed: {error}");
-                cancelled.store(true, Ordering::Relaxed);
-            }
-            workers = joins
-                .into_iter()
-                .map(|join| join.join().expect("worker thread panicked"))
-                .collect();
+struct WorkerSetup<'a> {
+    cfg: &'a config::Config,
+    username: Option<String>,
+    binary: &'a Path,
+    ips: &'a [IpAddr],
+    users: usize,
+    destination_ports: &'a str,
+    tokens: &'a Path,
+    output: &'a Path,
+    cancelled: &'a Arc<AtomicBool>,
+}
+
+struct WorkerRun {
+    monitor: Option<TargetMonitor>,
+    target_unavailable: Option<String>,
+    workers: Vec<Worker>,
+}
+
+fn run_workers(setup: &WorkerSetup<'_>) -> Result<WorkerRun> {
+    if let Some(user) = setup.username.as_deref() {
+        let workers = upload_remote_workers(setup, user)?;
+        if workers.iter().all(|worker| worker.error.is_none()) {
+            run_remote_workers(setup, user, workers)
+        } else {
+            Ok(WorkerRun {
+                monitor: None,
+                target_unavailable: None,
+                workers,
+            })
         }
     } else {
-        let dir = output.join("local");
+        run_local_worker(setup)
+    }
+}
+
+fn upload_remote_workers(setup: &WorkerSetup<'_>, user: &str) -> Result<Vec<Worker>> {
+    let WorkerSetup {
+        binary,
+        ips,
+        users,
+        tokens,
+        output,
+        cancelled,
+        ..
+    } = setup;
+    if user.is_empty()
+        || user.starts_with('-')
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+    {
+        return Err("invalid SSH username".into());
+    }
+    if ips.iter().collect::<BTreeSet<_>>().len() != ips.len() {
+        return Err("SSH generator addresses must be unique".into());
+    }
+    let mut workers = Vec::new();
+    for (index, (ip, (count, offset))) in
+        ips.iter().zip(split_users(*users, ips.len())?).enumerate()
+    {
+        let name = format!("host-{:03}-{}", index + 1, ip.to_string().replace(':', "_"));
+        let dir = output.join(&name);
         fs::create_dir(&dir)?;
+        let remote_dir = format!(
+            "/tmp/twelve-dollar-benchmark-{}-{}-{}",
+            Utc::now().timestamp_millis(),
+            std::process::id(),
+            index
+        );
+        let mut worker = Worker {
+            name,
+            users: count,
+            user_offset: offset,
+            remote_dir: Some(remote_dir.clone()),
+            exit_code: None,
+            error: None,
+        };
+        let upload = (|| -> Result<()> {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("interrupted".into());
+            }
+            checked(
+                ssh(user, &ip.to_string()).arg(format!(
+                    "umask 077; mkdir -- {} && mkdir -- {}",
+                    quote(&remote_dir),
+                    quote(&format!("{remote_dir}/results"))
+                )),
+                cancelled,
+            )?;
+            checked(
+                scp().arg("--").arg(binary).arg(destination(
+                    user,
+                    &ip.to_string(),
+                    &format!("{remote_dir}/twelve-dollar-benchmark"),
+                )),
+                cancelled,
+            )?;
+            checked(
+                scp().arg("--").arg(tokens).arg(destination(
+                    user,
+                    &ip.to_string(),
+                    &format!("{remote_dir}/tokens.json"),
+                )),
+                cancelled,
+            )?;
+            checked(
+                ssh(user, &ip.to_string()).arg(format!(
+                    "{} --version",
+                    quote(&format!("{remote_dir}/twelve-dollar-benchmark"))
+                )),
+                cancelled,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = upload {
+            worker.error = Some(error.to_string());
+        }
+        workers.push(worker);
+    }
+    Ok(workers)
+}
+
+fn run_remote_workers(
+    setup: &WorkerSetup<'_>,
+    user: &str,
+    workers: Vec<Worker>,
+) -> Result<WorkerRun> {
+    let controls = workers
+        .iter()
+        .zip(setup.ips)
+        .map(|(worker, ip)| {
+            worker
+                .remote_dir
+                .as_ref()
+                .map(|dir| (ip.to_string(), dir.clone()))
+                .ok_or_else(|| "remote worker has no directory".into())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let joins = spawn_remote_workers(setup, user, workers);
+    let mut run = WorkerRun {
+        monitor: None,
+        target_unavailable: None,
+        workers: Vec::new(),
+    };
+    let coordination = coordinate_remote_start(setup, user, &controls, &mut run);
+    if let Err(error) = coordination {
+        eprintln!("coordinated start failed: {error}");
+        setup.cancelled.store(true, Ordering::Relaxed);
+    }
+    run.workers = joins
+        .into_iter()
+        .map(|join| join.join().expect("worker thread panicked"))
+        .collect();
+    Ok(run)
+}
+
+fn coordinate_remote_start(
+    setup: &WorkerSetup<'_>,
+    user: &str,
+    controls: &[(String, String)],
+    run: &mut WorkerRun,
+) -> Result<()> {
+    for (ip, dir) in controls {
+        checked(
+            ssh(user, ip).arg(format!(
+                "{} --ready-supervised {}",
+                quote(&format!("{dir}/twelve-dollar-benchmark")),
+                quote(&format!("{dir}/cancel"))
+            )),
+            setup.cancelled,
+        )?;
+    }
+    (run.monitor, run.target_unavailable) =
+        prepare_monitor(setup.cfg, setup.binary, setup.output, setup.cancelled);
+    let start_at = (Utc::now().timestamp_millis() + 5000).to_string();
+    start_monitor(
+        &mut run.monitor,
+        &mut run.target_unavailable,
+        &start_at,
+        setup.cancelled,
+    );
+    publish_remote_start(user, controls, &start_at, setup.cancelled)
+}
+
+fn publish_remote_start(
+    user: &str,
+    controls: &[(String, String)],
+    start_at: &str,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let publications = thread::scope(|scope| {
+        let handles = controls
+            .iter()
+            .map(|(ip, dir)| {
+                scope.spawn(move || {
+                    checked(
+                        ssh(user, ip).arg(format!(
+                            "{} --start-supervised {} {}",
+                            quote(&format!("{dir}/twelve-dollar-benchmark")),
+                            quote(&format!("{dir}/cancel")),
+                            quote(start_at)
+                        )),
+                        cancelled,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("start publication panicked".into()))
+            })
+            .collect::<Vec<_>>()
+    });
+    for publication in publications {
+        publication?;
+    }
+    Ok(())
+}
+
+struct RemoteWorkerSetup {
+    user: String,
+    ip: String,
+    output: PathBuf,
+    base_url: String,
+    destination_ports: String,
+    ramp: String,
+    duration: String,
+    sample_interval: f64,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn spawn_remote_workers(
+    setup: &WorkerSetup<'_>,
+    user: &str,
+    workers: Vec<Worker>,
+) -> Vec<thread::JoinHandle<Worker>> {
+    workers
+        .into_iter()
+        .zip(setup.ips)
+        .map(|(worker, ip)| {
+            let remote = RemoteWorkerSetup {
+                user: user.to_owned(),
+                ip: ip.to_string(),
+                output: setup.output.to_owned(),
+                base_url: setup.cfg.base_url.clone(),
+                destination_ports: setup.destination_ports.to_owned(),
+                ramp: setup.cfg.ramp_up.clone(),
+                duration: setup.cfg.duration.clone(),
+                sample_interval: setup.cfg.sample_interval.as_secs_f64(),
+                cancelled: Arc::clone(setup.cancelled),
+            };
+            thread::spawn(move || execute_remote_worker(worker, &remote))
+        })
+        .collect()
+}
+
+fn execute_remote_worker(mut worker: Worker, setup: &RemoteWorkerSetup) -> Worker {
+    let result = (|| -> Result<()> {
+        let remote_dir = worker
+            .remote_dir
+            .as_deref()
+            .ok_or("remote worker has no directory")?;
+        let dir = setup.output.join(&worker.name);
+        let assignments = [
+            format!("BASE_URL={}", setup.base_url),
+            format!("DESTINATION_PORTS={}", setup.destination_ports),
+            format!("VUS={}", worker.users),
+            format!("RAMP_UP={}", setup.ramp),
+            format!("DURATION={}", setup.duration),
+            format!("BENCH_USER_OFFSET={}", worker.user_offset),
+            "TOKENS=../tokens.json".into(),
+            "SUMMARY=summary.json".into(),
+            "BENCH_SAMPLES=samples.json".into(),
+            "BENCH_TELEMETRY=telemetry.jsonl".into(),
+            format!("BENCH_SAMPLE_INTERVAL={}", setup.sample_interval),
+            "SOURCE_IPS=".into(),
+        ];
+        let command = format!(
+            "cd {} || exit 2; trap '' HUP; exec env {} ../twelve-dollar-benchmark --supervise ../cancel",
+            quote(&format!("{remote_dir}/results")),
+            assignments
+                .iter()
+                .map(|value| quote(value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         let log = File::create(dir.join("output.log"))?;
-        (monitor, target_unavailable) = prepare_monitor(&cfg, &binary, &output, cancelled);
-        let start_at = (Utc::now().timestamp_millis() + 1000).to_string();
-        start_monitor(&mut monitor, &mut target_unavailable, &start_at, cancelled);
         let status = execute(
-            Command::new(&binary)
-                .current_dir(&dir)
-                .env("TOKENS", tokens)
-                .env("BASE_URL", &cfg.base_url)
-                .env("DESTINATION_PORTS", &destination_ports)
-                .env("VUS", users.to_string())
-                .env("RAMP_UP", &cfg.ramp_up)
-                .env("DURATION", &cfg.duration)
-                .env("SOURCE_IPS", &cfg.source_ips)
-                .env(
-                    "BENCH_SAMPLE_INTERVAL",
-                    cfg.sample_interval.as_secs_f64().to_string(),
-                )
-                .env("SUMMARY", dir.join("summary.json"))
-                .env("BENCH_SAMPLES", dir.join("samples.json"))
-                .env("BENCH_TELEMETRY", dir.join("telemetry.jsonl"))
-                .env("BENCH_USER_OFFSET", "0")
-                .env("BENCH_START_AT", start_at)
+            ssh(&setup.user, &setup.ip)
+                .arg(command)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log)),
-            cancelled,
-        );
-        let (exit_code, error) = match status {
-            Ok(status) => (
-                status.code(),
-                if matches!(status.code(), Some(0 | 1)) {
-                    None
-                } else {
-                    Some(format!("local execution failed: {status}"))
-                },
-            ),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        workers.push(Worker {
+            &setup.cancelled,
+        )?;
+        worker.exit_code = status.code();
+        if setup.cancelled.load(Ordering::Relaxed) || !matches!(worker.exit_code, Some(0 | 1)) {
+            let mut stop = ssh(&setup.user, &setup.ip);
+            stop.arg(format!(
+                "{} --stop-supervised {}",
+                quote(&format!("{remote_dir}/twelve-dollar-benchmark")),
+                quote(&format!("{remote_dir}/cancel"))
+            ));
+            checked(&mut stop, &AtomicBool::new(false))?;
+        }
+        let remote = destination(&setup.user, &setup.ip, remote_dir);
+        checked(
+            scp()
+                .arg("-r")
+                .arg("--")
+                .arg(format!("{remote}/results/."))
+                .arg(&dir),
+            &AtomicBool::new(false),
+        )?;
+        if !matches!(worker.exit_code, Some(0 | 1)) {
+            return Err(format!("remote execution failed: {status}").into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        worker.error = Some(error.to_string());
+    }
+    worker
+}
+
+fn run_local_worker(setup: &WorkerSetup<'_>) -> Result<WorkerRun> {
+    let dir = setup.output.join("local");
+    fs::create_dir(&dir)?;
+    let log = File::create(dir.join("output.log"))?;
+    let (mut monitor, mut target_unavailable) =
+        prepare_monitor(setup.cfg, setup.binary, setup.output, setup.cancelled);
+    let start_at = (Utc::now().timestamp_millis() + 1000).to_string();
+    start_monitor(
+        &mut monitor,
+        &mut target_unavailable,
+        &start_at,
+        setup.cancelled,
+    );
+    let status = execute(
+        Command::new(setup.binary)
+            .current_dir(&dir)
+            .env("TOKENS", setup.tokens)
+            .env("BASE_URL", &setup.cfg.base_url)
+            .env("DESTINATION_PORTS", setup.destination_ports)
+            .env("VUS", setup.users.to_string())
+            .env("RAMP_UP", &setup.cfg.ramp_up)
+            .env("DURATION", &setup.cfg.duration)
+            .env("SOURCE_IPS", &setup.cfg.source_ips)
+            .env(
+                "BENCH_SAMPLE_INTERVAL",
+                setup.cfg.sample_interval.as_secs_f64().to_string(),
+            )
+            .env("SUMMARY", dir.join("summary.json"))
+            .env("BENCH_SAMPLES", dir.join("samples.json"))
+            .env("BENCH_TELEMETRY", dir.join("telemetry.jsonl"))
+            .env("BENCH_USER_OFFSET", "0")
+            .env("BENCH_START_AT", start_at)
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log)),
+        setup.cancelled,
+    );
+    let (exit_code, error) = match status {
+        Ok(status) => (
+            status.code(),
+            if matches!(status.code(), Some(0 | 1)) {
+                None
+            } else {
+                Some(format!("local execution failed: {status}"))
+            },
+        ),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(WorkerRun {
+        monitor,
+        target_unavailable,
+        workers: vec![Worker {
             name: "local".into(),
-            users,
+            users: setup.users,
             user_offset: 0,
             remote_dir: None,
             exit_code,
             error,
-        });
-    }
-    let target_telemetry = match monitor.as_mut() {
+        }],
+    })
+}
+
+struct RunOutput<'a> {
+    cfg: &'a config::Config,
+    output: &'a Path,
+    workers: &'a mut [Worker],
+    monitor: Option<&'a mut TargetMonitor>,
+    target_unavailable: Option<String>,
+    cancelled: &'a AtomicBool,
+    targets: &'a [reqwest::Url],
+    source_ip_count: usize,
+}
+
+fn finish_run(run: RunOutput<'_>) -> Result<u8> {
+    let RunOutput {
+        cfg,
+        output,
+        workers,
+        monitor,
+        target_unavailable,
+        cancelled,
+        targets,
+        source_ip_count,
+    } = run;
+    let target_telemetry = match monitor {
         Some(monitor) => monitor.finish().unwrap_or_else(|error| {
             eprintln!("Target telemetry unavailable: {error}");
             json!({"unavailable_reason": error.to_string(), "shutdown_unconfirmed": true})
@@ -1482,7 +1696,7 @@ pub(super) fn run(args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
             json!({"unavailable_reason": target_unavailable.unwrap_or_else(|| "target observer unavailable".into())})
         }
     };
-    let mut aggregate = collect(&output, &mut workers);
+    let mut aggregate = collect(output, workers);
     aggregate["network_hosts"] =
         network_hosts(&aggregate["generator_telemetry"], &target_telemetry);
     aggregate["target_telemetry"] = target_telemetry;
@@ -1491,7 +1705,7 @@ pub(super) fn run(args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
         let start = serde_json::from_value(aggregate["hold_started_at"].clone())?;
         let finish = serde_json::from_value(aggregate["hold_finished_at"].clone())?;
         let mut requests_per_second = 0.0;
-        for worker in &workers {
+        for worker in workers.iter() {
             let summary = twelve_dollar_benchmark::telemetry::summarize_hold(
                 &output.join(&worker.name).join("telemetry.jsonl"),
                 start,
@@ -1659,15 +1873,17 @@ mod tests {
             raw[0].failed = 101;
             for _ in 0..101 {
                 raw[0].errors.record(example(
-                    "GET /feed",
-                    "/feed",
+                    super::super::errors::ErrorLocation {
+                        endpoint: "GET /feed",
+                        path: "/feed",
+                        user_index: worker.user_offset,
+                        destination: "http://fixture.test:3000",
+                        source_ip: Some("192.0.2.1".into()),
+                    },
                     Some(503),
                     "http",
                     "queue full",
                     Some(b"busy"),
-                    worker.user_offset,
-                    "http://fixture.test:3000",
-                    Some("192.0.2.1".into()),
                 ));
             }
             let mut aggregate = Samples {
@@ -1774,6 +1990,15 @@ mod tests {
         assert!(rendered.contains("- 2 distinct stored examples not shown."));
         assert!(rendered.contains("- 10 repeated stored examples omitted from display."));
         assert!(rendered.contains("- 3 additional examples omitted before storage."));
+    }
+
+    #[test]
+    fn report_renders_the_network_header_once_with_left_aligned_observers() {
+        let rendered = render_report(&json!({}), false);
+        let header =
+            "| Observer(s) | Interface | RX Mbit/s | TX Mbit/s | RX packets/s | TX packets/s |";
+        assert_eq!(rendered.matches(header).count(), 1);
+        assert!(rendered.contains("|---|---|---:|---:|---:|---:|"));
     }
 
     #[test]
