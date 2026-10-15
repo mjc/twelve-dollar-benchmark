@@ -10,6 +10,8 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -78,7 +80,7 @@ fn find_score(
 fn trial_args(args: &[String], users: usize, stage: Stage, output: &Path) -> Vec<String> {
     let mut result: Vec<_> = args
         .iter()
-        .filter(|arg| *arg != "--score")
+        .filter(|arg| *arg != "--score" && *arg != "--skip-warmup")
         .cloned()
         .collect();
     result.extend([
@@ -123,6 +125,26 @@ struct Workflow {
     trials: Vec<Trial>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+impl Workflow {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            completed: false,
+            score: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            current: None,
+            protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users,
+            "maximum_search_users": cfg.max_users,
+            "search_step_users": cfg.step_users,
+            "cooldown_s": 60, "warmup_skipped": cfg.skip_warmup,
+            "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
+            "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
+            trials: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 fn save_state(root: &Path, state: &Workflow) -> Result<()> {
@@ -224,6 +246,18 @@ fn run_trial(
     if cancelled.load(Ordering::Relaxed) {
         return Err("scoring interrupted".into());
     }
+    if stage != Stage::Warmup {
+        workflow.current = None;
+        save_state(root, workflow)?;
+        println!("Cooling down for 60 seconds at zero load before the next trial.");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("scoring interrupted during cooldown".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
     let index = workflow.trials.len() + 1;
     let directory = root
         .join("trials")
@@ -265,20 +299,7 @@ fn run_trial(
 pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
     let root = create_run_dir(cfg)?;
     println!("Scoring results: {}", root.display());
-    let mut state = Workflow {
-        completed: false,
-        score: None,
-        started_at: Utc::now(),
-        finished_at: None,
-        current: None,
-        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users,
-            "maximum_search_users": cfg.max_users,
-            "search_step_users": cfg.step_users,
-            "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
-            "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
-        trials: Vec::new(),
-        error: None,
-    };
+    let mut state = Workflow::new(cfg);
     save_state(&root, &state)?;
     let mut confirmed = None;
     let mut last = None;
@@ -287,6 +308,13 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) ->
         cfg.max_users,
         cfg.step_users,
         |stage, users| {
+            if stage == Stage::Warmup && cfg.skip_warmup {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("scoring interrupted".into());
+                }
+                println!("Reusing the warm-up already completed in this session.");
+                return Ok(true);
+            }
             let (report, passed, directory) =
                 run_trial(&root, cfg, args, cancelled, &mut state, stage, users)?;
             if stage == Stage::Confirm && passed {

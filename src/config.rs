@@ -28,6 +28,7 @@ pub(super) struct Config {
     pub sample_interval: Duration,
     pub help: bool,
     pub score: bool,
+    pub skip_warmup: bool,
 }
 
 pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options]
@@ -38,6 +39,7 @@ pub(super) const HELP: &str = "Usage: run.sh [IP PORTS] [options]
   --monitor-user USER       Monitor the target over SSH while generating locally
   --users N                 Fixed-load run at N users; disables auto scoring
   --score                   Warm up, find the limit, confirm a five-minute score
+  --skip-warmup             Reuse a warm-up completed earlier in this session
   --start-users N           First search load (2500); positive multiple of 250
   --step-users N            Search increment (default: double)
                             Positive multiple of 250
@@ -70,6 +72,7 @@ unscored warm-up; one-minute searches from --start-users (2500), doubling or
 using --step-users, then narrowing to 250-user steps; and a separate five-minute
 confirmation, stepping down 250 users on failure. --score explicitly selects
 this workflow. --duration applies to fixed-load runs.
+Trials drain completely, then pause for one minute before the next trial.
 ";
 
 pub(super) use twelve_dollar_benchmark::{
@@ -218,6 +221,7 @@ fn defaults(lookup: &impl Fn(&str) -> Option<String>) -> Result<(Config, Overrid
             sample_interval: interval(&default("BENCH_SAMPLE_INTERVAL", "1"))?,
             help: false,
             score: false,
+            skip_warmup: false,
         },
         Overrides {
             users,
@@ -260,6 +264,12 @@ fn parse_options(
                     return Err("--score takes no value".into());
                 }
                 overrides.explicit_score = true;
+            }
+            Long("skip-warmup") => {
+                if parser.optional_value().is_some() {
+                    return Err("--skip-warmup takes no value".into());
+                }
+                config.skip_warmup = true;
             }
             Value(value) => {
                 let value = value

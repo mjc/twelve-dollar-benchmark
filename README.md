@@ -31,7 +31,9 @@ and doubles until a run fails or reaches `--max-users` (300,000 by default),
 then narrows the passing/failing bracket to 250 users. Search runs hold for one
 minute. A separate five-minute run confirms the result; if it fails, the runner
 steps down by 250 users and tries again. Each run also includes the configured
-ramp-up, 30-second ramp-down, and drain. A full search
+ramp-up, 30-second ramp-down, and drain, followed by a one-minute pause at
+zero load before the next trial. Use `--skip-warmup` only when a warm-up has
+already completed in the same session. A full search
 can take hours. Progress and every trial's reports are saved as the search runs.
 
 If the search ceiling passes confirmation, the result is a lower bound: the
@@ -53,6 +55,7 @@ a confirmed score.
 | `--user USER` | unset | Copy the release and tokens to each host and run over SSH |
 | `--monitor-user USER` | `--user` or unset | SSH to the target for monitoring while generators run locally |
 | `--users N` | unset (scoring workflow) | Fixed total concurrent users across all generators |
+| `--skip-warmup` | off | Reuse a warm-up completed earlier in this session |
 | `--score` | enabled when neither `--users` nor `VUS` is set | Find and confirm a score |
 | `--start-users N` | `2500` | First search load; positive multiple of 250 |
 | `--step-users N` | doubling | Fixed search increment; positive multiple of 250 |
