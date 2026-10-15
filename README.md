@@ -67,9 +67,8 @@ Ramp-down lasts 30 seconds. `--help` lists all options.
 Legacy `BASE_URL`, `DESTINATION_PORTS`, `VUS`, `RAMP_UP`, `DURATION`, `TOKENS`,
 and `SOURCE_IPS` provide defaults; explicit arguments take precedence. If you
 omit both target positionals, the default target is
-`http://127.0.0.1:3000`. Relative `TOKENS`, `SUMMARY`, and output paths resolve
-from the directory where you invoked the runner. `SUMMARY` requests an
-additional copy of the aggregate report.
+`http://127.0.0.1:3000`. `SUMMARY` requests an additional copy of the aggregate
+report.
 
 The port positional accepts a single port, a list such as `3100,3101,3102`, or an
 inclusive range such as `3100-3104`. `--destination-ports` accepts the same forms.
@@ -101,9 +100,7 @@ evenly with distinct token offsets and must be at least the host count. Remote
 generators use their OS's source-address selection. Their global user offsets
 spread users across destination ports while preserving the total user count.
 
-Target monitoring uses `--monitor-user` when set, otherwise it reuses `--user`.
-Set `--monitor-user` to monitor a remote target over SSH while running generators
-locally. Without SSH, monitoring works for a loopback target. The runner detects
+Without SSH, monitoring works for a loopback target. The runner detects
 accessible application processes listening on all supplied destination ports.
 It also looks for common proxy processes and their observed local TCP backends.
 PID options are optional overrides. Use them for custom proxies, remote or Unix

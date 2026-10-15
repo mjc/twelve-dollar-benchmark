@@ -33,7 +33,9 @@ fn main() -> ExitCode {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("Usage: twelve-dollar-observer --observe CONTROL");
+        println!(
+            "Usage: twelve-dollar-observer --observe CONTROL\nSample target process, network, and service resources."
+        );
         return ExitCode::SUCCESS;
     }
     let result = (|| {

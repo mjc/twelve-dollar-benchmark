@@ -13,6 +13,7 @@ path = "src/observer.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hyper-util = { version = "=0.1.21", features = ["client-legacy"] }
 libc = "0.2"
+lexopt = "0.3.2"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
 serde = { version = "1", features = ["derive"] }

@@ -5,7 +5,7 @@ export BENCH_CALLER_DIR="$PWD"
 bench_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$bench_dir"
 
-usage() { echo "Usage: $0 [IP PORTS] [options]; use --help for options" >&2; exit 2; }
+usage() { echo "Usage: $0 [IP PORTS] [OPTIONS]. Run '$0 --help' to list options." >&2; exit 2; }
 
 validate_ports() {
   local value=$1 item start end
