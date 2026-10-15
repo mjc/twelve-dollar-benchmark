@@ -41,6 +41,12 @@ impl ErrorExample {
 }
 
 impl ErrorDetails {
+    #[cfg(test)]
+    pub fn record(&mut self, example: ErrorExample) {
+        self.increment_counts(example.status_code, &example.kind);
+        self.retain(example);
+    }
+
     pub fn record_lazy(
         &mut self,
         status_code: Option<u16>,
@@ -237,5 +243,123 @@ fn sanitize_path(value: &str) -> (String, bool) {
     match value.split_once('?') {
         Some((path, _)) => (path.to_owned(), true),
         None => (value.to_owned(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(kind: &str, status: Option<u16>) -> ErrorExample {
+        example(
+            ErrorLocation {
+                endpoint: "GET /feed",
+                path: "/a?token=x",
+                user_index: 4,
+                destination: "http://user:secret@example.test:3000?q=token",
+                source_ip: None,
+            },
+            status,
+            kind,
+            "é".repeat(600),
+            Some("x".repeat(1500).as_bytes()),
+        )
+    }
+
+    #[test]
+    fn bounds_text_counts_examples_and_merge_omissions() {
+        let mut details = ErrorDetails::default();
+        for _ in 0..101 {
+            details.record(sample("http", Some(503)));
+        }
+        assert_eq!(details.counts["kind:http"], 101);
+        assert_eq!(details.counts["status:503"], 101);
+        assert_eq!(details.examples.len(), 100);
+        assert_eq!(details.omitted, 1);
+        assert!(details.examples[0].reason.len() <= MAX_REASON_BYTES);
+        assert!(details.examples[0].body_excerpt.as_ref().unwrap().len() <= MAX_BODY_BYTES);
+        assert!(details.examples[0].body_truncated);
+        assert_eq!(details.examples[0].path, "/a");
+        assert_eq!(details.examples[0].destination, "http://example.test:3000/");
+        let serialized = serde_json::to_string(&details.examples[0]).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("token=x"));
+
+        let mut merged = ErrorDetails::default();
+        merged.merge(&details);
+        merged.merge(&details);
+        assert_eq!(merged.counts["status:503"], 202);
+        assert_eq!(merged.examples.len(), 100);
+        assert_eq!(merged.omitted, 102);
+    }
+
+    #[test]
+    fn full_example_buffer_counts_without_constructing_an_example() {
+        let mut details = ErrorDetails::default();
+        for _ in 0..MAX_ERROR_EXAMPLES {
+            details.record_lazy(Some(503), "http", || sample("http", Some(503)));
+        }
+
+        let mut constructed = false;
+        details.record_lazy(Some(503), "http", || {
+            constructed = true;
+            sample("http", Some(503))
+        });
+
+        assert!(!constructed);
+        assert_eq!(details.counts["kind:http"], MAX_ERROR_EXAMPLES + 1);
+        assert_eq!(details.counts["status:503"], MAX_ERROR_EXAMPLES + 1);
+        assert_eq!(details.omitted, 1);
+    }
+
+    #[test]
+    fn truncation_keeps_utf8_boundaries() {
+        let (value, clipped) = truncate(&"🦀".repeat(300), MAX_REASON_BYTES);
+        assert!(clipped);
+        assert!(value.len() <= MAX_REASON_BYTES);
+        assert!(value.is_char_boundary(value.len()));
+    }
+
+    #[test]
+    fn error_chains_redact_url_credentials_and_queries() {
+        #[derive(Debug)]
+        struct TestError(&'static str);
+        impl std::fmt::Display for TestError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+        impl std::error::Error for TestError {}
+
+        let message = error_chain(&TestError(
+            "failed at http://user:secret@example.test/a?token=x",
+        ));
+        assert_eq!(message, "failed at http://example.test/a");
+    }
+
+    #[test]
+    fn url_redaction_handles_ipv6_parentheses_and_malformed_urls() {
+        for (value, expected) in [
+            (
+                "http://user:secret@[2001:db8::1]/p?token=x",
+                "http://[2001:db8::1]/p",
+            ),
+            (
+                "https://user)secret@example.test/path?key=value",
+                "https://example.test/path",
+            ),
+        ] {
+            let message = sanitize_message_urls(value);
+            assert_eq!(message, expected);
+            assert!(!message.contains("secret"));
+            assert!(!message.contains("token=x"));
+            assert!(!message.contains("key=value"));
+        }
+
+        let malformed = "http://user:secret@[2001:db8::1?token=x";
+        let sanitized = sanitize_message_urls(malformed);
+        assert_eq!(sanitized, "http://[2001:db8::1");
+        assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("token=x"));
     }
 }

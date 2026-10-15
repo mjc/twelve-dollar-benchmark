@@ -683,3 +683,177 @@ fn build_report(
     });
     samples::report(samples, elapsed, runtime_count, completed, report)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::samples::{aggregate_samples, passes};
+    #[test]
+    fn thresholds_are_strict_empty_runs_fail_and_runtime_errors_fail() {
+        let mut s = Samples::default();
+        assert!(!passes(&s.summary(), 0));
+        s.latency_ms = vec![10.0; 100];
+        s.failed = 1;
+        assert!(!passes(&s.summary(), 0)); // exactly one percent fails
+        s.latency_ms.push(10.0);
+        assert!(passes(&s.summary(), 0));
+        s.failed = 0;
+        let mut summary = s.summary();
+        summary.latency.p95 = Some(500.0);
+        assert!(!passes(&summary, 0));
+        summary.latency.p95 = Some(499.0);
+        summary.latency.p99 = Some(1000.0);
+        assert!(!passes(&summary, 0));
+        summary.latency.p99 = Some(999.0);
+        assert!(!passes(&summary, 1));
+        assert!(passes(&summary, 0));
+    }
+
+    #[test]
+    fn aggregate_reuses_largest_endpoint_buffer_after_raw_samples_are_serialized() {
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[2].latency_ms = vec![9.0, 1.0, 5.0];
+        let raw = serde_json::to_value(&samples).unwrap();
+        let original_buffer = samples[2].latency_ms.as_ptr();
+
+        let mut aggregate = aggregate_samples(&mut samples);
+        let summary = aggregate.summary();
+
+        assert_eq!(raw[2]["latency_ms"], serde_json::json!([9.0, 1.0, 5.0]));
+        assert_eq!(aggregate.latency_ms.as_ptr(), original_buffer);
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.latency.median, Some(5.0));
+        assert!(samples.iter().all(|sample| sample.latency_ms.is_empty()));
+    }
+
+    #[test]
+    fn raw_sample_artifacts_survive_aggregation_and_connection_reporting() {
+        let directory = env::temp_dir().join(format!("benchmark-samples-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let samples_path = directory.join("samples.json");
+        let connections_path = directory.join("connection-samples.json");
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[0].latency_ms = vec![3.0, 1.0];
+        let connections = connections::Connections {
+            successful_ms: vec![2.0],
+            failed_ms: vec![4.0],
+            ..Default::default()
+        };
+
+        write_sample_artifacts(&samples, &connections, &samples_path, &connections_path).unwrap();
+        let mut aggregate = aggregate_samples(&mut samples);
+        let _ = aggregate.summary();
+        let report = connections.report(Some(1.0));
+
+        let raw: [Samples; 4] =
+            serde_json::from_reader(fs::File::open(&samples_path).unwrap()).unwrap();
+        let raw_connections: connections::Connections =
+            serde_json::from_reader(fs::File::open(&connections_path).unwrap()).unwrap();
+        assert_eq!(raw[0].latency_ms, [3.0, 1.0]);
+        assert_eq!(raw_connections.successful_ms, [2.0]);
+        assert_eq!(raw_connections.failed_ms, [4.0]);
+        assert_eq!(report["setup_duration_ms"]["samples"], 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scheduled_start_rejects_overflow_and_missed_deadlines() {
+        assert!(scheduled_start_delay(i64::MIN, 0).is_err());
+        assert!(scheduled_start_delay(749, 1_000).is_err());
+        assert_eq!(
+            scheduled_start_delay(1_001, 1_000).unwrap(),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(scheduled_start_delay(1_000, 1_000).unwrap(), None);
+    }
+
+    #[test]
+    fn stop_flags_use_local_indices_for_a_launched_prefix() {
+        let flags: Arc<[AtomicBool]> = (0..5)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+        let launched = 3;
+        let local_index = 2;
+        let global_index = global_user_index(700, local_index).unwrap();
+        stop_one(&flags, local_index);
+
+        assert_eq!(launched, 3);
+        assert_eq!(global_index, 702);
+        assert!(flags[local_index].load(Ordering::Relaxed));
+        assert!(!flags[3].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stop_all_sets_every_flag() {
+        let flags: Arc<[AtomicBool]> = (0..4)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+
+        stop_all(&flags);
+
+        assert!(flags.iter().all(|flag| flag.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn three_users_ramp_down_highest_local_user_first() {
+        let hold_end = Instant::now();
+        for (step, local_index, seconds) in [(1, 2, 10), (2, 1, 20), (3, 0, 30)] {
+            let deadline = ramp_down_deadline(hold_end, step, 3).unwrap();
+            assert_eq!(
+                deadline.duration_since(hold_end),
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(3 - step, local_index);
+        }
+    }
+
+    #[tokio::test]
+    async fn grace_cancel_drops_active_sample_and_keeps_completed_samples() {
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let soft_stop = Arc::new(AtomicBool::new(false));
+        let task_samples = samples.clone();
+        let task_stop = soft_stop.clone();
+        let mut tasks = JoinSet::new();
+        let abort = tasks.spawn(async move {
+            task_samples.lock().unwrap().push(1);
+            if !task_stop.load(Ordering::Relaxed) {
+                let response = std::future::pending::<Option<usize>>().await;
+                if let Some(sample) = response {
+                    task_samples.lock().unwrap().push(sample);
+                }
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(*samples.lock().unwrap(), [1]);
+        soft_stop.store(true, Ordering::Relaxed);
+        abort.abort();
+        let result = tasks.join_next().await.unwrap();
+
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(*samples.lock().unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn ramp_scheduler_spreads_thousands_of_launch_slots_over_the_interval() {
+        let ramp = Duration::from_secs(1);
+        assert_eq!(ramp_offset(0, 5000, ramp), Duration::ZERO);
+        assert_eq!(ramp_offset(4999, 5000, ramp), ramp);
+        assert!(ramp_offset(2500, 5000, ramp) > Duration::from_millis(499));
+        assert_eq!(ramp_offset(0, usize::MAX, Duration::ZERO), Duration::ZERO);
+        assert_eq!(global_user_index(usize::MAX, 0), Some(usize::MAX));
+        assert_eq!(global_user_index(usize::MAX, 1), None);
+        let start = Instant::now();
+        for user in 0..5000 {
+            wait_ramp_slot(start + ramp_offset(user, 5000, Duration::from_millis(50))).await;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(45),
+            "ramp elapsed only {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "ramp took {elapsed:?}");
+    }
+}

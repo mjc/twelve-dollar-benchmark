@@ -303,3 +303,152 @@ pub(super) fn finish_run(
     }
     Ok(u8::from(aggregate["passed"] != true))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::example;
+    use std::path::PathBuf;
+    fn fixture(name: &str, samples: Vec<f64>, offset: i64) -> (PathBuf, Worker) {
+        let dir = env::temp_dir().join(format!(
+            "twelve-dollar-benchmark-aggregate-{name}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join(name)).unwrap();
+        let mut raw: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        raw[0].latency_ms = samples;
+        let summary = raw[0].summary();
+        let start = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::TimeDelta::seconds(offset);
+        fs::write(
+            dir.join(name).join("summary.json"),
+            json!({
+                "maximum_users": 1, "total_users": 1,
+                "started_at": start, "finished_at": start + chrono::TimeDelta::seconds(10),
+                "hold_started_at": start, "hold_finished_at": start + chrono::TimeDelta::seconds(5),
+                "planned_hold_s": 5, "hosts": ["http://127.0.0.1:3000"], "source_ips": [],
+                "runtime_errors": 0, "completed": true, "aggregate": summary,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        serde_json::to_writer(
+            File::create(dir.join(name).join("samples.json")).unwrap(),
+            &raw,
+        )
+        .unwrap();
+        (
+            dir,
+            Worker {
+                name: name.into(),
+                users: 1,
+                user_offset: 0,
+                remote_dir: Some("/tmp/fixture".into()),
+                exit_code: Some(1),
+                error: None,
+            },
+        )
+    }
+
+    #[test]
+    fn combined_percentiles_weight_samples_and_require_overlapping_hold() {
+        let (dir, a) = fixture("weighted-a", vec![10.0; 99], 0);
+        let (other, b) = fixture("weighted-b", vec![1000.0], 0);
+        fs::rename(other.join(&b.name), dir.join(&b.name)).unwrap();
+        let mut workers = vec![a, b];
+        let result = collect(&dir, &mut workers);
+        assert_eq!(result["passed"], true); // the slow host's own p99 fails, combined p99 passes
+        assert!((result["aggregate"]["p99_ms"].as_f64().unwrap() - 19.9).abs() < 1e-9);
+        assert_eq!(result["aggregate"]["requests"], 100);
+        assert_eq!(result["duration_s"], 10.0);
+        assert_eq!(result["common_hold_s"], 5.0);
+        let (late, c) = fixture("weighted-c", vec![10.0], 20);
+        fs::rename(late.join(&c.name), dir.join(&c.name)).unwrap();
+        workers.push(c);
+        let result = collect(&dir, &mut workers);
+        assert_eq!(result["passed"], false);
+        assert_eq!(result["completed"], false);
+        assert_eq!(result["duration_s"], 30.0);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir(other).unwrap();
+        fs::remove_dir(late).unwrap();
+    }
+
+    #[test]
+    fn missing_or_inconsistent_worker_data_cannot_pass() {
+        let (dir, mut worker) = fixture("invalid", vec![10.0], 0);
+        worker.users = 2;
+        let result = collect(&dir, std::slice::from_mut(&mut worker));
+        assert_eq!(result["passed"], false);
+        assert!(worker.error.is_some());
+        worker.users = 1;
+        worker.error = None;
+        fs::remove_file(dir.join(&worker.name).join("samples.json")).unwrap();
+        let result = collect(&dir, std::slice::from_mut(&mut worker));
+        assert_eq!(result["completed"], false);
+        assert!(worker.error.is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_error_details_merge_counts_and_keep_bounded_host_attribution() {
+        let (dir, first) = fixture("errors-a", vec![10.0], 0);
+        let (other, second) = fixture("errors-b", vec![11.0], 0);
+        fs::rename(other.join(&second.name), dir.join(&second.name)).unwrap();
+        for worker in [&first, &second] {
+            let path = dir.join(&worker.name).join("samples.json");
+            let mut raw: [Samples; 4] =
+                serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+            raw[0].latency_ms = vec![10.0; 101];
+            raw[0].failed = 101;
+            for _ in 0..101 {
+                raw[0].errors.record(example(
+                    crate::errors::ErrorLocation {
+                        endpoint: "GET /feed",
+                        path: "/feed",
+                        user_index: worker.user_offset,
+                        destination: "http://fixture.test:3000",
+                        source_ip: Some("192.0.2.1".into()),
+                    },
+                    Some(503),
+                    "http",
+                    "queue full",
+                    Some(b"busy"),
+                ));
+            }
+            let mut aggregate = Samples {
+                latency_ms: vec![10.0; 101],
+                failed: 101,
+                ..Samples::default()
+            };
+            aggregate.errors.merge(&raw[0].errors);
+            let summary_path = dir.join(&worker.name).join("summary.json");
+            let mut summary: Value =
+                serde_json::from_reader(File::open(&summary_path).unwrap()).unwrap();
+            summary["aggregate"] = serde_json::to_value(aggregate.summary()).unwrap();
+            serde_json::to_writer(File::create(summary_path).unwrap(), &summary).unwrap();
+            serde_json::to_writer(File::create(path).unwrap(), &raw).unwrap();
+        }
+
+        let mut workers = vec![first, second];
+        let result = collect(&dir, &mut workers);
+        let errors = &result["endpoints"]["GET /feed"]["errors"];
+        assert_eq!(errors["counts"]["kind:http"], 202);
+        assert_eq!(errors["counts"]["status:503"], 202);
+        assert_eq!(errors["examples"].as_array().unwrap().len(), 100);
+        assert_eq!(errors["omitted"], 102);
+        assert_eq!(result["aggregate"]["errors"]["counts"]["status:503"], 202);
+        assert!(
+            errors["examples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["worker"].is_string())
+        );
+        assert_eq!(result["aggregate"]["failed"], 202);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+}

@@ -98,3 +98,43 @@ pub fn stop_supervised(control: &Path) -> Result<u8> {
     }
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "twelve-dollar-benchmark-control-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&dir).unwrap();
+        (dir.clone(), dir.join("metrics"))
+    }
+
+    #[test]
+    fn observer_lease_refresh_is_rejected_after_shutdown_or_cancel() {
+        let (dir, control) = fixture();
+        fs::write(control.with_extension("done"), "stopped\n").unwrap();
+        assert!(refresh_observer(&control).is_err());
+        assert!(!control.with_extension("lease").exists());
+        fs::remove_file(control.with_extension("done")).unwrap();
+        fs::write(&control, "cancel\n").unwrap();
+        assert!(refresh_observer(&control).is_err());
+        assert!(!control.with_extension("lease").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn observer_lease_refresh_writes_while_running() {
+        let (dir, control) = fixture();
+        assert_eq!(refresh_observer(&control).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(control.with_extension("lease")).unwrap(),
+            "alive\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

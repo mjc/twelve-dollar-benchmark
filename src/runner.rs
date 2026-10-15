@@ -449,3 +449,14 @@ fn run_local_worker(setup: &WorkerSetup<'_>) -> Result<WorkerRun> {
         }],
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn total_users_split_evenly_with_disjoint_token_offsets() {
+        assert_eq!(split_users(10, 3).unwrap(), [(4, 0), (3, 4), (3, 7)]);
+        assert!(split_users(2, 3).is_err());
+        assert!(split_users(100, 0).is_err());
+    }
+}

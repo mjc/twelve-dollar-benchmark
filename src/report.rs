@@ -506,3 +506,88 @@ fn render_omitted_errors(text: &mut String, value: &Value) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_error_examples_include_each_worker_before_filling_the_limit() {
+        let repeated = |worker: &str, reason: &str| {
+            (0..6)
+                .map(|_| {
+                    json!({
+                        "worker": worker,
+                        "endpoint": "GET /feed",
+                        "path": "/feed",
+                        "kind": "http",
+                        "reason": reason,
+                        "body_excerpt": "busy",
+                        "status_code": 503
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut examples = repeated("host-one", "first host repeated reason");
+        examples.extend(repeated("host-two", "second host repeated reason"));
+        for reason in [
+            "first host unique C",
+            "first host unique D",
+            "first host unique E",
+            "first host unique F",
+            "first host unique G",
+        ] {
+            examples.push(json!({
+                "worker": "host-one",
+                "endpoint": "GET /feed",
+                "path": "/feed",
+                "kind": "http",
+                "reason": reason,
+                "body_excerpt": "busy",
+                "status_code": 503
+            }));
+        }
+        let report = json!({
+            "endpoints": {
+                "GET /feed": {
+                    "errors": {
+                        "counts": {"kind:http": 17, "status:503": 17},
+                        "examples": examples,
+                        "omitted": 3
+                    }
+                }
+            }
+        });
+
+        let rendered = render_report(&report, false);
+
+        assert!(rendered.contains("| Error type | Count |"));
+        assert!(rendered.contains("| http | 17 |"));
+        assert!(rendered.contains("| HTTP status | Count |"));
+        assert!(rendered.contains("| 503 | 17 |"));
+        assert!(rendered.contains("host-one: GET /feed /feed"));
+        assert!(rendered.contains("host-two: GET /feed /feed"));
+        assert!(rendered.contains("first host repeated reason"));
+        assert!(rendered.contains("second host repeated reason"));
+        assert!(rendered.contains("first host unique C"));
+        let first = rendered.find("first host repeated reason").unwrap();
+        let second = rendered.find("second host repeated reason").unwrap();
+        let third = rendered.find("first host unique C").unwrap();
+        let fourth = rendered.find("first host unique D").unwrap();
+        let fifth = rendered.find("first host unique E").unwrap();
+        assert!(first < second && second < third && third < fourth && fourth < fifth);
+        assert!(rendered.contains("Examples:\n\n- host-one:"));
+        assert!(!rendered.contains("first host unique F"));
+        assert!(rendered.contains("- 2 distinct stored examples not shown."));
+        assert!(rendered.contains("- 10 repeated stored examples omitted from display."));
+        assert!(rendered.contains("- 3 additional examples omitted before storage."));
+    }
+
+    #[test]
+    fn report_renders_the_network_header_once_with_left_aligned_observers() {
+        let rendered = render_report(&json!({}), false);
+        let header = "| Observer(s) | Interface | RX MB/s | TX MB/s | RX packets/s (pps) | TX packets/s (pps) |";
+        assert_eq!(rendered.matches(header).count(), 1);
+        assert!(rendered.contains("|---|---|---:|---:|---:|---:|"));
+    }
+}

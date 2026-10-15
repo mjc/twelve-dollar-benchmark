@@ -29,6 +29,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 url = "2.5"
 
+[dev-dependencies]
+flate2 = "1"
+
 [patch.crates-io]
 hyper = { path = "vendor/hyper" }
 hyper-util = { path = "vendor/hyper-util" }

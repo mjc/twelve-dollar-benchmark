@@ -185,7 +185,7 @@ impl HeaderCaseMap {
         Self(HeaderMap::default())
     }
 
-    #[cfg(feature = "ffi")]
+    #[cfg(any(test, feature = "ffi"))]
     pub(crate) fn insert(&mut self, name: HeaderName, orig: Bytes) {
         self.0.insert(name, orig);
     }

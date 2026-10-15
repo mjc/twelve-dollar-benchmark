@@ -38,3 +38,62 @@ pub(super) fn index(user: usize, sources: usize, destinations: usize) -> usize {
     let phase = (user / sources / (destinations / gcd)) % gcd;
     (user % destinations + phase) % destinations
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn balances_every_source_destination_pair_without_moving_sleeping_users() {
+        for (sources, ports) in [(1, 3), (3, 1), (3, 4)] {
+            let mut counts = vec![vec![0; ports]; sources];
+            for user in 0..sources * ports * 2 {
+                counts[user % sources][index(user, sources, ports)] += 1;
+            }
+            assert!(counts.into_iter().flatten().all(|count| count == 2));
+        }
+        for sources in 1..=7 {
+            for ports in 1..=7 {
+                let mut source_counts = vec![0usize; sources];
+                let mut port_counts = vec![0usize; ports];
+                for user in 0..sources * ports * 2 {
+                    source_counts[user % sources] += 1;
+                    port_counts[index(user, sources, ports)] += 1;
+                    assert!(
+                        source_counts.iter().max().unwrap() - source_counts.iter().min().unwrap()
+                            <= 1
+                    );
+                    assert!(
+                        port_counts.iter().max().unwrap() - port_counts.iter().min().unwrap() <= 1
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            (0..5).map(|user| index(user, 0, 3)).collect::<Vec<_>>(),
+            [0, 1, 2, 0, 1]
+        );
+        // Remote workers retain disjoint global offsets, avoiding restarting the
+        // destination cycle on every generator.
+        assert_eq!(
+            (2..5).map(|user| index(user, 0, 3)).collect::<Vec<_>>(),
+            [2, 0, 1]
+        );
+    }
+    #[test]
+    fn destination_urls_preserve_scheme_ipv6_and_default_ports() {
+        let targets = urls("http://[::1]/base?x=1", &[80, 8080]).unwrap();
+        assert_eq!(targets[0].as_str(), "http://[::1]/base?x=1");
+        assert_eq!(targets[1].as_str(), "http://[::1]:8080/base?x=1");
+        assert_eq!(
+            urls("http://127.0.0.1:3100", &[]).unwrap()[0].port(),
+            Some(3100)
+        );
+        assert!(urls("ftp://localhost", &[3100]).is_err());
+        assert!(
+            urls("https://localhost", &[443])
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS/TLS")
+        );
+    }
+}

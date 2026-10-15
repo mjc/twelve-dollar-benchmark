@@ -514,6 +514,11 @@ pub(super) fn limits() -> Value {
     Value::Object(values)
 }
 
+#[cfg(test)]
+pub(super) fn listener_pids(port: u16) -> Result<Vec<u32>> {
+    listener_pids_for_ports(&[port])
+}
+
 pub(super) fn listener_pids_for_ports(ports: &[u16]) -> Result<Vec<u32>> {
     let ports: BTreeSet<_> = ports.iter().copied().collect();
     let mut inodes = BTreeSet::new();
