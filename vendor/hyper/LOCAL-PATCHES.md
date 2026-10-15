@@ -21,6 +21,12 @@ the initial reserve: existing `max_buf_size` enforcement is unchanged, and no
 new cap is imposed on retained capacity. The read buffer sizing is unchanged by
 this write-side allocation change.
 
+The client builder also exposes `read_buf_chunk_size`, which limits each socket
+read without reducing the maximum header buffer size. The generator selects
+1,024-byte chunks. After parsing headers, an oversized buffer is replaced with
+a chunk-sized buffer when the remaining bytes fit. Adaptive and exact-size
+read modes keep their existing behavior.
+
 With `writev(false)`, HTTP/1 queues the body's existing buffers and writes each
 contiguous chunk with ordinary `poll_write` calls. It avoids copying response
 bodies into a connection's retained header buffer. Partial writes and pending

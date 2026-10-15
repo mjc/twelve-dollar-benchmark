@@ -116,6 +116,11 @@ where
         self.io.set_read_buf_exact_size(sz);
     }
 
+    #[cfg(feature = "client")]
+    pub(crate) fn set_read_buf_chunk_size(&mut self, sz: usize, max: usize) {
+        self.io.set_read_buf_chunk_size(sz, max);
+    }
+
     pub(crate) fn set_h1_parser_config(&mut self, parser_config: ParserConfig) {
         self.state.h1_parser_config = parser_config;
     }

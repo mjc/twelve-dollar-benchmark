@@ -5,7 +5,7 @@ export BENCH_CALLER_DIR="$PWD"
 bench_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$bench_dir"
 
-usage() { echo "Usage: $0 [IP PORTS] [options] [-- Goose diagnostics]; use --help for options" >&2; exit 2; }
+usage() { echo "Usage: $0 [IP PORTS] [OPTIONS]. Run '$0 --help' to list options." >&2; exit 2; }
 
 validate_ports() {
   local value=$1 item start end
@@ -32,7 +32,7 @@ validate_ports() {
   done
 }
 
-# Keep BASE_URL and Goose flags available, or accept an explicit target IP/port.
+# Keep BASE_URL defaults available, or accept an explicit target IP/port.
 if [[ $# -gt 0 && $1 != -* ]]; then
   if [[ $# -lt 2 ]] || ! validate_ports "$2"; then
     usage
@@ -72,7 +72,7 @@ fi
 if [[ -n ${SUMMARY:-} && $SUMMARY != /* ]]; then
   export SUMMARY="$BENCH_CALLER_DIR/$SUMMARY"
 elif [[ -z ${SUMMARY:-} ]]; then
-  export SUMMARY="$BENCH_CALLER_DIR/results/goose-summary.json"
+  export SUMMARY="$BENCH_CALLER_DIR/results/summary.json"
 fi
 
 # Give the launcher and its local generator a useful descriptor floor. This
@@ -88,6 +88,47 @@ if [[ $soft_nofile != unlimited ]] && (( soft_nofile < descriptor_floor )); then
       ulimit -S -n "$hard_nofile"
     fi
     echo "Generator descriptor limit capped at hard limit $hard_nofile; increase it to reach $descriptor_floor" >&2
+  fi
+fi
+
+# Host tuning is unnecessary for help/version requests and must never lower a
+# larger conntrack table setting.
+skip_conntrack_tuning=0
+for arg in "$@"; do
+  if [[ $arg == --help || $arg == --help=* || $arg == -h || $arg == --version || $arg == -V ]]; then
+    skip_conntrack_tuning=1
+    break
+  fi
+done
+
+conntrack_max=/proc/sys/net/netfilter/nf_conntrack_max
+if (( ! skip_conntrack_tuning )) && [[ -r $conntrack_max ]]; then
+  effective_nofile=$(ulimit -Sn)
+  if [[ $effective_nofile == unlimited ]]; then
+    effective_nofile=$(< /proc/sys/fs/nr_open)
+  fi
+  current_conntrack_max=$(< "$conntrack_max")
+  if (( current_conntrack_max < effective_nofile )); then
+    if ! command -v sysctl >/dev/null; then
+      echo "Conntrack is enabled but sysctl is unavailable; raise nf_conntrack_max to $effective_nofile as root" >&2
+      exit 1
+    fi
+    privilege=()
+    if (( EUID != 0 )); then
+      if command -v doas >/dev/null; then
+        privilege=(doas)
+      elif command -v sudo >/dev/null; then
+        privilege=(sudo)
+      else
+        echo "Conntrack is enabled but nf_conntrack_max is $current_conntrack_max; raise it to $effective_nofile as root" >&2
+        exit 1
+      fi
+    fi
+    if ! "${privilege[@]}" sysctl -w "net.netfilter.nf_conntrack_max=$effective_nofile" >/dev/null; then
+      echo "Conntrack is enabled but nf_conntrack_max could not be raised from $current_conntrack_max to $effective_nofile" >&2
+      exit 1
+    fi
+    echo "Raised nf_conntrack_max from $current_conntrack_max to $effective_nofile" >&2
   fi
 fi
 

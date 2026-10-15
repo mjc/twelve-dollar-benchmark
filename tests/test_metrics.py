@@ -1,4 +1,4 @@
-"""Check native reports and sleeping users against a local HTTP/1.1 server."""
+"""Check benchmark reports and sleeping users against a local HTTP/1.1 server."""
 
 from collections import Counter
 from datetime import datetime
@@ -21,7 +21,7 @@ import unittest
 @unittest.skipUnless(os.environ.get("TWELVE_DOLLAR_BENCHMARK_BIN"), "set TWELVE_DOLLAR_BENCHMARK_BIN to test the built coordinator")
 class MetricsTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="goose metrics ")
+        self.temp = tempfile.TemporaryDirectory(prefix="benchmark metrics ")
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.binary = Path(os.environ["TWELVE_DOLLAR_BENCHMARK_BIN"]).resolve()
@@ -46,6 +46,9 @@ class MetricsTests(unittest.TestCase):
         self.feed_status = 200
         self.error_body = b'{"error":"queue full"}'
         self.truncate_error_body = False
+        self.empty_feed = False
+        self.response_delay = 0
+        self.first_request = threading.Event()
         self.observations = []
         self.topology_observations = []
         fixture = self
@@ -75,7 +78,10 @@ class MetricsTests(unittest.TestCase):
                 with fixture.lock:
                     fixture.in_flight += 1
                     fixture.requests += 1
+                fixture.first_request.set()
                 try:
+                    if fixture.response_delay:
+                        time.sleep(fixture.response_delay)
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -89,7 +95,8 @@ class MetricsTests(unittest.TestCase):
             def do_GET(self):
                 status = fixture.feed_status if self.path == "/feed" else 200
                 body = fixture.error_body if status >= 400 else json.dumps(
-                    {"posts": [{"id": 42}]} if self.path == "/feed" else {"post": {"id": 42}}
+                    {"posts": [] if fixture.empty_feed else [{"id": 42}]}
+                    if self.path == "/feed" else {"post": {"id": 42}}
                 ).encode()
                 if status >= 400 and fixture.truncate_error_body:
                     with fixture.lock:
@@ -196,6 +203,31 @@ class MetricsTests(unittest.TestCase):
                     child.wait(timeout=25)
         return returncode, log.read_text()
 
+    def direct_command(self, port, output, *, users=1, duration="10s"):
+        return [str(self.binary), "127.0.0.1", str(port), "--users", str(users),
+                "--ramp-up", "0s", "--duration", duration, "--source-ips", "127.0.0.1",
+                "--tokens", str(self.tokens), "--sample-interval", "0.1",
+                "--output-dir", str(output)]
+
+    def wait_for_signal_handlers(self, child, timeout=10):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("signal readiness check requires Linux /proc")
+        required = (1 << (signal.SIGINT - 1)) | (1 << (signal.SIGTERM - 1))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                self.fail(f"benchmark exited before installing signal handlers: {child.returncode}")
+            try:
+                status = Path(f"/proc/{child.pid}/status").read_text()
+                caught = next(line.split()[1] for line in status.splitlines()
+                              if line.startswith("SigCgt:"))
+                if int(caught, 16) & required == required:
+                    return
+            except (FileNotFoundError, StopIteration):
+                pass
+            time.sleep(0.02)
+        self.fail("benchmark did not install SIGINT and SIGTERM handlers")
+
     def assert_rates(self, summary, seconds):
         self.assertGreater(seconds, 0)
         self.assertAlmostEqual(summary["requests_per_second"], summary["requests"] / seconds)
@@ -211,6 +243,71 @@ class MetricsTests(unittest.TestCase):
         expected = ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
         self.assertAlmostEqual(summary["p99_ms"], expected)
 
+    def test_sigint_and_sigterm_during_coordinated_start_wait_write_empty_report(self):
+        for name, signum in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
+            with self.subTest(signal=name):
+                output = self.root / f"cancel-before-{name.lower()}"
+                output.mkdir()
+                env = dict(self.env,
+                           BENCH_START_AT=str(int(time.time() * 1000) + 60_000),
+                           BENCH_TELEMETRY=str(output / "telemetry.jsonl"),
+                           BENCH_SAMPLES=str(output / "samples.json"))
+                log = (output / "run.log").open("w")
+                child = subprocess.Popen(
+                    self.direct_command(self.server.server_port, output, duration="10s"),
+                    env=env, cwd=self.root, stdout=log, stderr=subprocess.STDOUT,
+                )
+                try:
+                    self.wait_for_signal_handlers(child)
+                    child.send_signal(signum)
+                    status = child.wait(timeout=15)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
+                    log.close()
+                self.assertEqual(status, 1, (output / "run.log").read_text())
+                report = json.loads((output / "summary.json").read_text())
+                samples = json.loads((output / "samples.json").read_text())
+                self.assertFalse(report["completed"])
+                self.assertEqual(report["maximum_users"], 0)
+                self.assertEqual(report["aggregate"]["requests"], 0)
+                self.assertTrue(all(not sample["latency_ms"] for sample in samples))
+        self.assertEqual(self.requests, 0)
+
+    def test_sigterm_during_ramp_down_finishes_current_iteration_within_ten_seconds(self):
+        self.empty_feed = True
+        self.response_delay = 0.2
+        output = self.root / "cancel-during-ramp-down"
+        output.mkdir()
+        env = dict(self.env,
+                   BENCH_TELEMETRY=str(output / "telemetry.jsonl"),
+                   BENCH_SAMPLES=str(output / "samples.json"))
+        log = (output / "run.log").open("w")
+        child = subprocess.Popen(
+            self.direct_command(self.server.server_port, output, users=1, duration="0s"),
+            env=env, cwd=self.root, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            self.wait_for_signal_handlers(child)
+            self.assertTrue(self.first_request.wait(timeout=15), "browse did not reach the test server")
+            interrupted_at = time.monotonic()
+            child.send_signal(signal.SIGTERM)
+            status = child.wait(timeout=12)
+            elapsed = time.monotonic() - interrupted_at
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+            log.close()
+        self.assertEqual(status, 1, (output / "run.log").read_text())
+        self.assertLessEqual(elapsed, 10, "current browse iteration exceeded the shutdown grace")
+        report = json.loads((output / "summary.json").read_text())
+        self.assertFalse(report["completed"])
+        self.assertEqual(report["maximum_users"], 1)
+        self.assertIsNotNone(report["hold_finished_at"], "signal should arrive after the zero-length hold")
+        self.assertGreaterEqual(report["aggregate"]["requests"], 1)
+
     def standalone_observer(self, directory, lease_seconds):
         directory.mkdir()
         control = directory / "metrics"
@@ -218,7 +315,8 @@ class MetricsTests(unittest.TestCase):
                    BENCH_TARGET_PORT=str(self.server.server_port), BENCH_SAMPLE_INTERVAL="0.1",
                    BENCH_OBSERVER_LEASE_SECONDS=str(lease_seconds))
         log = (directory / "observer.log").open("w")
-        child = subprocess.Popen([str(self.binary.with_name("twelve-dollar-observer")), "--observe", str(control)],
+        observer = self.binary.with_name("twelve-dollar-observer")
+        child = subprocess.Popen([str(observer), "--observe", str(control)],
                                  cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT)
 
         def cleanup():
@@ -290,7 +388,6 @@ class MetricsTests(unittest.TestCase):
         native = json.loads((output / "local" / "summary.json").read_text())
         self.assertTrue(aggregate["completed"])
         self.assertTrue(aggregate["passed"])
-        self.assertFalse(native["native_metrics"])
         expected_hosts = [f"http://127.0.0.1:{port}" for port in ports]
         self.assertCountEqual([host.rstrip("/") for host in native["hosts"]], expected_hosts)
         self.assertCountEqual([host.rstrip("/") for host in aggregate["hosts"]], expected_hosts)
@@ -390,7 +487,6 @@ class MetricsTests(unittest.TestCase):
         native = json.loads((body_output / "local" / "summary.json").read_text())
         raw = json.loads((body_output / "local" / "samples.json").read_text())
         feed = raw[0]["errors"]
-        self.assertFalse(native["native_metrics"])
         self.assertGreater(feed["counts"]["status:503"], 0)
         self.assertEqual(feed["counts"]["kind:http"], feed["counts"]["status:503"])
         self.assertIn("queue full", feed["examples"][0]["body_excerpt"])
@@ -449,7 +545,6 @@ class MetricsTests(unittest.TestCase):
         self.assertNotEqual(status, 0, log)
         aggregate = json.loads((output / "aggregate.json").read_text())
         native = json.loads((output / "local" / "summary.json").read_text())
-        self.assertFalse(native["native_metrics"])
         self.assertFalse(aggregate["passed"])
         connections = aggregate["connections"]
         raw = json.loads((output / "local" / "connection-samples.json").read_text())

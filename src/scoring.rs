@@ -41,39 +41,6 @@ impl Stage {
     }
 }
 
-#[derive(Serialize)]
-struct CurrentTrial {
-    stage: Stage,
-    users: usize,
-    directory: PathBuf,
-}
-
-#[derive(Serialize)]
-struct Trial {
-    stage: Stage,
-    users: usize,
-    scored: bool,
-    passed: bool,
-    completed: bool,
-    p95_ms: Option<f64>,
-    p99_ms: Option<f64>,
-    failure_rate: Option<f64>,
-    report: PathBuf,
-}
-
-#[derive(Serialize)]
-struct Workflow {
-    completed: bool,
-    score: Option<usize>,
-    started_at: chrono::DateTime<Utc>,
-    finished_at: Option<chrono::DateTime<Utc>>,
-    current: Option<CurrentTrial>,
-    protocol: Value,
-    trials: Vec<Trial>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
 fn find_score(
     start_users: usize,
     max_users: usize,
@@ -111,11 +78,7 @@ fn find_score(
 }
 
 fn trial_args(args: &[String], users: usize, stage: Stage, output: &Path) -> Vec<String> {
-    let split = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len());
-    let mut result: Vec<_> = args[..split]
+    let mut result: Vec<_> = args
         .iter()
         .filter(|arg| *arg != "--score" && *arg != "--skip-warmup")
         .cloned()
@@ -128,8 +91,60 @@ fn trial_args(args: &[String], users: usize, stage: Stage, output: &Path) -> Vec
         "--output-dir".into(),
         output.to_string_lossy().into_owned(),
     ]);
-    result.extend_from_slice(&args[split..]);
     result
+}
+
+#[derive(Serialize)]
+struct CurrentTrial {
+    stage: Stage,
+    users: usize,
+    directory: PathBuf,
+}
+
+#[derive(Serialize)]
+struct Trial {
+    stage: Stage,
+    users: usize,
+    scored: bool,
+    passed: bool,
+    completed: bool,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    failure_rate: Option<f64>,
+    report: PathBuf,
+}
+
+#[derive(Serialize)]
+struct Workflow {
+    completed: bool,
+    score: Option<usize>,
+    started_at: chrono::DateTime<Utc>,
+    finished_at: Option<chrono::DateTime<Utc>>,
+    current: Option<CurrentTrial>,
+    protocol: Value,
+    trials: Vec<Trial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Workflow {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            completed: false,
+            score: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            current: None,
+            protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users,
+            "maximum_search_users": cfg.max_users,
+            "search_step_users": cfg.step_users,
+            "cooldown_s": 60, "warmup_skipped": cfg.skip_warmup,
+            "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
+            "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
+            trials: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 fn save_state(root: &Path, state: &Workflow) -> Result<()> {
@@ -142,7 +157,65 @@ fn save_state(root: &Path, state: &Workflow) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> Result<u8> {
+fn validate_trial(
+    cfg: &Config,
+    cancelled: &AtomicBool,
+    report: &Value,
+    status: u8,
+    stage: Stage,
+    users: usize,
+    directory: &Path,
+) -> Result<bool> {
+    let passed = report["passed"] == true;
+    let target_is_remote = cfg.monitor_user.is_some() || cfg.user.is_some();
+    if status == 2
+        || cancelled.load(Ordering::Relaxed)
+        || report["completed"] != true
+        || report["runtime_errors"].as_u64() != Some(0)
+    {
+        return Err(format!(
+            "{} at {users} VUs did not complete a valid load run; inspect {}",
+            stage.name(),
+            directory.display()
+        )
+        .into());
+    }
+    if target_is_remote && report["target_telemetry"]["unavailable_reason"].is_string() {
+        return Err(format!(
+            "target telemetry is unavailable; inspect {} before continuing the score search",
+            directory.display()
+        )
+        .into());
+    }
+    if passed && target_is_remote {
+        for metric in [
+            "requests_per_second",
+            "service_cpu_percent",
+            "sampled_peak_memory_bytes",
+        ] {
+            if !report["hold"][metric].is_number() {
+                return Err(format!(
+                    "hold metric {metric} is unavailable; inspect {} before continuing",
+                    directory.display()
+                )
+                .into());
+            }
+        }
+    }
+    if report["connections"]["errors"]
+        .as_object()
+        .is_some_and(|errors| {
+            errors.keys().any(|error| {
+                error.contains("AddrNotAvailable") || error.contains("tcp bind source port error")
+            })
+        })
+    {
+        return Err("generator source-port exhaustion invalidates the limit search; add source IPs or generator hosts".into());
+    }
+    Ok(passed)
+}
+
+fn create_run_dir(cfg: &Config) -> Result<PathBuf> {
     let root = cfg.output.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
             "results/score-{}-{}",
@@ -158,136 +231,99 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     fs::create_dir(&root)?;
     let root = fs::canonicalize(root)?;
     fs::create_dir(root.join("trials"))?;
+    Ok(root)
+}
+
+fn run_trial(
+    root: &Path,
+    cfg: &Config,
+    args: &[String],
+    cancelled: &Arc<AtomicBool>,
+    workflow: &mut Workflow,
+    stage: Stage,
+    users: usize,
+) -> Result<(Value, bool, PathBuf)> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("scoring interrupted".into());
+    }
+    if stage != Stage::Warmup {
+        workflow.current = None;
+        save_state(root, workflow)?;
+        println!("Cooling down for 60 seconds at zero load before the next trial.");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("scoring interrupted during cooldown".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let index = workflow.trials.len() + 1;
+    let directory = root
+        .join("trials")
+        .join(format!("{index:02}-{}-{users}", stage.name()));
+    println!(
+        "\n{}: {users} VUs, {} hold{}",
+        stage.name(),
+        stage.duration(),
+        if stage == Stage::Warmup {
+            " (not scored)"
+        } else {
+            ""
+        }
+    );
+    workflow.current = Some(CurrentTrial {
+        stage,
+        users,
+        directory: directory.clone(),
+    });
+    save_state(root, workflow)?;
+    let status = runner::run(&trial_args(args, users, stage, &directory), cancelled)?;
+    let report: Value = serde_json::from_slice(&fs::read(directory.join("aggregate.json"))?)?;
+    workflow.trials.push(Trial {
+        stage,
+        users,
+        scored: stage != Stage::Warmup,
+        passed: report["passed"] == true,
+        completed: report["completed"] == true,
+        p95_ms: report["aggregate"]["p95_ms"].as_f64(),
+        p99_ms: report["aggregate"]["p99_ms"].as_f64(),
+        failure_rate: report["aggregate"]["failure_rate"].as_f64(),
+        report: directory.join("aggregate.json"),
+    });
+    save_state(root, workflow)?;
+    let passed = validate_trial(cfg, cancelled, &report, status, stage, users, &directory)?;
+    Ok((report, passed, directory))
+}
+
+pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) -> Result<u8> {
+    let root = create_run_dir(cfg)?;
     println!("Scoring results: {}", root.display());
-    let mut state = Workflow {
-        completed: false,
-        score: None,
-        started_at: Utc::now(),
-        finished_at: None,
-        current: None,
-        protocol: json!({"warmup_users": 1000, "warmup_hold_s": 120, "initial_search_users": cfg.start_users, "maximum_search_users": cfg.max_users,
-            "search_step_users": cfg.step_users,
-            "cooldown_s": 60, "warmup_skipped": cfg.skip_warmup,
-            "search_hold_s": 60, "confirmation_hold_s": 300, "resolution_users": 250,
-            "ramp_up": cfg.ramp_up, "ramp_down": "30s", "warmup_scored": false}),
-        trials: Vec::new(),
-        error: None,
-    };
+    let mut state = Workflow::new(cfg);
     save_state(&root, &state)?;
     let mut confirmed = None;
     let mut last = None;
-    let step = cfg.step_users;
-    let score = find_score(cfg.start_users, cfg.max_users, step, |stage, users| {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err("scoring interrupted".into());
-        }
-        if stage == Stage::Warmup && cfg.skip_warmup {
-            println!("Reusing the warm-up already completed in this session.");
-            return Ok(true);
-        }
-        if stage != Stage::Warmup {
-            state.current = None;
-            save_state(&root, &state)?;
-            println!("Cooling down for 60 seconds at zero load before the next trial.");
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while Instant::now() < deadline {
+    let score = find_score(
+        cfg.start_users,
+        cfg.max_users,
+        cfg.step_users,
+        |stage, users| {
+            if stage == Stage::Warmup && cfg.skip_warmup {
                 if cancelled.load(Ordering::Relaxed) {
-                    return Err("scoring interrupted during cooldown".into());
+                    return Err("scoring interrupted".into());
                 }
-                thread::sleep(Duration::from_millis(100));
+                println!("Reusing the warm-up already completed in this session.");
+                return Ok(true);
             }
-        }
-        let index = state.trials.len() + 1;
-        let directory = root
-            .join("trials")
-            .join(format!("{index:02}-{}-{users}", stage.name()));
-        println!(
-            "\n{}: {users} VUs, {} hold{}",
-            stage.name(),
-            stage.duration(),
-            if stage == Stage::Warmup {
-                " (not scored)"
-            } else {
-                ""
+            let (report, passed, directory) =
+                run_trial(&root, cfg, args, cancelled, &mut state, stage, users)?;
+            if stage == Stage::Confirm && passed {
+                confirmed = Some((report.clone(), directory));
             }
-        );
-        state.current = Some(CurrentTrial {
-            stage,
-            users,
-            directory: directory.clone(),
-        });
-        save_state(&root, &state)?;
-        let status = runner::run(
-            &trial_args(args, users, stage, &directory),
-            cancelled.clone(),
-        )?;
-        let report: Value = serde_json::from_slice(&fs::read(directory.join("aggregate.json"))?)?;
-        let passed = report["passed"] == true;
-        state.trials.push(Trial {
-            stage,
-            users,
-            scored: stage != Stage::Warmup,
-            passed,
-            completed: report["completed"] == true,
-            p95_ms: report["aggregate"]["p95_ms"].as_f64(),
-            p99_ms: report["aggregate"]["p99_ms"].as_f64(),
-            failure_rate: report["aggregate"]["failure_rate"].as_f64(),
-            report: directory.join("aggregate.json"),
-        });
-        save_state(&root, &state)?;
-        if status == 2
-            || cancelled.load(Ordering::Relaxed)
-            || report["completed"] != true
-            || report["runtime_errors"].as_u64() != Some(0)
-        {
-            return Err(format!(
-                "{} at {users} VUs did not complete a valid load run; inspect {}",
-                stage.name(),
-                directory.display()
-            )
-            .into());
-        }
-        if (cfg.monitor_user.is_some() || cfg.user.is_some())
-            && report["target_telemetry"]["unavailable_reason"].is_string()
-        {
-            return Err(format!(
-                "target telemetry is unavailable; inspect {} before continuing the score search",
-                directory.display()
-            )
-            .into());
-        }
-        if passed && (cfg.monitor_user.is_some() || cfg.user.is_some()) {
-            for metric in [
-                "requests_per_second",
-                "service_cpu_percent",
-                "sampled_peak_memory_bytes",
-            ] {
-                if !report["hold"][metric].is_number() {
-                    return Err(format!(
-                        "hold metric {metric} is unavailable; inspect {} before continuing",
-                        directory.display()
-                    )
-                    .into());
-                }
-            }
-        }
-        if report["connections"]["errors"]
-            .as_object()
-            .is_some_and(|errors| {
-                errors.keys().any(|error| {
-                    error.contains("AddrNotAvailable")
-                        || error.contains("tcp bind source port error")
-                })
-            })
-        {
-            return Err("generator source-port exhaustion invalidates the limit search; add source IPs or generator hosts".into());
-        }
-        if stage == Stage::Confirm && passed {
-            confirmed = Some((report.clone(), directory.clone()));
-        }
-        last = Some(report);
-        Ok(passed)
-    });
+            last = Some(report);
+            Ok(passed)
+        },
+    );
     let score = match score {
         Ok(score) => score,
         Err(error) => {
@@ -331,13 +367,17 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
     } else {
         limits.join(", ")
     });
-    report["scoring_protocol"] = serde_json::to_value(state)?;
+    report["scoring_protocol"] = serde_json::to_value(&state)?;
     report["confirmation_directory"] = json!(directory);
     let output = format!("{}\n", serde_json::to_string_pretty(&report)?);
     fs::write(root.join("aggregate.json"), &output)?;
     fs::write(
         root.join("report.md"),
-        runner::render_report(&report, false),
+        super::report::render_report(&report, false),
+    )?;
+    fs::write(
+        root.join("leaderboard.md"),
+        super::report::render_score_table(&report),
     )?;
     if let Ok(summary) = std::env::var("SUMMARY")
         && !summary.is_empty()
@@ -348,13 +388,9 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: Arc<AtomicBool>) -> 
         }
         fs::write(path, &output)?;
     }
-    fs::write(
-        root.join("leaderboard.md"),
-        runner::render_score_table(&report),
-    )?;
-    print!("{}", runner::render_report(&report, true));
+    print!("{}", super::report::render_report(&report, true));
     println!("Full score report: {}", root.join("report.md").display());
-    Ok(if score > 0 { 0 } else { 1 })
+    Ok(u8::from(score == 0))
 }
 
 #[cfg(test)]
@@ -362,9 +398,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scoring_stages_use_short_search_and_full_confirmation_holds() {
+        assert_eq!(Stage::Warmup.duration(), "2m");
+        assert_eq!(Stage::Search.duration(), "1m");
+        assert_eq!(Stage::Confirm.duration(), "5m");
+    }
+
+    #[test]
     fn search_excludes_warmup_narrows_and_steps_down_on_confirmation_failure() {
         let mut calls = Vec::new();
-        let score = find_score(2500, 300000, None, |stage, users| {
+        let score = find_score(2500, 300_000, None, |stage, users| {
             calls.push((stage, users));
             Ok(match stage {
                 Stage::Warmup => false,
@@ -373,14 +416,16 @@ mod tests {
             })
         })
         .unwrap();
-        assert_eq!(calls[0], (Stage::Warmup, 1000));
+        assert_eq!(calls.first(), Some(&(Stage::Warmup, 1000)));
         assert_eq!(
-            calls[1..4],
-            [
-                (Stage::Search, 2500),
-                (Stage::Search, 5000),
-                (Stage::Search, 10000),
-            ]
+            calls.get(1..4),
+            Some(
+                &[
+                    (Stage::Search, 2500),
+                    (Stage::Search, 5000),
+                    (Stage::Search, 10_000)
+                ][..]
+            )
         );
         assert_eq!(score, 7250);
         assert!(calls.ends_with(&[(Stage::Confirm, 7500), (Stage::Confirm, 7250)]));
@@ -388,19 +433,63 @@ mod tests {
 
     #[test]
     fn failures_at_the_smallest_candidate_produce_zero_without_false_confirmation() {
-        let score = find_score(2500, 300000, None, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
+        let score = find_score(2500, 300_000, None, |stage, _| Ok(stage == Stage::Warmup)).unwrap();
         assert_eq!(score, 0);
-        assert!(find_score(2500, 300000, None, |_, _| Err("control failure".into())).is_err());
+        assert!(find_score(2500, 300_000, None, |_, _| Err("control failure".into())).is_err());
     }
 
     #[test]
-    fn trial_overrides_precede_native_diagnostics_and_disable_recursive_scoring() {
-        let args = ["--score", "--", "--report-file", "native.html"].map(String::from);
+    fn search_confirms_a_non_doubling_ceiling() {
+        let mut calls = Vec::new();
+        let ceiling = 6_750;
+        let score = find_score(2500, ceiling, None, |stage, users| {
+            calls.push((stage, users));
+            Ok(true)
+        })
+        .unwrap();
+
+        assert_eq!(score, ceiling);
+        assert_eq!(
+            calls,
+            [
+                (Stage::Warmup, 1000),
+                (Stage::Search, 2500),
+                (Stage::Search, 5000),
+                (Stage::Search, ceiling),
+                (Stage::Confirm, ceiling),
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_search_increment_is_capped_at_the_ceiling() {
+        let mut calls = Vec::new();
+        let score = find_score(10_000, 25_000, Some(10_000), |stage, users| {
+            calls.push((stage, users));
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(score, 25_000);
+        assert_eq!(
+            calls,
+            [
+                (Stage::Warmup, 1000),
+                (Stage::Search, 10_000),
+                (Stage::Search, 20_000),
+                (Stage::Search, 25_000),
+                (Stage::Confirm, 25_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn trial_overrides_workload_and_disable_recursive_scoring() {
+        let args = ["--score", "--users", "9", "--duration", "3m"].map(String::from);
         let args = trial_args(&args, 2500, Stage::Search, Path::new("/trial"));
         let config = crate::config::parse(&args).unwrap();
         assert!(!config.score);
         assert_eq!(config.users, 2500);
         assert_eq!(config.duration, "1m");
-        assert_eq!(config.diagnostics, ["--report-file", "native.html"]);
+        assert_eq!(config.output.as_deref(), Some(Path::new("/trial")));
     }
 }

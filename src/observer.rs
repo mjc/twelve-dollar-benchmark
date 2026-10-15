@@ -1,30 +1,22 @@
-use std::{env, path::Path, process::ExitCode, time::Duration};
-use twelve_dollar_benchmark::{control, parse_destination_ports, setting, telemetry};
+use std::{env, path::Path, process::ExitCode};
+use twelve_dollar_benchmark::{
+    control, parse_destination_ports, parse_pids, parse_sample_interval, setting, telemetry,
+};
 
 fn observe_target(control: &Path) -> Result<u8, Box<dyn std::error::Error>> {
-    let parse_pids = |name| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        let value = setting(name, "");
-        if value.is_empty() {
-            return Ok(Vec::new());
-        }
-        value
-            .split(',')
-            .map(|p| p.parse::<u32>().map_err(Into::into))
-            .collect()
-    };
-    let interval: f64 = setting("BENCH_SAMPLE_INTERVAL", "1").parse()?;
-    if !interval.is_finite() || interval < 0.1 {
-        return Err("invalid sample interval".into());
-    }
+    let pids = |name| parse_pids(&setting(name, ""));
+    let interval = parse_sample_interval(&setting("BENCH_SAMPLE_INTERVAL", "1"))
+        .map_err(|_| "invalid sample interval")?;
+    let ports = parse_destination_ports(&setting(
+        "BENCH_TARGET_PORTS",
+        &setting("BENCH_TARGET_PORT", "3000"),
+    ))?;
     telemetry::observe(
         control,
-        parse_pids("BENCH_APPLICATION_PIDS")?,
-        parse_pids("BENCH_PROXY_PIDS")?,
-        parse_destination_ports(&setting(
-            "BENCH_TARGET_PORTS",
-            &setting("BENCH_TARGET_PORT", "3000"),
-        ))?,
-        Duration::from_secs_f64(interval),
+        pids("BENCH_APPLICATION_PIDS")?,
+        pids("BENCH_PROXY_PIDS")?,
+        &ports,
+        interval,
     )
 }
 
@@ -41,7 +33,9 @@ fn main() -> ExitCode {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("Usage: twelve-dollar-observer --observe CONTROL");
+        println!(
+            "Usage: twelve-dollar-observer --observe CONTROL\nSample target process, network, and service resources."
+        );
         return ExitCode::SUCCESS;
     }
     let result = (|| {
