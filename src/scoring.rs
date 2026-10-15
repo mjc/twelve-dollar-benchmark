@@ -345,11 +345,11 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) ->
     fs::write(root.join("aggregate.json"), &output)?;
     fs::write(
         root.join("report.md"),
-        runner::render_report(&report, false),
+        super::report::render_report(&report, false),
     )?;
     fs::write(
         root.join("leaderboard.md"),
-        runner::render_score_table(&report),
+        super::report::render_score_table(&report),
     )?;
     if let Ok(summary) = std::env::var("SUMMARY")
         && !summary.is_empty()
@@ -360,7 +360,7 @@ pub(super) fn run(cfg: &Config, args: &[String], cancelled: &Arc<AtomicBool>) ->
         }
         fs::write(path, &output)?;
     }
-    print!("{}", runner::render_report(&report, true));
+    print!("{}", super::report::render_report(&report, true));
     println!("Full score report: {}", root.join("report.md").display());
     Ok(u8::from(score == 0))
 }

@@ -1,7 +1,7 @@
 use chrono::{SecondsFormat, Utc};
 use num_traits::ToPrimitive;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -22,9 +22,15 @@ mod config;
 mod connections;
 mod destinations;
 mod errors;
+mod report;
 mod runner;
+mod samples;
 mod scoring;
 mod transport;
+
+#[cfg(test)]
+use samples::percentile;
+use samples::{Metrics, Samples, aggregate_samples, passes};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Endpoint {
@@ -35,6 +41,7 @@ enum Endpoint {
 }
 
 impl Endpoint {
+    #[cfg(test)]
     const ALL: [Self; 4] = [Self::Feed, Self::Post, Self::Like, Self::Create];
 
     const fn name(self) -> &'static str {
@@ -81,17 +88,6 @@ struct Post {
     id: u64,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Samples {
-    // ponytail: exact samples match k6 and use about 8 MB per million requests.
-    latency_ms: Vec<f64>,
-    failed: usize,
-    checks_failed: usize,
-    #[serde(default)]
-    errors: errors::ErrorDetails,
-}
-type Metrics = Arc<Mutex<[Samples; 4]>>;
-
 struct User {
     client: transport::Client,
     base: Arc<url::Url>,
@@ -102,84 +98,6 @@ struct User {
     runtime_details: Arc<Mutex<errors::ErrorDetails>>,
 }
 
-#[derive(Serialize, Debug)]
-struct Summary {
-    requests: usize,
-    failed: usize,
-    failure_rate: Option<f64>,
-    checks_failed: usize,
-    avg_ms: Option<f64>,
-    med_ms: Option<f64>,
-    p95_ms: Option<f64>,
-    p99_ms: Option<f64>,
-    max_ms: Option<f64>,
-    errors: errors::ErrorDetails,
-}
-impl Samples {
-    fn summary(&mut self) -> Summary {
-        self.latency_ms.sort_unstable_by(f64::total_cmp);
-        let n = self.latency_ms.len();
-        let count = n.to_f64();
-        Summary {
-            requests: n,
-            failed: self.failed,
-            failure_rate: count
-                .filter(|_| n > 0)
-                .and_then(|count| self.failed.to_f64().map(|failed| failed / count)),
-            checks_failed: self.checks_failed,
-            avg_ms: count
-                .filter(|_| n > 0)
-                .map(|count| self.latency_ms.iter().sum::<f64>() / count),
-            med_ms: percentile(&self.latency_ms, 0.5),
-            p95_ms: percentile(&self.latency_ms, 0.95),
-            p99_ms: percentile(&self.latency_ms, 0.99),
-            max_ms: self.latency_ms.last().copied(),
-            errors: self.errors.clone(),
-        }
-    }
-}
-
-fn aggregate_samples(samples: &mut [Samples]) -> Samples {
-    let Some((base_index, _)) = samples
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, sample)| sample.latency_ms.len())
-    else {
-        return Samples::default();
-    };
-    let mut aggregate = Samples {
-        latency_ms: std::mem::take(&mut samples[base_index].latency_ms),
-        ..Samples::default()
-    };
-    for (index, sample) in samples.iter_mut().enumerate() {
-        aggregate.failed += sample.failed;
-        aggregate.checks_failed += sample.checks_failed;
-        aggregate.errors.merge(&sample.errors);
-        if index != base_index {
-            let mut latency = std::mem::take(&mut sample.latency_ms);
-            aggregate.latency_ms.append(&mut latency);
-        }
-    }
-    aggregate
-}
-
-#[must_use]
-fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
-    if sorted.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
-        return None;
-    }
-    let rank = p * (sorted.len() - 1).to_f64()?;
-    let low = *sorted.get(rank.floor().to_usize()?)?;
-    let high = *sorted.get(rank.ceil().to_usize()?)?;
-    Some(low + (high - low) * rank.fract())
-}
-#[must_use]
-fn passes(s: &Summary, runtime_errors: usize) -> bool {
-    runtime_errors == 0
-        && s.p95_ms.is_some_and(|v| v < 500.0)
-        && s.p99_ms.is_some_and(|v| v < 1000.0)
-        && s.failure_rate.is_some_and(|v| v < 0.01)
-}
 fn http_success(status: u16) -> bool {
     (200..400).contains(&status)
 }
@@ -1143,7 +1061,7 @@ fn write_report(
         fs::create_dir_all(parent)?;
     }
     if let Ok(destination) = env::var("BENCH_SAMPLES") {
-        let cp = summary_path(context)
+        let cp = path
             .parent()
             .unwrap_or(Path::new("."))
             .join("connection-samples.json");
@@ -1155,23 +1073,8 @@ fn write_report(
         )?;
     }
     let mut collected = context.metrics.lock().unwrap();
-    let mut endpoints = serde_json::Map::new();
     let elapsed = Some(result.duration_s);
-    for ((endpoint, name), samples) in Endpoint::ALL
-        .into_iter()
-        .zip(ENDPOINTS)
-        .zip(collected.iter_mut())
-    {
-        debug_assert_eq!(endpoint.name(), name);
-        let endpoint_summary = samples.summary();
-        let rates = connections::request_rates(samples, elapsed);
-        let mut summary = serde_json::to_value(endpoint_summary)?;
-        if let (Some(summary), serde_json::Value::Object(rates)) = (summary.as_object_mut(), rates)
-        {
-            summary.extend(rates);
-        }
-        endpoints.insert(name.into(), summary);
-    }
+    let endpoints = samples::endpoint_summaries(&mut collected, elapsed)?;
     let aggregate = aggregate_samples(&mut collected[..]);
     let (report, passed) = build_report(context, result, elapsed, aggregate, &endpoints);
     save_report(context, &report, passed)
@@ -1240,9 +1143,6 @@ fn save_report(
     let output = serde_json::to_string_pretty(report)?;
     println!("\nScoring summary (full-body latency):\n{output}");
     let path = summary_path(context);
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
     fs::write(&path, format!("{output}\n"))?;
     println!(
         "{} — summary: {}",

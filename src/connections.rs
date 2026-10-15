@@ -1,4 +1,4 @@
-use super::{Samples, errors, percentile};
+use super::{Samples, errors, samples::percentile};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
