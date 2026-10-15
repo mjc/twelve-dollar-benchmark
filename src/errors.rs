@@ -41,33 +41,48 @@ impl ErrorExample {
 }
 
 impl ErrorDetails {
-    pub fn record(&mut self, mut example: ErrorExample) {
-        let kind_count = self
-            .counts
-            .entry(format!("kind:{}", example.kind))
-            .or_default();
+    #[cfg(test)]
+    pub fn record(&mut self, example: ErrorExample) {
+        self.increment_counts(example.status_code, &example.kind);
+        self.retain(example);
+    }
+
+    pub fn record_lazy(
+        &mut self,
+        status_code: Option<u16>,
+        kind: &str,
+        make_example: impl FnOnce() -> ErrorExample,
+    ) {
+        self.increment_counts(status_code, kind);
+        if self.examples.len() < MAX_ERROR_EXAMPLES {
+            self.retain(make_example());
+        } else {
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
+
+    fn increment_counts(&mut self, status_code: Option<u16>, kind: &str) {
+        let kind_count = self.counts.entry(format!("kind:{kind}")).or_default();
         *kind_count = kind_count.saturating_add(1);
-        if matches!(example.kind.as_str(), "http" | "check" | "body_read")
-            && let Some(status) = example.status_code
+        if matches!(kind, "http" | "check" | "body_read")
+            && let Some(status) = status_code
         {
             let count = self.counts.entry(format!("status:{status}")).or_default();
             *count = count.saturating_add(1);
         }
-        example.reason = truncate(&example.reason, MAX_REASON_BYTES).0;
-        if let Some(body) = example.body_excerpt.take() {
-            let (body, clipped) = truncate(&body, MAX_BODY_BYTES);
-            example.body_excerpt = Some(body);
-            example.body_truncated |= clipped;
-        }
-        if self.examples.len() < MAX_ERROR_EXAMPLES {
-            eprintln!(
-                "BENCH_ERROR {}",
-                serde_json::to_string(&example).unwrap_or_default()
-            );
-            self.examples.push(example);
-        } else {
+    }
+
+    fn retain(&mut self, mut example: ErrorExample) {
+        if self.examples.len() >= MAX_ERROR_EXAMPLES {
             self.omitted = self.omitted.saturating_add(1);
+            return;
         }
+        normalize_example(&mut example);
+        eprintln!(
+            "BENCH_ERROR {}",
+            serde_json::to_string(&example).unwrap_or_default()
+        );
+        self.examples.push(example);
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -147,7 +162,7 @@ pub fn example(
         path,
         status_code,
         kind: kind.to_owned(),
-        reason: truncate(&reason.into(), MAX_REASON_BYTES).0,
+        reason: truncate_owned(reason.into(), MAX_REASON_BYTES).0,
         body_excerpt,
         body_truncated,
         latency_ms: None,
@@ -167,6 +182,27 @@ fn truncate(value: &str, max: usize) -> (String, bool) {
         end -= 1;
     }
     (value[..end].to_owned(), true)
+}
+
+fn truncate_owned(mut value: String, max: usize) -> (String, bool) {
+    if value.len() <= max {
+        return (value, false);
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    (value, true)
+}
+
+fn normalize_example(example: &mut ErrorExample) {
+    example.reason = truncate_owned(std::mem::take(&mut example.reason), MAX_REASON_BYTES).0;
+    if let Some(body) = example.body_excerpt.take() {
+        let (body, clipped) = truncate_owned(body, MAX_BODY_BYTES);
+        example.body_excerpt = Some(body);
+        example.body_truncated |= clipped;
+    }
 }
 
 fn sanitize_url(value: &str) -> (String, bool) {
@@ -255,6 +291,25 @@ mod tests {
         assert_eq!(merged.counts["status:503"], 202);
         assert_eq!(merged.examples.len(), 100);
         assert_eq!(merged.omitted, 102);
+    }
+
+    #[test]
+    fn full_example_buffer_counts_without_constructing_an_example() {
+        let mut details = ErrorDetails::default();
+        for _ in 0..MAX_ERROR_EXAMPLES {
+            details.record_lazy(Some(503), "http", || sample("http", Some(503)));
+        }
+
+        let mut constructed = false;
+        details.record_lazy(Some(503), "http", || {
+            constructed = true;
+            sample("http", Some(503))
+        });
+
+        assert!(!constructed);
+        assert_eq!(details.counts["kind:http"], MAX_ERROR_EXAMPLES + 1);
+        assert_eq!(details.counts["status:503"], MAX_ERROR_EXAMPLES + 1);
+        assert_eq!(details.omitted, 1);
     }
 
     #[test]

@@ -25,7 +25,7 @@ mod errors;
 mod runner;
 mod scoring;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Endpoint {
     Feed,
     Post,
@@ -90,7 +90,7 @@ type Metrics = Arc<Mutex<[Samples; 4]>>;
 
 struct User {
     client: reqwest::Client,
-    base: reqwest::Url,
+    base: Arc<reqwest::Url>,
     index: usize,
     source: Option<IpAddr>,
     metrics: Metrics,
@@ -134,6 +134,7 @@ impl Samples {
         }
     }
 }
+
 fn aggregate_samples(samples: &mut [Samples]) -> Samples {
     let Some((base_index, _)) = samples
         .iter()
@@ -265,19 +266,62 @@ fn runtime_error(
     source: Option<IpAddr>,
 ) {
     count.fetch_add(1, Ordering::Relaxed);
-    details.lock().unwrap().record(errors::example(
-        errors::ErrorLocation {
-            endpoint: "runtime",
-            path: "",
-            user_index,
-            destination: url,
-            source_ip: source.map(|v| v.to_string()),
-        },
-        None,
-        "runtime",
-        errors::error_chain(error),
-        None,
-    ));
+    details.lock().unwrap().record_lazy(None, "runtime", || {
+        errors::example(
+            errors::ErrorLocation {
+                endpoint: "runtime",
+                path: "",
+                user_index,
+                destination: url,
+                source_ip: source.map(|v| v.to_string()),
+            },
+            None,
+            "runtime",
+            errors::error_chain(error),
+            None,
+        )
+    });
+}
+
+fn should_capture_http_excerpt(user: &User, endpoint: Endpoint) -> bool {
+    sample_mut(&mut user.metrics.lock().unwrap(), endpoint)
+        .errors
+        .examples
+        .len()
+        < errors::MAX_ERROR_EXAMPLES
+}
+
+async fn read_response_body(
+    mut response: reqwest::Response,
+    keep_body: bool,
+    capture_excerpt: bool,
+) -> (Option<bytes::Bytes>, Option<reqwest::Error>) {
+    if keep_body {
+        return match response.bytes().await {
+            Ok(bytes) => (Some(bytes), None),
+            Err(error) => (None, Some(error.without_url())),
+        };
+    }
+
+    let mut excerpt = capture_excerpt.then(|| Vec::with_capacity(1025));
+    let read_result = async {
+        while let Some(chunk) = response.chunk().await? {
+            if let Some(excerpt) = &mut excerpt
+                && excerpt.len() < 1025
+            {
+                excerpt.extend_from_slice(&chunk[..chunk.len().min(1025 - excerpt.len())]);
+            }
+        }
+        Ok::<(), reqwest::Error>(())
+    }
+    .await;
+    match read_result {
+        Ok(()) => (
+            Some(excerpt.map_or_else(bytes::Bytes::new, bytes::Bytes::from)),
+            None,
+        ),
+        Err(error) => (None, Some(error.without_url())),
+    }
 }
 
 async fn request(
@@ -286,7 +330,7 @@ async fn request(
     path: &str,
     auth: Option<&Token>,
     body: Option<&serde_json::Value>,
-) -> Option<Vec<u8>> {
+) -> Option<bytes::Bytes> {
     let url = match user.base.join(path) {
         Ok(url) => url,
         Err(error) => {
@@ -300,19 +344,21 @@ async fn request(
             );
             sample_mut(&mut user.metrics.lock().unwrap(), endpoint)
                 .errors
-                .record(errors::example(
-                    errors::ErrorLocation {
-                        endpoint: endpoint.name(),
-                        path,
-                        user_index: user.index,
-                        destination: user.base.as_str(),
-                        source_ip: user.source.map(|v| v.to_string()),
-                    },
-                    None,
-                    "request_builder",
-                    errors::error_chain(&error),
-                    None,
-                ));
+                .record_lazy(None, "request_builder", || {
+                    errors::example(
+                        errors::ErrorLocation {
+                            endpoint: endpoint.name(),
+                            path,
+                            user_index: user.index,
+                            destination: user.base.as_str(),
+                            source_ip: user.source.map(|v| v.to_string()),
+                        },
+                        None,
+                        "request_builder",
+                        errors::error_chain(&error),
+                        None,
+                    )
+                });
             return None;
         }
     };
@@ -340,14 +386,11 @@ async fn request(
     let (status, bytes, failure) = match result {
         Ok(response) => {
             let status = response.status().as_u16();
-            match response.bytes().await {
-                Ok(bytes) => (status, Some(bytes.to_vec()), None),
-                Err(error) => (
-                    status,
-                    None,
-                    Some(("body_read", errors::error_chain(&error.without_url()))),
-                ),
-            }
+            let keep_body = endpoint == Endpoint::Feed && endpoint.successful_status(status);
+            let capture_excerpt =
+                !http_success(status) && should_capture_http_excerpt(user, endpoint);
+            let (bytes, error) = read_response_body(response, keep_body, capture_excerpt).await;
+            (status, bytes, error.map(|error| ("body_read", error)))
         }
         Err(error) => (
             0,
@@ -358,7 +401,7 @@ async fn request(
                 } else {
                     "transport"
                 },
-                errors::error_chain(&error.without_url()),
+                error.without_url(),
             )),
         ),
     };
@@ -381,7 +424,7 @@ fn record_response(
     path: &str,
     status: u16,
     bytes: Option<&[u8]>,
-    failure: Option<(&str, String)>,
+    failure: Option<(&str, reqwest::Error)>,
     latency_ms: f64,
 ) {
     let success = http_success(status) && bytes.is_some();
@@ -390,32 +433,43 @@ fn record_response(
     samples.latency_ms.push(latency_ms);
     samples.failed += usize::from(!success);
     samples.checks_failed += usize::from(!endpoint.successful_status(status) || bytes.is_none());
-    let example = if let Some((kind, reason)) = failure {
-        Some((kind, reason, None))
+    let error = if let Some((kind, reason)) = failure {
+        Some((kind, Some(reason), None))
     } else if !http_success(status) {
-        Some(("http", format!("HTTP status {status}"), bytes))
+        Some(("http", None, bytes))
     } else if !endpoint.successful_status(status) {
-        Some(("check", format!("unexpected HTTP status {status}"), None))
+        Some(("check", None, None))
     } else {
         None
     };
-    if let Some((kind, reason, body)) = example {
-        samples.errors.record(
-            errors::example(
-                errors::ErrorLocation {
-                    endpoint: endpoint.name(),
-                    path,
-                    user_index: user.index,
-                    destination: user.base.as_str(),
-                    source_ip: user.source.map(|v| v.to_string()),
-                },
-                (status != 0).then_some(status),
-                kind,
-                reason,
-                body,
-            )
-            .with_latency(latency_ms),
-        );
+    if let Some((kind, failure, body)) = error {
+        samples
+            .errors
+            .record_lazy((status != 0).then_some(status), kind, || {
+                errors::example(
+                    errors::ErrorLocation {
+                        endpoint: endpoint.name(),
+                        path,
+                        user_index: user.index,
+                        destination: user.base.as_str(),
+                        source_ip: user.source.map(|v| v.to_string()),
+                    },
+                    (status != 0).then_some(status),
+                    kind,
+                    failure.map_or_else(
+                        || {
+                            if kind == "http" {
+                                format!("HTTP status {status}")
+                            } else {
+                                format!("unexpected HTTP status {status}")
+                            }
+                        },
+                        |error| errors::error_chain(&error),
+                    ),
+                    body,
+                )
+                .with_latency(latency_ms)
+            });
     }
 }
 
@@ -454,19 +508,21 @@ async fn browse(user: &User, tokens: &[Token], iteration: usize) {
             let mut metrics = user.metrics.lock().unwrap();
             let samples = sample_mut(&mut metrics, Endpoint::Feed);
             samples.checks_failed += 1;
-            samples.errors.record(errors::example(
-                errors::ErrorLocation {
-                    endpoint: Endpoint::Feed.name(),
-                    path: "/feed",
-                    user_index: user.index,
-                    destination: user.base.as_str(),
-                    source_ip: user.source.map(|v| v.to_string()),
-                },
-                Some(200),
-                "check",
-                "feed body was empty or malformed",
-                None,
-            ));
+            samples.errors.record_lazy(Some(200), "check", || {
+                errors::example(
+                    errors::ErrorLocation {
+                        endpoint: Endpoint::Feed.name(),
+                        path: "/feed",
+                        user_index: user.index,
+                        destination: user.base.as_str(),
+                        source_ip: user.source.map(|v| v.to_string()),
+                    },
+                    Some(200),
+                    "check",
+                    "feed body was empty or malformed",
+                    None,
+                )
+            });
         }
         think(3.0, 7.0).await;
         return;
@@ -592,7 +648,7 @@ struct Workload {
     ramp: Duration,
     hold: Duration,
     source_ips: Arc<Vec<IpAddr>>,
-    targets: Arc<Vec<reqwest::Url>>,
+    targets: Arc<Vec<Arc<reqwest::Url>>>,
     tokens: Arc<Vec<Token>>,
     user_offset: usize,
 }
@@ -643,7 +699,12 @@ fn prepare_workload(cfg: &config::Config) -> Result<Workload, Box<dyn std::error
     hyper_util::client::legacy::connect::set_source_port_range(1024, 65535)?;
     let source_ips = Arc::new(parse_source_ips(&cfg.source_ips)?);
     validate_source_ips(&source_ips)?;
-    let targets = Arc::new(destinations::urls(&cfg.base_url, &cfg.destination_ports)?);
+    let targets = Arc::new(
+        destinations::urls(&cfg.base_url, &cfg.destination_ports)?
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>(),
+    );
     let capacity = 64512usize
         .saturating_mul(source_ips.len().max(1))
         .saturating_mul(targets.len());
@@ -834,11 +895,11 @@ async fn launch_users(
                 break;
             }
         };
-        context
-            .assigned
-            .lock()
-            .unwrap()
-            .insert(base.as_str().to_owned());
+        let mut assigned = context.assigned.lock().unwrap();
+        if !assigned.contains(base.as_str()) {
+            assigned.insert(base.as_str().to_owned());
+        }
+        drop(assigned);
         users.maximum += 1;
         let (tx, rx) = tokio::sync::watch::channel(false);
         users.stops.push(tx);
@@ -1185,12 +1246,12 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
 
     fn user(base: &str, metrics: Metrics) -> User {
         User {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            base: reqwest::Url::parse(base).unwrap(),
+            base: Arc::new(reqwest::Url::parse(base).unwrap()),
             index: 7,
             source: None,
             metrics,
@@ -1218,6 +1279,53 @@ mod tests {
         summary.p99_ms = Some(999.0);
         assert!(!passes(&summary, 1));
         assert!(passes(&summary, 0));
+    }
+
+    #[test]
+    fn aggregate_reuses_largest_endpoint_buffer_after_raw_samples_are_serialized() {
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[2].latency_ms = vec![9.0, 1.0, 5.0];
+        let raw = serde_json::to_value(&samples).unwrap();
+        let original_buffer = samples[2].latency_ms.as_ptr();
+
+        let mut aggregate = aggregate_samples(&mut samples);
+        let summary = aggregate.summary();
+
+        assert_eq!(raw[2]["latency_ms"], serde_json::json!([9.0, 1.0, 5.0]));
+        assert_eq!(aggregate.latency_ms.as_ptr(), original_buffer);
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.med_ms, Some(5.0));
+        assert!(samples.iter().all(|sample| sample.latency_ms.is_empty()));
+    }
+
+    #[test]
+    fn raw_sample_artifacts_survive_aggregation_and_connection_reporting() {
+        let directory = env::temp_dir().join(format!("benchmark-samples-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let samples_path = directory.join("samples.json");
+        let connections_path = directory.join("connection-samples.json");
+        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
+        samples[0].latency_ms = vec![3.0, 1.0];
+        let connections = connections::Connections {
+            successful_ms: vec![2.0],
+            failed_ms: vec![4.0],
+            ..Default::default()
+        };
+
+        write_sample_artifacts(&samples, &connections, &samples_path, &connections_path).unwrap();
+        let mut aggregate = aggregate_samples(&mut samples);
+        let _ = aggregate.summary();
+        let report = connections.report(Some(1.0));
+
+        let raw: [Samples; 4] =
+            serde_json::from_reader(fs::File::open(&samples_path).unwrap()).unwrap();
+        let raw_connections: connections::Connections =
+            serde_json::from_reader(fs::File::open(&connections_path).unwrap()).unwrap();
+        assert_eq!(raw[0].latency_ms, [3.0, 1.0]);
+        assert_eq!(raw_connections.successful_ms, [2.0]);
+        assert_eq!(raw_connections.failed_ms, [4.0]);
+        assert_eq!(report["setup_duration_ms"]["samples"], 2);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1315,7 +1423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_reads_full_body_and_preserves_auth_and_json_write() {
+    async fn request_drains_write_response_and_preserves_auth_and_body_timing() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1370,7 +1478,7 @@ mod tests {
             Some(&payload),
         )
         .await;
-        assert_eq!(response.unwrap().as_slice(), b"complete body".as_slice());
+        assert!(response.unwrap().is_empty());
         server.join().unwrap();
         let mut data = metrics.lock().unwrap();
         let create = sample_mut(&mut data, Endpoint::Create);
@@ -1382,6 +1490,72 @@ mod tests {
         );
         assert_eq!(create.failed, 0);
         assert_eq!(user.runtime_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_feed_returns_bytes_and_non_feed_drain_reuses_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /posts "));
+            loop {
+                line.clear();
+                stream.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = vec![b'x'; 4096];
+            let stream = stream.get_mut();
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            for chunk in body.chunks(1024) {
+                stream.write_all(chunk).unwrap();
+                stream.flush().unwrap();
+            }
+
+            let mut stream = std::io::BufReader::new(stream);
+            line.clear();
+            stream.read_line(&mut line).unwrap();
+            assert!(line.starts_with("GET /feed "));
+            loop {
+                line.clear();
+                stream.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = br#"{"posts":[{"id":1}]}"#;
+            let stream = stream.get_mut();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let metrics: Metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+        let user = user(&format!("http://{address}"), metrics);
+        let write_response = request(&user, Endpoint::Create, "/posts", None, None).await;
+        assert!(write_response.unwrap().is_empty());
+        let feed_response: bytes::Bytes = request(&user, Endpoint::Feed, "/feed", None, None)
+            .await
+            .unwrap();
+        assert_eq!(&feed_response[..], br#"{"posts":[{"id":1}]}"#);
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -1464,6 +1638,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_failure_body_excerpt_is_bounded_and_marks_truncation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = vec![b'x'; 4096];
+            write!(
+                stream,
+                "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let metrics = Arc::new(Mutex::new(std::array::from_fn(|_| Samples::default())));
+        let user = user(&format!("http://{address}"), metrics.clone());
+        assert!(
+            request(&user, Endpoint::Feed, "/feed", None, None)
+                .await
+                .is_none()
+        );
+        server.join().unwrap();
+        let mut metrics = metrics.lock().unwrap();
+        let feed = sample_mut(&mut metrics, Endpoint::Feed);
+        let example = feed.errors.examples.first().unwrap();
+        assert_eq!(example.body_excerpt.as_ref().unwrap().len(), 1024);
+        assert!(example.body_truncated);
+    }
+
+    #[tokio::test]
     async fn clients_bind_source_ips_and_connector_tracks_reconnects() {
         let ips = parse_source_ips("127.0.0.[2-3]").unwrap();
         validate_source_ips(&ips).unwrap();
@@ -1511,7 +1722,10 @@ mod tests {
         assert_eq!(peers, ips);
         let mut report = connection_metrics.lock().unwrap();
         assert_eq!(report.successful_ms.len(), 2);
-        assert_eq!(report.report(Some(1.0))["established"], 2);
+        assert_eq!(
+            std::mem::take(&mut *report).report(Some(1.0))["established"],
+            2
+        );
     }
 
     #[tokio::test]
@@ -1561,52 +1775,5 @@ mod tests {
             "ramp elapsed only {elapsed:?}"
         );
         assert!(elapsed < Duration::from_secs(1), "ramp took {elapsed:?}");
-    }
-
-    #[test]
-    fn aggregate_reuses_largest_endpoint_buffer_after_raw_samples_are_serialized() {
-        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
-        samples[2].latency_ms = vec![9.0, 1.0, 5.0];
-        let raw = serde_json::to_value(&samples).unwrap();
-        let original_buffer = samples[2].latency_ms.as_ptr();
-
-        let mut aggregate = aggregate_samples(&mut samples);
-        let summary = aggregate.summary();
-
-        assert_eq!(raw[2]["latency_ms"], serde_json::json!([9.0, 1.0, 5.0]));
-        assert_eq!(aggregate.latency_ms.as_ptr(), original_buffer);
-        assert_eq!(summary.requests, 3);
-        assert_eq!(summary.med_ms, Some(5.0));
-        assert!(samples.iter().all(|sample| sample.latency_ms.is_empty()));
-    }
-
-    #[test]
-    fn raw_sample_artifacts_survive_aggregation_and_connection_reporting() {
-        let directory = env::temp_dir().join(format!("benchmark-samples-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let samples_path = directory.join("samples.json");
-        let connections_path = directory.join("connection-samples.json");
-        let mut samples: [Samples; 4] = std::array::from_fn(|_| Samples::default());
-        samples[0].latency_ms = vec![3.0, 1.0];
-        let connections = connections::Connections {
-            successful_ms: vec![2.0],
-            failed_ms: vec![4.0],
-            ..Default::default()
-        };
-
-        write_sample_artifacts(&samples, &connections, &samples_path, &connections_path).unwrap();
-        let mut aggregate = aggregate_samples(&mut samples);
-        let _ = aggregate.summary();
-        let report = connections.report(Some(1.0));
-
-        let raw: [Samples; 4] =
-            serde_json::from_reader(fs::File::open(&samples_path).unwrap()).unwrap();
-        let raw_connections: connections::Connections =
-            serde_json::from_reader(fs::File::open(&connections_path).unwrap()).unwrap();
-        assert_eq!(raw[0].latency_ms, [3.0, 1.0]);
-        assert_eq!(raw_connections.successful_ms, [2.0]);
-        assert_eq!(raw_connections.failed_ms, [4.0]);
-        assert_eq!(report["setup_duration_ms"]["samples"], 2);
-        fs::remove_dir_all(directory).unwrap();
     }
 }

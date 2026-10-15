@@ -10,6 +10,7 @@ name = "twelve-dollar-observer"
 path = "src/observer.rs"
 
 [dependencies]
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hyper-util = { version = "=0.1.21", features = ["client-legacy"] }
 libc = "0.2"
