@@ -1,4 +1,4 @@
-use super::{Point, Process, Result};
+use super::{Point, Process, Result, host::SystemMemory};
 use chrono::Utc;
 use num_traits::ToPrimitive;
 use serde_json::{Value, json};
@@ -15,6 +15,43 @@ pub(super) fn checked_sum(values: impl IntoIterator<Item = Option<u64>>) -> Opti
         .try_fold(0_u64, |total, value| total.checked_add(value?))
 }
 
+#[derive(Default)]
+struct SystemMemoryPeaks {
+    total_bytes: Option<u64>,
+    min_available_bytes: Option<u64>,
+    peak_used_bytes: Option<u64>,
+    peak_used_including_reclaimable_bytes: Option<u64>,
+}
+
+impl SystemMemoryPeaks {
+    fn observe(&mut self, sample: Option<&SystemMemory>) {
+        let Some(sample) = sample else { return };
+        self.total_bytes.get_or_insert(sample.total_bytes);
+        if let Some(available) = sample.available_bytes {
+            self.min_available_bytes = Some(
+                self.min_available_bytes
+                    .map_or(available, |current| current.min(available)),
+            );
+            self.peak_used_bytes = self
+                .peak_used_bytes
+                .max(sample.total_bytes.checked_sub(available));
+        }
+        self.peak_used_including_reclaimable_bytes = self
+            .peak_used_including_reclaimable_bytes
+            .max(sample.total_bytes.checked_sub(sample.free_bytes));
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "total_bytes": self.total_bytes,
+            "min_available_bytes": self.min_available_bytes,
+            "peak_total_minus_available_bytes": self.peak_used_bytes,
+            "peak_total_minus_free_bytes_including_reclaimable": self.peak_used_including_reclaimable_bytes,
+            "scope": "whole observed system from /proc/meminfo; MemAvailable is never inferred when missing; MemFree-only usage includes reclaimable cache"
+        })
+    }
+}
+
 /// Summarize counters between samples wholly inside the full-load hold.
 ///
 /// # Errors
@@ -27,12 +64,14 @@ pub fn summarize_hold(
     let mut first: Option<Point> = None;
     let mut last: Option<Point> = None;
     let mut peak_memory = None;
+    let mut system_memory = SystemMemoryPeaks::default();
     for line in BufReader::new(File::open(path)?).lines() {
         let point: Point = serde_json::from_str(&line?)?;
         let at = chrono::DateTime::parse_from_rfc3339(&point.timestamp)?;
         if at < start || at > finish {
             continue;
         }
+        system_memory.observe(point.system_memory.as_ref());
         if let Some(groups) = point
             .service
             .get("groups")
@@ -87,7 +126,8 @@ pub fn summarize_hold(
         "requests_per_second": rate(requests, seconds, 1.0),
         "service_cpu_percent": cpu.and_then(|n| n.to_f64()).map(|n| n / (seconds * 10_000.0)),
         "sampled_peak_memory_bytes": peak_memory,
-        "memory_scope": "sampled cgroup memory.current, including descendants, socket buffers and page cache"
+        "memory_scope": "sampled cgroup memory.current for selected application and proxy groups, including descendants, socket buffers and page cache",
+        "system_memory": system_memory.report()
     }))
 }
 
@@ -230,12 +270,14 @@ pub(crate) fn summarize(path: &Path) -> Result<Value> {
     let mut errors = BTreeSet::new();
     let mut peak_established = None;
     let mut peak_conntrack = None;
+    let mut system_memory = SystemMemoryPeaks::default();
     for line in BufReader::new(File::open(path)?).lines() {
         let point: Point = serde_json::from_str(&line?)?;
         if first.is_none() {
             first = Some(point.clone());
         }
         samples += 1;
+        system_memory.observe(point.system_memory.as_ref());
         peak_conntrack = peak_conntrack.max(
             point.limits["conntrack_count"]["value"]
                 .as_str()
@@ -295,6 +337,7 @@ pub(crate) fn summarize(path: &Path) -> Result<Value> {
         "network_scope": "per-interface host/network-namespace counters include unrelated traffic; do not add virtual links or both ends of a connection; packet counters can reflect offloads, not physical wire packets",
         "network": network_report(&first,&last), "tcp": tcp_report(&first,&last), "peak_namespace_established_sockets": peak_established, "activity": activity_report(&first,&last),
         "processes": process_report, "limits": last.limits, "peak_conntrack_count": peak_conntrack, "errors": errors,
-        "process_scope": "CPU includes every process thread and is expressed relative to one CPU core; memory, descriptors and established sockets are sampled peaks"}),
+        "process_scope": "CPU includes every process thread and is expressed relative to one CPU core; process memory, descriptors and established sockets are sampled peaks",
+        "system_memory": system_memory.report()}),
     )
 }

@@ -27,6 +27,49 @@ pub(super) struct Process {
     pub(super) descriptor_limits: Value,
     pub(super) errors: Vec<String>,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct SystemMemory {
+    pub(super) total_bytes: u64,
+    pub(super) available_bytes: Option<u64>,
+    pub(super) free_bytes: u64,
+}
+
+pub(super) fn system_memory() -> Result<SystemMemory> {
+    meminfo(&fs::read_to_string("/proc/meminfo")?)
+}
+
+fn meminfo(text: &str) -> Result<SystemMemory> {
+    let mut total = None;
+    let mut available = None;
+    let mut free = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let destination = match name {
+            "MemTotal" => Some(&mut total),
+            "MemAvailable" => Some(&mut available),
+            "MemFree" => Some(&mut free),
+            _ => None,
+        };
+        let Some(destination) = destination else {
+            continue;
+        };
+        let mut fields = value.split_whitespace();
+        let kib: u64 = fields.next().ok_or("missing meminfo value")?.parse()?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err("invalid meminfo unit".into());
+        }
+        *destination = Some(kib.checked_mul(1024).ok_or("meminfo byte count overflow")?);
+    }
+    Ok(SystemMemory {
+        total_bytes: total.ok_or("MemTotal unavailable")?,
+        available_bytes: available,
+        free_bytes: free.ok_or("MemFree unavailable")?,
+    })
+}
+
 pub(super) fn interfaces(text: &str) -> Result<BTreeMap<String, Interface>> {
     let mut result = BTreeMap::new();
     for line in text.lines().skip(2) {

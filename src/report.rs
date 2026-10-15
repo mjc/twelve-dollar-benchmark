@@ -11,7 +11,7 @@ pub(super) fn render_score_table(report: &Value) -> String {
         .replace('|', "\\|")
         .replace(['\r', '\n'], " ");
     format!(
-        "| Rank | PR | Implementation | Max users | Req/s | p50 | p95 | p99 | Errors | CPU | Peak memory | Limited by |\n\
+        "| Rank | PR | Implementation | Max users | Req/s | p50 | p95 | p99 | Errors | CPU | Peak system used | Limited by |\n\
 |---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n\
 | — | — | {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         if report["score_is_lower_bound"] == true {
@@ -31,7 +31,7 @@ pub(super) fn render_score_table(report: &Value) -> String {
         ),
         number(report["hold"]["service_cpu_percent"].as_f64(), "%"),
         number(
-            report["hold"]["sampled_peak_memory_bytes"]
+            report["hold"]["system_memory"]["peak_total_minus_available_bytes"]
                 .as_f64()
                 .map(|n| n / 1_048_576.0),
             " MiB"
@@ -63,7 +63,7 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
     );
     let table = if report["score"].is_u64() {
         format!(
-            "{}\nReq/s and CPU are means from samples inside the confirmed hold. Memory is sampled peak cgroup usage, including socket buffers and page cache. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",
+            "{}\nReq/s and CPU are means from samples inside the confirmed hold. Peak system used is MemTotal − MemAvailable sampled for the whole observed system during the hold; it includes the OS and observer. It is unavailable when those whole-system samples are missing. The legacy cgroup metric remains in hold JSON. Latency and errors cover the complete confirmation run. Rank and PR are left blank; Limited by names a failing threshold, not an inferred resource bottleneck.",
             render_score_table(report)
         )
     } else {
@@ -125,6 +125,7 @@ pub(super) fn render_report(report: &Value, compact: bool) -> String {
         render_request_errors(&mut text, report);
     }
     render_connections(&mut text, report);
+    render_system_memory(&mut text, report);
     render_network(&mut text, report, compact);
     render_processes(&mut text, report, compact);
     text.push_str("\nExact latency/connection samples, resource time series, kernel limits and availability details are retained alongside aggregate.json.\n");
@@ -246,6 +247,26 @@ fn observations(report: &Value) -> impl Iterator<Item = (&str, &Value)> {
         .flat_map(|map| map.iter())
         .map(|(name, value)| (name.as_str(), value))
         .chain(std::iter::once(("target", &report["target_telemetry"])))
+}
+
+fn render_system_memory(text: &mut String, report: &Value) {
+    text.push_str("\nWhole-system memory is read from each observer's `/proc/meminfo`; values cover its full observation window and include background system activity. Used (total − available) uses the kernel's MemAvailable estimate. Cache-inclusive used (total − free) counts reclaimable cache as used.\n\n| Observer | Total MiB | Minimum available MiB | Peak used (total − available) MiB | Peak used including reclaimable cache (total − free) MiB |\n|---|---:|---:|---:|---:|\n");
+    for (observer, value) in observations(report) {
+        let memory = &value["system_memory"];
+        let mib = |key| {
+            memory[key]
+                .as_f64()
+                .map_or(Value::Null, |bytes| json!(bytes / 1_048_576.0))
+        };
+        let _ = writeln!(
+            text,
+            "| {observer} | {} | {} | {} | {} |",
+            number(&mib("total_bytes")),
+            number(&mib("min_available_bytes")),
+            number(&mib("peak_total_minus_available_bytes")),
+            number(&mib("peak_total_minus_free_bytes_including_reclaimable"))
+        );
+    }
 }
 
 fn render_processes(text: &mut String, report: &Value, compact: bool) {

@@ -4,8 +4,8 @@ mod summary;
 mod tests;
 
 use host::{
-    Interface, Process, discover_roles, interfaces, limits, process, service_resources,
-    socket_inodes, tcp_counters, ticks_per_second,
+    Interface, Process, SystemMemory, discover_roles, interfaces, limits, process,
+    service_resources, socket_inodes, system_memory, tcp_counters, ticks_per_second,
 };
 pub use summary::summarize_hold;
 use summary::{interval_report, summarize};
@@ -43,6 +43,8 @@ struct Point {
     interval_rates: Value,
     #[serde(default)]
     service: Value,
+    #[serde(default)]
+    system_memory: Option<SystemMemory>,
     errors: Vec<String>,
 }
 
@@ -114,6 +116,9 @@ impl Sampler {
                     .and_then(|text| tcp_counters(&text).map_err(|e| e.to_string()))
                     .map_err(|e| errors.push(format!("TCP counters: {e}")))
                     .ok();
+                let system_memory = system_memory()
+                    .map_err(|e| errors.push(format!("system memory: {e}")))
+                    .ok();
                 let mut point = Point {
                     timestamp: Utc::now().to_rfc3339(),
                     elapsed_s: started.elapsed().as_secs_f64(),
@@ -129,6 +134,7 @@ impl Sampler {
                     limits: limits(),
                     activity: activity(),
                     service: service_resources(&roles),
+                    system_memory,
                     tcp,
                     interval_rates: Value::Null,
                     errors,

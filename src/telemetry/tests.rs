@@ -78,6 +78,7 @@ fn fixture(elapsed: f64) -> Point {
         ])),
         interval_rates: Value::Null,
         service: Value::Null,
+        system_memory: None,
         errors: vec![],
     }
 }
