@@ -95,7 +95,7 @@ fi
 # larger conntrack table setting.
 skip_conntrack_tuning=0
 for arg in "$@"; do
-  if [[ $arg == --help || $arg == -h || $arg == --version || $arg == -V ]]; then
+  if [[ $arg == --help || $arg == --help=* || $arg == -h || $arg == --version || $arg == -V ]]; then
     skip_conntrack_tuning=1
     break
   fi
