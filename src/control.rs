@@ -51,6 +51,9 @@ pub fn start_supervised(control: &Path, timestamp: &str) -> Result<u8> {
 }
 
 pub fn refresh_observer(control: &Path) -> Result<u8> {
+    if control.exists() || control.with_extension("done").exists() {
+        return Err("cannot refresh an observer that has already stopped".into());
+    }
     fs::write(control.with_extension("lease"), "alive\n")?;
     Ok(0)
 }
