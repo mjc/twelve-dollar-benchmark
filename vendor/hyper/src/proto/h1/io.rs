@@ -97,6 +97,11 @@ where
         self.read_buf_strategy = ReadStrategy::Exact(sz);
     }
 
+    #[cfg(feature = "client")]
+    pub(crate) fn set_read_buf_chunk_size(&mut self, sz: usize, max: usize) {
+        self.read_buf_strategy = ReadStrategy::Fixed { size: sz, max };
+    }
+
     pub(crate) fn set_write_strategy_queue(&mut self) {
         // this should always be called only at construction time,
         // so this assert is here to catch myself
@@ -205,6 +210,13 @@ where
             )? {
                 debug!("parsed {} headers", msg.head.headers.len());
                 self.partial_len = None;
+                if let Some(size) = self.read_buf_strategy.fixed_size() {
+                    if self.read_buf.capacity() > size && self.read_buf.len() <= size {
+                        let mut read_buf = BytesMut::with_capacity(size);
+                        read_buf.extend_from_slice(&self.read_buf);
+                        self.read_buf = read_buf;
+                    }
+                }
                 return Poll::Ready(Ok(msg));
             } else {
                 let curr_len = self.read_buf.len();
@@ -251,7 +263,8 @@ where
         // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
         // bytes onto `dst`.
         let dst = unsafe { self.read_buf.chunk_mut().as_uninit_slice_mut() };
-        let mut buf = ReadBuf::uninit(dst);
+        let read_size = self.read_buf_strategy.read_limit(dst.len());
+        let mut buf = ReadBuf::uninit(&mut dst[..read_size]);
         match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
             Poll::Ready(Ok(())) => {
                 let n = buf.filled().len();
@@ -406,6 +419,8 @@ enum ReadStrategy {
     },
     #[cfg(feature = "client")]
     Exact(usize),
+    #[cfg(feature = "client")]
+    Fixed { size: usize, max: usize },
 }
 
 impl ReadStrategy {
@@ -422,6 +437,8 @@ impl ReadStrategy {
             ReadStrategy::Adaptive { next, .. } => next,
             #[cfg(feature = "client")]
             ReadStrategy::Exact(exact) => exact,
+            #[cfg(feature = "client")]
+            ReadStrategy::Fixed { size, .. } => size,
         }
     }
 
@@ -430,6 +447,8 @@ impl ReadStrategy {
             ReadStrategy::Adaptive { max, .. } => max,
             #[cfg(feature = "client")]
             ReadStrategy::Exact(exact) => exact,
+            #[cfg(feature = "client")]
+            ReadStrategy::Fixed { max, .. } => max,
         }
     }
 
@@ -464,7 +483,27 @@ impl ReadStrategy {
             }
             #[cfg(feature = "client")]
             ReadStrategy::Exact(_) => (),
+            #[cfg(feature = "client")]
+            ReadStrategy::Fixed { .. } => (),
         }
+    }
+
+    fn read_limit(&self, available: usize) -> usize {
+        match *self {
+            ReadStrategy::Adaptive { .. } => available,
+            #[cfg(feature = "client")]
+            ReadStrategy::Exact(_) => available,
+            #[cfg(feature = "client")]
+            ReadStrategy::Fixed { size, .. } => cmp::min(size, available),
+        }
+    }
+
+    fn fixed_size(&self) -> Option<usize> {
+        #[cfg(feature = "client")]
+        if let ReadStrategy::Fixed { size, .. } = *self {
+            return Some(size);
+        }
+        None
     }
 }
 
