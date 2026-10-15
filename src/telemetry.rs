@@ -222,17 +222,139 @@ fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
         .ok_or("missing process name")?
         .1
         .to_owned();
-    let fields: Vec<_> = tail.split_whitespace().collect();
-    if fields.len() < 22 {
-        return Err("incomplete process stat".into());
+    let mut fields = tail.split_whitespace();
+    let mut field = || fields.next().ok_or("incomplete process stat");
+    let _state = field()?;
+    for _ in 0..10 {
+        field()?;
     }
+    let user_ticks: u64 = field()?.parse()?;
+    let system_ticks: u64 = field()?.parse()?;
+    for _ in 0..6 {
+        field()?;
+    }
+    let start_ticks = field()?.parse()?;
+    let _virtual_bytes = field()?;
+    let resident_pages = field()?.parse()?;
     Ok((
         name,
-        fields[19].parse()?,
-        fields[11]
-            .parse::<u64>()?
-            .saturating_add(fields[12].parse()?),
-        fields[21].parse()?,
+        start_ticks,
+        user_ticks.saturating_add(system_ticks),
+        resident_pages,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn count_descriptors(
+    pid: u32,
+    sockets: Option<&HashSet<u64>>,
+) -> Result<(usize, Option<usize>, Vec<std::io::Error>)> {
+    use std::{
+        ffi::{CStr, CString},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            // SAFETY: this guard uniquely owns the DIR returned by fdopendir.
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    let path = CString::new(format!("/proc/{pid}/fd"))?;
+    // SAFETY: path is NUL-terminated and flags require no additional arguments.
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: open returned a new owned descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    // fdopendir takes ownership of the descriptor, so transfer it from OwnedFd.
+    let raw = owned.as_raw_fd();
+    std::mem::forget(owned);
+    // SAFETY: raw is a valid directory descriptor; fdopendir owns it on success.
+    let directory = unsafe { libc::fdopendir(raw) };
+    if directory.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir failed and did not consume the descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        return Err(error.into());
+    }
+    let directory = Directory(directory);
+    let mut count = 0;
+    let mut established = HashSet::with_capacity(sockets.map_or(0, HashSet::len));
+    let mut socket_errors = Vec::new();
+    let mut socket_complete = sockets.is_some();
+    let mut link = [0_u8; 256];
+    loop {
+        // readdir returns a borrowed dirent valid until the next readdir call.
+        // SAFETY: directory is live and exclusively used by this loop.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: directory is live.
+        let entry = unsafe { libc::readdir(directory.0) };
+        if entry.is_null() {
+            // SAFETY: errno is thread-local and readdir was just called.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno).into());
+            }
+            break;
+        }
+        // SAFETY: readdir supplies a NUL-terminated name in the live dirent.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        count += 1;
+        let Some(sockets) = sockets else { continue };
+        // SAFETY: name is NUL-terminated; link is writable for its full length.
+        let len = unsafe {
+            libc::readlinkat(
+                libc::dirfd(directory.0),
+                name.as_ptr(),
+                link.as_mut_ptr().cast(),
+                link.len(),
+            )
+        };
+        if len < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            socket_errors.push(error);
+            socket_complete = false;
+            continue;
+        }
+        let len = usize::try_from(len)?;
+        // A socket target is short; a full buffer means another target type, not
+        // a failed sample. This also avoids treating truncated links as sockets.
+        if len == link.len() {
+            continue;
+        }
+        if let Some(inode) = link[..len]
+            .strip_prefix(b"socket:[")
+            .and_then(|target| target.strip_suffix(b"]"))
+            .and_then(|inode| std::str::from_utf8(inode).ok())
+            .and_then(|inode| inode.parse::<u64>().ok())
+            .filter(|inode| sockets.contains(inode))
+        {
+            established.insert(inode);
+        }
+    }
+    Ok((
+        count,
+        (socket_complete && sockets.is_some()).then_some(established.len()),
+        socket_errors,
     ))
 }
 
@@ -255,49 +377,13 @@ fn process(
     if !same_namespace {
         errors.push("established sockets unavailable: process network namespace differs from observer or cannot be read".into());
     }
-    let (open_descriptors, established_sockets) = match fs::read_dir(format!("/proc/{pid}/fd")) {
-        Ok(entries) => {
-            let mut count = 0;
-            let mut descriptors_complete = true;
-            let mut established = BTreeSet::new();
-            let mut socket_complete = sockets.is_ok() && same_namespace;
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        errors.push(error.to_string());
-                        socket_complete = false;
-                        descriptors_complete = false;
-                        continue;
-                    }
-                };
-                count += 1;
-                if let Ok(sockets) = &sockets {
-                    match fs::read_link(entry.path()) {
-                        Ok(link) => {
-                            if let Some(inode) = link
-                                .to_str()
-                                .and_then(|s| s.strip_prefix("socket:["))
-                                .and_then(|s| s.strip_suffix(']'))
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .filter(|inode| sockets.contains(inode))
-                            {
-                                established.insert(inode);
-                            }
-                        }
-                        // An FD can close between the directory listing and readlink.
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            errors.push(error.to_string());
-                            socket_complete = false;
-                        }
-                    }
-                }
-            }
-            (
-                descriptors_complete.then_some(count),
-                socket_complete.then_some(established.len()),
-            )
+    let (open_descriptors, established_sockets) = match count_descriptors(
+        pid,
+        sockets.as_ref().ok().copied().filter(|_| same_namespace),
+    ) {
+        Ok((count, established, socket_errors)) => {
+            errors.extend(socket_errors.into_iter().map(|error| error.to_string()));
+            (Some(count), established)
         }
         Err(error) => {
             errors.push(format!("descriptors: {error}"));
@@ -1152,6 +1238,7 @@ mod tests {
     use super::*;
     use std::{
         net::{TcpListener, TcpStream},
+        os::fd::{AsRawFd, FromRawFd},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -1412,6 +1499,33 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
+        let socket_dump = socket_inodes();
+        let (before_count, before_sockets, _) =
+            count_descriptors(std::process::id(), socket_dump.as_ref().ok()).unwrap();
+        // SAFETY: dup creates an independent descriptor referring to the live client socket.
+        let duplicate = unsafe { libc::dup(client.as_raw_fd()) };
+        assert!(duplicate >= 0);
+        // SAFETY: duplicate is a fresh descriptor owned by this test.
+        let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+        let (after_count, after_sockets, _) =
+            count_descriptors(std::process::id(), socket_dump.as_ref().ok()).unwrap();
+        assert_eq!(after_count, before_count + 1);
+        assert_eq!(after_sockets, before_sockets);
+
+        let long_dir = temporary().with_extension("long-fd");
+        let target = long_dir
+            .join("a".repeat(100))
+            .join("b".repeat(100))
+            .join("target");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "long symlink target").unwrap();
+        let long_target = File::open(&target).unwrap();
+        let (count_with_long_target, _, _) =
+            count_descriptors(std::process::id(), socket_dump.as_ref().ok()).unwrap();
+        assert_eq!(count_with_long_target, after_count + 1);
+        drop(long_target);
+        fs::remove_dir_all(long_dir).unwrap();
+
         assert!(
             listener_pids(listener.local_addr().unwrap().port())
                 .unwrap()
@@ -1421,6 +1535,6 @@ mod tests {
         assert!(observed.established_sockets.unwrap() >= 2);
         assert!(observed.open_descriptors.unwrap() >= 3);
         assert!(observed.descriptor_limits["soft"].as_str().is_some());
-        drop((client, server));
+        drop((client, server, duplicate));
     }
 }
