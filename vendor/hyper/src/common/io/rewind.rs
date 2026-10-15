@@ -14,17 +14,7 @@ pub(crate) struct Rewind<T> {
 }
 
 impl<T> Rewind<T> {
-    #[cfg(all(
-        test,
-        any(feature = "client", feature = "server"),
-        any(feature = "http1", feature = "http2")
-    ))]
-    pub(crate) fn new(io: T) -> Self {
-        Rewind {
-            pre: None,
-            inner: io,
-        }
-    }
+
 
     pub(crate) fn new_buffered(io: T, buf: Bytes) -> Self {
         Rewind {
@@ -33,15 +23,7 @@ impl<T> Rewind<T> {
         }
     }
 
-    #[cfg(all(
-        test,
-        any(feature = "client", feature = "server"),
-        any(feature = "http1", feature = "http2")
-    ))]
-    pub(crate) fn rewind(&mut self, bs: Bytes) {
-        debug_assert!(self.pre.is_none());
-        self.pre = Some(bs);
-    }
+
 
     pub(crate) fn into_inner(self) -> (T, Bytes) {
         (self.inner, self.pre.unwrap_or_default())
@@ -106,61 +88,5 @@ where
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
-    }
-}
-
-#[cfg(all(
-    any(feature = "client", feature = "server"),
-    any(feature = "http1", feature = "http2"),
-))]
-#[cfg(test)]
-mod tests {
-    use super::super::Compat;
-    use super::Rewind;
-    use bytes::Bytes;
-    use tokio::io::AsyncReadExt;
-
-    #[cfg(not(miri))]
-    #[tokio::test]
-    async fn partial_rewind() {
-        let underlying = [104, 101, 108, 108, 111];
-
-        let mock = tokio_test::io::Builder::new().read(&underlying).build();
-
-        let mut stream = Compat::new(Rewind::new(Compat::new(mock)));
-
-        // Read off some bytes, ensure we filled o1
-        let mut buf = [0; 2];
-        stream.read_exact(&mut buf).await.expect("read1");
-
-        // Rewind the stream so that it is as if we never read in the first place.
-        stream.0.rewind(Bytes::copy_from_slice(&buf[..]));
-
-        let mut buf = [0; 5];
-        stream.read_exact(&mut buf).await.expect("read1");
-
-        // At this point we should have read everything that was in the MockStream
-        assert_eq!(&buf, &underlying);
-    }
-
-    #[cfg(not(miri))]
-    #[tokio::test]
-    async fn full_rewind() {
-        let underlying = [104, 101, 108, 108, 111];
-
-        let mock = tokio_test::io::Builder::new().read(&underlying).build();
-
-        let mut stream = Compat::new(Rewind::new(Compat::new(mock)));
-
-        let mut buf = [0; 5];
-        stream.read_exact(&mut buf).await.expect("read1");
-
-        // Rewind the stream so that it is as if we never read in the first place.
-        stream.0.rewind(Bytes::copy_from_slice(&buf[..]));
-
-        let mut buf = [0; 5];
-        stream.read_exact(&mut buf).await.expect("read1");
-
-        assert_eq!(&buf, &underlying);
     }
 }

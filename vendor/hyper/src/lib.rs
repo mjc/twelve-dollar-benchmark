@@ -114,9 +114,6 @@
 #[doc(hidden)]
 pub use http;
 
-#[cfg(all(test, feature = "nightly"))]
-extern crate test;
-
 #[doc(no_inline)]
 pub use http::{header, HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 

@@ -816,7 +816,6 @@ dependencies = [
  "async-compression",
  "bytes",
  "chrono",
- "flate2",
  "futures-util",
  "http",
  "http-body-util",

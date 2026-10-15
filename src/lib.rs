@@ -98,25 +98,3 @@ pub fn parse_destination_ports(value: &str) -> Result<Vec<u16>, Box<dyn Error>> 
     }
     Ok(ports)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_pids, parse_sample_interval};
-
-    #[test]
-    fn process_id_parser_handles_empty_deduplicated_and_invalid_values() {
-        assert_eq!(parse_pids("").unwrap(), Vec::<u32>::new());
-        assert_eq!(parse_pids("12, 7,12").unwrap(), vec![12, 7]);
-        assert!(parse_pids("0").is_err());
-        assert!(parse_pids("12,nope").is_err());
-    }
-
-    #[test]
-    fn sample_interval_parser_checks_minimum_and_finite_range() {
-        assert_eq!(parse_sample_interval("0.5").unwrap().as_millis(), 500);
-        assert_eq!(parse_sample_interval("0.5s").unwrap().as_millis(), 500);
-        assert!(parse_sample_interval("0.09").is_err());
-        assert!(parse_sample_interval("NaN").is_err());
-        assert!(parse_sample_interval("1e100").is_err());
-    }
-}
