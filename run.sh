@@ -136,10 +136,12 @@ cargo_command=(cargo)
 rustc_command=(rustc)
 rustc_version=
 if command -v rustc >/dev/null; then
-  rustc_version=$(rustc --version)
+  if ! rustc_version=$(rustc --version 2>/dev/null); then
+    rustc_version=
+  fi
 fi
 if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null ||
-   [[ $rustc_version == "rustc 1.99.0 "* ]]; then
+   [[ -z $rustc_version || $rustc_version == "rustc 1.99.0 "* ]]; then
   if ! command -v rustup >/dev/null; then
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     if ! command -v rustup >/dev/null; then
