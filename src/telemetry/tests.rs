@@ -1,6 +1,9 @@
 use super::*;
 use super::{
-    host::{count_descriptors, listener_pids, proc_address, process_stat},
+    host::{
+        CensusPacer, CensusPacing, DescriptorCensus, count_descriptors, listener_pids,
+        proc_address, process, process_stat, socket_inodes,
+    },
     summary::{activity_report, checked_sum, network_report, rate},
 };
 use std::io::{BufRead, BufReader};
@@ -63,6 +66,7 @@ fn fixture(elapsed: f64) -> Point {
                     resident_bytes: 4096,
                     open_descriptors: Some(4),
                     established_sockets: Some(2),
+                    descriptor_census: None,
                     descriptor_limits: json!({"soft":"1024","hard":"2048"}),
                     errors: vec![],
                 }],
@@ -81,6 +85,86 @@ fn fixture(elapsed: f64) -> Point {
         system_memory: None,
         errors: vec![],
     }
+}
+
+#[test]
+fn census_cadence_limits_large_or_unknown_totals_and_preserves_long_intervals() {
+    let interval = Duration::from_secs(2);
+    assert_eq!(census_cadence(interval, Some(9_999)), interval);
+    assert_eq!(
+        census_cadence(interval, Some(10_000)),
+        Duration::from_secs(10)
+    );
+    assert_eq!(census_cadence(interval, None), Duration::from_secs(10));
+
+    let long_interval = Duration::from_secs(20);
+    assert_eq!(census_cadence(long_interval, Some(10_000)), long_interval);
+    assert_eq!(census_cadence(long_interval, None), long_interval);
+}
+
+#[test]
+fn census_pacer_cancels_immediately_for_sent_or_disconnected_stop_channel() {
+    let (stop, stop_rx) = std::sync::mpsc::channel();
+    stop.send(()).unwrap();
+    let mut pacer = CensusPacer::new(&stop_rx);
+    let error = pacer.checkpoint().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert!(pacer.is_cancelled());
+
+    let (stop, stop_rx) = std::sync::mpsc::channel();
+    drop(stop);
+    let mut pacer = CensusPacer::new(&stop_rx);
+    let error = pacer.checkpoint().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert!(pacer.is_cancelled());
+}
+
+#[test]
+fn summary_retains_fresh_peak_census_metadata_when_later_sample_is_null() {
+    let path = temporary();
+    let mut peak = fixture(1.0);
+    let census = DescriptorCensus {
+        started_at: "2026-01-01T00:00:00Z".into(),
+        finished_at: "2026-01-01T00:00:01Z".into(),
+        cadence_s: Some(1.0),
+        next_cadence_s: 1.0,
+        pacing: CensusPacing::default(),
+    };
+    let process = &mut peak.processes.get_mut("application").unwrap()[0];
+    process.open_descriptors = Some(8);
+    process.established_sockets = Some(6);
+    process.descriptor_census = Some(census.clone());
+
+    let mut later = fixture(3.0);
+    let process = &mut later.processes.get_mut("application").unwrap()[0];
+    process.open_descriptors = None;
+    process.established_sockets = None;
+    process.descriptor_census = None;
+    process.cpu_seconds = 2.0;
+    process.resident_bytes = 16_384;
+
+    let mut output = File::create(&path).unwrap();
+    for point in [peak, later] {
+        serde_json::to_writer(&mut output, &point).unwrap();
+        output.write_all(b"\n").unwrap();
+    }
+    drop(output);
+
+    let report = summarize(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    let process = &report["processes"]["application"]["processes"][0];
+    assert_eq!(process["peak_open_descriptors"], 8);
+    assert_eq!(process["peak_established_sockets"], 6);
+    assert_eq!(
+        process["peak_open_descriptors_census"]["started_at"],
+        census.started_at
+    );
+    assert_eq!(
+        process["peak_established_sockets_census"]["finished_at"],
+        census.finished_at
+    );
+    assert_eq!(process["peak_resident_bytes"], 16_384);
+    assert_eq!(process["cpu_percent_of_one_core"], 50.0);
 }
 
 fn temporary() -> PathBuf {
@@ -253,27 +337,41 @@ fn sampler_flushes_baseline_and_final_activity_even_before_regular_interval() {
     let report = sampler.finish().unwrap();
     assert_eq!(report["samples"], 2);
     assert_eq!(report["activity"]["endpoints"]["GET /feed"]["requests"], 4);
-    assert!(
-        report["processes"]["generator"]["processes"][0]["peak_open_descriptors"]
-            .as_u64()
-            .is_some()
-    );
+    let process = &report["processes"]["generator"]["processes"][0];
+    assert!(process["peak_resident_bytes"].as_u64().is_some());
+    assert!(process["cpu_percent_of_one_core"].as_f64().is_some());
+    let descriptors = process["peak_open_descriptors"].as_u64();
+    let descriptor_census = &process["peak_open_descriptors_census"];
+    assert_eq!(descriptors.is_some(), descriptor_census.is_object());
+    if let Some(census) = descriptor_census.as_object() {
+        assert!(census.get("started_at").and_then(Value::as_str).is_some());
+        assert!(census.get("finished_at").and_then(Value::as_str).is_some());
+    }
+    let sockets = process["peak_established_sockets"].as_u64();
+    let socket_census = &process["peak_established_sockets_census"];
+    assert_eq!(sockets.is_some(), socket_census.is_object());
+    if let Some(census) = socket_census.as_object() {
+        assert!(census.get("started_at").and_then(Value::as_str).is_some());
+        assert!(census.get("finished_at").and_then(Value::as_str).is_some());
+    }
     fs::remove_file(path).unwrap();
 }
 
 #[test]
 fn discovers_local_listener_and_counts_open_established_socket_descriptors() {
+    let (_stop, stop_rx) = std::sync::mpsc::channel();
+    let mut pacer = CensusPacer::new(&stop_rx);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
-    let socket_dump = socket_inodes();
+    let socket_dump = socket_inodes(&mut pacer);
     // SAFETY: dup creates an independent descriptor referring to the live client socket.
     let duplicate = unsafe { libc::dup(client.as_raw_fd()) };
     assert!(duplicate >= 0);
     // SAFETY: duplicate is a fresh descriptor owned by this test.
     let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
     let (_, duplicated_sockets, _) =
-        count_descriptors(std::process::id(), socket_dump.as_ref().ok()).unwrap();
+        count_descriptors(std::process::id(), socket_dump.as_ref().ok(), &mut pacer).unwrap();
     assert!(duplicated_sockets.unwrap() >= 2);
 
     let long_dir = temporary().with_extension("long-fd");
@@ -285,7 +383,7 @@ fn discovers_local_listener_and_counts_open_established_socket_descriptors() {
     fs::write(&target, "long symlink target").unwrap();
     let long_target = File::open(&target).unwrap();
     let (count_with_long_target, _, _) =
-        count_descriptors(std::process::id(), socket_dump.as_ref().ok()).unwrap();
+        count_descriptors(std::process::id(), socket_dump.as_ref().ok(), &mut pacer).unwrap();
     // The process-wide count can change while unrelated tests run concurrently.
     // These five held descriptors plus count_descriptors' own directory fd are stable.
     assert!(count_with_long_target >= 6);
@@ -297,7 +395,8 @@ fn discovers_local_listener_and_counts_open_established_socket_descriptors() {
             .unwrap()
             .contains(&std::process::id())
     );
-    let observed = process(std::process::id(), 100.0, 4096, &socket_inodes()).unwrap();
+    let socket_dump = socket_inodes(&mut pacer);
+    let observed = process(std::process::id(), 100.0, 4096, &socket_dump, &mut pacer).unwrap();
     assert!(observed.established_sockets.unwrap() >= 2);
     assert!(observed.open_descriptors.unwrap() >= 3);
     assert!(observed.descriptor_limits["soft"].as_str().is_some());

@@ -4,8 +4,9 @@ mod summary;
 mod tests;
 
 use host::{
-    Interface, Process, SystemMemory, discover_roles, interfaces, limits, process,
-    service_resources, socket_inodes, system_memory, tcp_counters, ticks_per_second,
+    CensusPacer, DescriptorCensus, Interface, Process, SystemMemory, discover_roles, interfaces,
+    limits, process, process_fast, service_resources, socket_inodes, system_memory, tcp_counters,
+    ticks_per_second,
 };
 pub use summary::summarize_hold;
 use summary::{interval_report, summarize};
@@ -25,6 +26,124 @@ use std::{
 };
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub type Roles = BTreeMap<String, Vec<u32>>;
+
+struct CensusSnapshot {
+    completed: Instant,
+    processes: BTreeMap<String, Vec<Process>>,
+    errors: Vec<String>,
+}
+
+fn census_cadence(interval: Duration, descriptors: Option<usize>) -> Duration {
+    const LARGE_CENSUS_THRESHOLD: usize = 10_000;
+    if descriptors.is_none_or(|count| count >= LARGE_CENSUS_THRESHOLD) {
+        interval.max(Duration::from_secs(10))
+    } else {
+        interval
+    }
+}
+
+fn start_census_worker(
+    roles: Roles,
+    ticks: f64,
+    page: u64,
+    interval: Duration,
+    results: mpsc::SyncSender<CensusSnapshot>,
+    stop: mpsc::Receiver<()>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut previous_start: Option<Instant> = None;
+        loop {
+            let started_at = Utc::now();
+            let started = Instant::now();
+            let mut pacer = CensusPacer::new(&stop);
+            let sockets = socket_inodes(&mut pacer);
+            if pacer.is_cancelled() {
+                return;
+            }
+            let mut errors = Vec::new();
+            let mut processes = BTreeMap::new();
+            let mut descriptor_total = Some(0usize);
+            for (role, pids) in &roles {
+                let mut data = Vec::new();
+                for pid in pids {
+                    match process(*pid, ticks, page, &sockets, &mut pacer) {
+                        Ok(process) => {
+                            descriptor_total = descriptor_total
+                                .zip(process.open_descriptors)
+                                .and_then(|(total, count)| total.checked_add(count));
+                            data.push(process);
+                        }
+                        Err(error) => {
+                            if pacer.is_cancelled() {
+                                return;
+                            }
+                            descriptor_total = None;
+                            errors.push(format!("{role} PID {pid}: {error}"));
+                        }
+                    }
+                }
+                processes.insert(role.clone(), data);
+            }
+            if pacer.checkpoint().is_err() {
+                return;
+            }
+            let pacing = pacer.finish();
+            let completed = Instant::now();
+            let next_cadence = census_cadence(interval, descriptor_total);
+            let metadata = DescriptorCensus {
+                started_at: started_at.to_rfc3339(),
+                finished_at: Utc::now().to_rfc3339(),
+                cadence_s: previous_start
+                    .map(|previous| started.duration_since(previous).as_secs_f64()),
+                next_cadence_s: next_cadence.as_secs_f64(),
+                pacing,
+            };
+            for process in processes.values_mut().flatten() {
+                process.descriptor_census = Some(metadata.clone());
+            }
+            let snapshot = CensusSnapshot {
+                completed,
+                processes,
+                errors,
+            };
+            match results.try_send(snapshot) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            }
+            previous_start = Some(started);
+            match stop.recv_timeout(next_cadence) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    })
+}
+
+struct CensusWorker {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CensusWorker {
+    fn stop_and_join(&mut self) -> std::result::Result<(), String> {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| "descriptor census worker panicked".to_owned())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CensusWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Point {
@@ -78,27 +197,79 @@ impl Sampler {
             let ticks = ticks_per_second(ticks);
             let page = u64::try_from(page).map_err(|_| "invalid kernel page size".to_owned())?;
             let mut writer = BufWriter::new(file);
+            let (census_results, census_receiver) = mpsc::sync_channel(1);
+            let (census_stop, census_stop_receiver) = mpsc::channel();
+            let mut census_worker = CensusWorker {
+                stop: census_stop,
+                thread: Some(start_census_worker(
+                    roles.clone(),
+                    ticks,
+                    page,
+                    interval,
+                    census_results,
+                    census_stop_receiver,
+                )),
+            };
             let started = Instant::now();
             let mut identities = BTreeMap::new();
             let mut final_sample = false;
+            let mut census_stopped = false;
+            let mut census_channel_closed = false;
             let mut previous: Option<Point> = None;
             loop {
                 let mut errors = Vec::new();
+                let census = match census_receiver.try_recv() {
+                    Ok(snapshot) => {
+                        let freshness = interval.saturating_mul(2).max(Duration::from_secs(1));
+                        if snapshot.completed.elapsed() <= freshness {
+                            errors.extend(snapshot.errors.iter().cloned());
+                            Some(snapshot)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !census_stopped && !census_channel_closed {
+                            errors.push("descriptor census worker stopped unexpectedly".into());
+                            census_channel_closed = true;
+                        }
+                        None
+                    }
+                };
                 let interfaces = fs::read_to_string("/proc/net/dev")
                     .map_err(|e| e.to_string())
                     .and_then(|text| interfaces(&text).map_err(|e| e.to_string()))
                     .map_err(|e| errors.push(format!("network: {e}")))
                     .ok();
                 let mut processes = BTreeMap::new();
-                let sockets = socket_inodes();
                 for (role, pids) in &roles {
                     let mut data = Vec::new();
                     for pid in pids {
-                        match process(*pid, ticks, page, &sockets) {
+                        match process_fast(*pid, ticks, page) {
                             Ok(data_point) => {
                                 let original =
                                     identities.entry(*pid).or_insert(data_point.start_ticks);
                                 if *original == data_point.start_ticks {
+                                    let mut data_point = data_point;
+                                    if let Some(census_process) = census
+                                        .as_ref()
+                                        .and_then(|snapshot| snapshot.processes.get(role))
+                                        .into_iter()
+                                        .flatten()
+                                        .find(|process| {
+                                            process.pid == *pid
+                                                && process.start_ticks == data_point.start_ticks
+                                        })
+                                    {
+                                        data_point.open_descriptors =
+                                            census_process.open_descriptors;
+                                        data_point.established_sockets =
+                                            census_process.established_sockets;
+                                        data_point.descriptor_census =
+                                            census_process.descriptor_census.clone();
+                                        data_point.errors.extend(census_process.errors.clone());
+                                    }
                                     data.push(data_point);
                                 } else {
                                     errors.push(format!(
@@ -153,7 +324,11 @@ impl Sampler {
                     break;
                 }
                 match receiver.recv_timeout(interval) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => final_sample = true,
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        final_sample = true;
+                        census_worker.stop_and_join()?;
+                        census_stopped = true;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
