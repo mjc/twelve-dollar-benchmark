@@ -75,7 +75,7 @@ fn prepare_descriptor_limit(users: usize) -> Result<(), Box<dyn std::error::Erro
         return Err(std::io::Error::last_os_error().into());
     }
     let required = (users as libc::rlim_t).saturating_add(256);
-    let desired = required.max(524_288);
+    let desired = required.max(1_048_576);
     if limit.rlim_cur < desired {
         limit.rlim_cur = desired.min(limit.rlim_max);
         // SAFETY: the pointer is valid and the new soft limit is within the hard limit.

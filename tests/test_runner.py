@@ -122,27 +122,27 @@ class RunnerTests(unittest.TestCase):
     def test_launcher_raises_soft_limit_and_preserves_hard_limit(self):
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
         if hard == resource.RLIM_INFINITY:
-            hard = 1_000_000
-        if hard < 524288:
+            hard = 2_097_152
+        if hard < 1048576:
             self.skipTest("host hard limit cannot accommodate the descriptor floor")
         run = self.run_runner(self.bench, limits=(32, hard))
         self.assertEqual(run.returncode, 7, run.stderr)
         result = json.loads((self.root / "result").read_text())
         soft, actual_hard = result["nofile"]
-        self.assertEqual(soft, 524288)
+        self.assertEqual(soft, 1048576)
         self.assertEqual(actual_hard, hard)
         self.assertEqual(result["summary"], str(self.bench / "results" / "summary.json"))
 
     def test_launcher_preserves_already_higher_soft_limit(self):
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
         if hard == resource.RLIM_INFINITY:
-            hard = 1_000_000
-        if hard < 600000:
+            hard = 2_097_152
+        if hard < 2_097_152:
             self.skipTest("host hard limit cannot accommodate the higher soft limit")
-        run = self.run_runner(self.bench, limits=(600000, hard))
+        run = self.run_runner(self.bench, limits=(2_097_152, hard))
         self.assertEqual(run.returncode, 7, run.stderr)
         soft, actual_hard = json.loads((self.root / "result").read_text())["nofile"]
-        self.assertEqual(soft, 600000)
+        self.assertEqual(soft, 2_097_152)
         self.assertEqual(actual_hard, hard)
 
     def test_launcher_caps_at_hard_limit_and_warns(self):

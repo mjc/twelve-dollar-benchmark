@@ -56,9 +56,10 @@ To split users across SSH generator hosts, add
 `--source-ips '192.0.2.20,192.0.2.21' --user bench`. The hosts need compatible
 binaries, SSH key access, and synchronized clocks.
 
-The launcher raises its soft file-descriptor limit toward 524,288 and raises
-`nf_conntrack_max` if available and lower. Raising conntrack requires root,
-`sudo`, or `doas`. Remote generators and servers need their own limits.
+The launcher and each generator raise their soft FD limit to 1,048,576 (1 Mi),
+subject to the inherited hard limit. `run.sh` also raises `nf_conntrack_max` if
+available and lower; this requires root, `sudo`, or `doas`. Remote hosts and
+servers need their own limits.
 
 ## Workload
 

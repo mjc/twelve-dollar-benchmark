@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--users", type=int, default=300000)
     args = parser.parse_args()
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(hard, 700000)), hard))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(hard, 1_048_576)), hard))
     if args.server:
         asyncio.run(serve(args.server))
         return

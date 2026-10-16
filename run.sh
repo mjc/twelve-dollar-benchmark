@@ -77,7 +77,7 @@ fi
 
 # Give the launcher and its local generator a useful descriptor floor. This
 # affects only this process tree; the native generator checks its own limit.
-descriptor_floor=524288
+descriptor_floor=1048576
 soft_nofile=$(ulimit -Sn)
 hard_nofile=$(ulimit -Hn)
 if [[ $soft_nofile != unlimited ]] && (( soft_nofile < descriptor_floor )); then

@@ -448,7 +448,7 @@ class MetricsTests(unittest.TestCase):
         generator_limits = generator["processes"]["generator"]["processes"][0]["descriptor_limits"]
         inherited_hard = application_limits[1]
         expected_generator_limit = (
-            524288 if inherited_hard == resource.RLIM_INFINITY else min(524288, inherited_hard)
+            1048576 if inherited_hard == resource.RLIM_INFINITY else min(1048576, inherited_hard)
         )
         self.assertEqual(int(generator_limits["soft"]), expected_generator_limit)
         self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), application_limits)
