@@ -10,9 +10,11 @@ IP address and one or more ports:
 ./run.sh 10.0.0.5 3000 --source-ips '10.0.0.[11-12]' --user bench --users 8000 --tokens /path/to/tokens.json
 ```
 
-The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with Rust
-1.99.1 and locked dependencies. If
-that toolchain is missing, it installs rustup and Rust 1.99.1. The generator
+The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with the
+installed Rust toolchain and locked dependencies. It skips the known-bad Rust
+1.99.0 compiler and falls back to the current stable channel when needed. The
+build log records the compiler version; this change was checked with Rust
+1.99.1. The generator
 sends HTTP/1.1 traffic. It does not include HTTPS or TLS support.
 
 The build also produces `twelve-dollar-observer`. For remote target monitoring,
