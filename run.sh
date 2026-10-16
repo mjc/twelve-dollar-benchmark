@@ -132,11 +132,16 @@ if (( ! skip_conntrack_tuning )) && [[ -r $conntrack_max ]]; then
   fi
 fi
 
-rust_version=1.99.0
 cargo_command=(cargo)
 rustc_command=(rustc)
+rustc_version=
+if command -v rustc >/dev/null; then
+  if ! rustc_version=$(rustc --version 2>/dev/null); then
+    rustc_version=
+  fi
+fi
 if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null ||
-   [[ $(rustc --version) != "rustc $rust_version "* || $(cargo --version) != "cargo $rust_version "* ]]; then
+   [[ -z $rustc_version || $rustc_version == "rustc 1.99.0 "* ]]; then
   if ! command -v rustup >/dev/null; then
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     if ! command -v rustup >/dev/null; then
@@ -144,15 +149,30 @@ if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null ||
         sh -s -- -y --no-modify-path --default-toolchain none
     fi
   fi
-  if ! rustup run "$rust_version" rustc --version >/dev/null 2>&1; then
-    rustup toolchain install "$rust_version" --profile minimal
+  stable_rustc=
+  if ! stable_rustc=$(rustup run stable rustc --version 2>/dev/null); then
+    stable_rustc=
   fi
-  cargo_command=(rustup run "$rust_version" cargo)
-  rustc_command=(rustup run "$rust_version" rustc)
+  if [[ -z $stable_rustc ]]; then
+    rustup toolchain install stable --profile minimal
+  elif [[ $stable_rustc == "rustc 1.99.0 "* ]]; then
+    rustup update stable
+  fi
+  stable_rustc=
+  if ! stable_rustc=$(rustup run stable rustc --version 2>/dev/null); then
+    stable_rustc=
+  fi
+  if [[ -z $stable_rustc || $stable_rustc == "rustc 1.99.0 "* ]]; then
+    echo "Rust stable is unavailable or resolves to known-bad Rust 1.99.0" >&2
+    exit 1
+  fi
+  cargo_command=(rustup run stable cargo)
+  rustc_command=(rustup run stable rustc)
 fi
 
 # Select the host explicitly so inherited Cargo targets cannot select a stale binary.
 rust_details=$("${rustc_command[@]}" -vV)
+printf 'Building with %s\n' "${rust_details%%$'\n'*}" >&2
 rust_host=${rust_details#*$'\nhost: '}
 rust_host=${rust_host%%$'\n'*}
 "${cargo_command[@]}" build --locked --release --target "$rust_host" --manifest-path "$bench_dir/Cargo.toml" --target-dir "$bench_dir/target"

@@ -41,7 +41,7 @@ elif name == "git":
 elif name == "curl":
     print("exec " + shlex.join([sys.executable, str(root / "driver"), "--install-rustup"]))
 elif name == "rustc" or args == ["--version"]:
-    version = "1.99.0" if os.environ["MODE"] == "native" else "1.98.0"
+    version = {"native": "1.99.1", "bad": "1.99.0"}.get(os.environ["MODE"], "1.98.0")
     print(name + " " + version + " (fixture)")
     if args == ["-vV"]:
         print("host: fixture-host")
@@ -50,10 +50,12 @@ else:
         if args[:2] == ["toolchain", "install"]:
             (root / "installed").touch()
             sys.exit(0)
-        assert args[:2] == ["run", "1.99.0"], args
+        assert args[:2] == ["run", "stable"], args
         if args[2] == "rustc":
             if args[3:] == ["-vV"]:
-                print("rustc 1.99.0 (fixture)\nhost: fixture-host")
+                print("rustc 1.99.1 (fixture)\nhost: fixture-host")
+            elif args[3:] == ["--version"]:
+                print("rustc 1.99.1 (fixture)")
             sys.exit(0 if (root / "installed").exists() else 1)
         assert args[2] == "cargo", args
         args = args[3:]
@@ -170,14 +172,20 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["args"], ["--users=7"])
         self.assertFalse(any(call[0] in ["curl", "rustup"] for call in self.calls()))
 
-    def test_rustup_bootstrap_and_pinned_toolchain_reuse(self):
+    def test_rustup_bootstrap_and_stable_toolchain_reuse(self):
         self.env.update(MODE="old", TOKENS="../custom-tokens.json")
-        run = self.run_runner(self.bench.parent, "127.0.0.1", "3000")
+        run = self.run_runner(self.bench, "127.0.0.1", "3000")
         self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertFalse(any(call[0] in ["curl", "rustup"] for call in self.calls()))
+        (self.root / "calls").unlink()
+
+        self.env["MODE"] = "bad"
+        run = self.run_runner(self.bench.parent, "127.0.0.1", "3000")
+        self.assertEqual(run.returncode, 7, f"{run.stderr}\n{self.calls()}")
         calls = self.calls()
         self.assertTrue(any(call[0] == "curl" for call in calls))
-        self.assertIn(["rustup", "toolchain", "install", "1.99.0", "--profile", "minimal"], calls)
-        self.assertTrue(any(call[:4] == ["rustup", "run", "1.99.0", "cargo"] for call in calls))
+        self.assertIn(["rustup", "toolchain", "install", "stable", "--profile", "minimal"], calls)
+        self.assertTrue(any(call[:4] == ["rustup", "run", "stable", "cargo"] for call in calls))
         self.assertEqual(json.loads((self.root / "result").read_text())["tokens"], str(self.bench.parent / "../custom-tokens.json"))
         (self.root / "calls").unlink()
         run = self.run_runner(self.bench, "127.0.0.1", "3000")

@@ -10,9 +10,11 @@ IP address and one or more ports:
 ./run.sh 10.0.0.5 3000 --source-ips '10.0.0.[11-12]' --user bench --users 8000 --tokens /path/to/tokens.json
 ```
 
-The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with Rust
-1.99.0 and locked dependencies. If
-that toolchain is missing, it installs rustup and Rust 1.99.0. The generator
+The runner builds `twelve-dollar-benchmark`, an edition 2024 crate, with the
+installed Rust toolchain and locked dependencies. It skips the known-bad Rust
+1.99.0 compiler and falls back to the current stable channel when needed. The
+build log records the compiler version; this change was checked with Rust
+1.99.1. The generator
 sends HTTP/1.1 traffic. It does not include HTTPS or TLS support.
 
 The build also produces `twelve-dollar-observer`. For remote target monitoring,
@@ -237,15 +239,8 @@ connection setup. Connection setup durations are reported separately.
 
 `duration_s` includes shutdown time.
 
-On Linux/Android, a local connector patch uses `IP_BIND_ADDRESS_NO_PORT` so
-explicit source binding does not reserve a port before the destination is known.
-This lets the same source port serve distinct destination tuples. Provenance and
-the retained upstream license are in [the connector patch notes](vendor/hyper-util/LOCAL_PATCH.md).
-
-The [Hyper patch](vendor/hyper/LOCAL-PATCHES.md) starts adaptive HTTP/1 reads at
-1 KiB, allocates write headers on demand and reserves one slot for the first
-queued body. Read buffers still grow for larger responses; HTTP/1 limits remain
-unchanged.
+Pinned Hyper forks retain the benchmark's HTTP/1 and connector optimizations.
+See [patch provenance and upstream revisions](patches/README.md).
 
 ## Code layout
 

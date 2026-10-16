@@ -2,7 +2,6 @@
   languages.rust = {
     enable = true;
     channel = "stable";
-    version = "1.99.0";
     components = ["cargo" "rustc" "clippy" "rustfmt" "rust-src" "rust-analyzer"];
   };
 
