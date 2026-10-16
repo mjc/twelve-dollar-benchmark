@@ -143,6 +143,46 @@ before terminating a generator that has not exited. It collects available
 outputs and marks the run incomplete. The benchmark collects its own request
 samples, connection samples, and telemetry.
 
+## Observed generator throughput
+
+Measured on 2026-10-16 with one generator VM, commit `a2db1cc`, the browsing
+workload below, and normal observer and resource sampling.
+
+| Generator VM | Specification |
+|---|---|
+| OS | Ubuntu 24.04, x86-64 |
+| CPU | 1 vCPU |
+| RAM | 2 GiB |
+| Swap | Disabled |
+| Disk | 50 GiB |
+
+The generator used one source address and ten destination ports to a remote
+target. The run had a 60-second ramp, 300-second hold, 30-second ramp-down, and
+10-second grace period.
+
+| Concurrent VUs | Hold duration | HTTP requests/s during hold | Peak established TCP connections |
+|---|---|---|---|
+| 180,000 | 300 seconds | 17,529.8 | 180,000 |
+
+Across all phases, 6,210,920 requests completed with zero HTTP errors. The request
+rate above covers the hold only; the connection count is the generator process's
+measured established-socket peak.
+
+| Generator resource | Measured value | Window |
+|---|---|---|
+| Process CPU | 53.23% of one core | Hold |
+| VM CPU busy | 55.85% of one core | Hold |
+| Peak process RSS | 966.41 MiB | Whole run |
+| Peak VM used RAM | 1,801.05 MiB | Whole run |
+| Minimum VM available RAM | 166.94 MiB | Whole run |
+| Peak process file descriptors | 180,011 | Whole run |
+| Average receive rate | 31.59 MB/s | Whole run |
+| Average transmit rate | 3.66 MB/s | Whole run |
+
+VM used RAM is `MemTotal - MemAvailable`, including operating-system and kernel
+memory. Memory and descriptor peaks are sampled. Network rates use decimal MB/s
+and include other traffic on the observed interface.
+
 ## Results
 
 The runner prints Markdown tables when a run finishes. Scoring output starts
