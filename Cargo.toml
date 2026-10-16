@@ -33,6 +33,6 @@ url = "2.5"
 flate2 = "1"
 
 [patch.crates-io]
-hyper = { git = "https://github.com/mjc/hyper.git", rev = "903ce8f3c54704c148c0967e4374c69707906dc8" }
+hyper = { git = "https://github.com/mjc/hyper.git", rev = "aaf16f787d264aa967e357b07a5781f593d5f230" }
 hyper-util = { git = "https://github.com/mjc/hyper-util.git", rev = "df185d6b535ca66198ebf8175e14b1ea4db75277" }
 tokio = { git = "https://github.com/mjc/tokio.git", rev = "30fa5746845ea20c8908134ee72ac6f43ecc76ac" }
