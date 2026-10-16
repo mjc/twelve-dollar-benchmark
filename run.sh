@@ -132,6 +132,31 @@ if (( ! skip_conntrack_tuning )) && [[ -r $conntrack_max ]]; then
   fi
 fi
 
+# Install a prerequisite only when the selected build/bootstrap path needs it.
+install_build_packages() {
+  if ! command -v apt-get >/dev/null; then
+    echo "Missing build prerequisites: $*; install the equivalent packages for your system" >&2
+    exit 1
+  fi
+  privilege=()
+  if (( EUID != 0 )); then
+    if command -v sudo >/dev/null; then
+      privilege=(sudo)
+    elif command -v doas >/dev/null; then
+      privilege=(doas)
+    else
+      echo "Missing build prerequisites: $*; install them as root and rerun" >&2
+      exit 1
+    fi
+  fi
+  echo "Installing missing build prerequisites: $*" >&2
+  "${privilege[@]}" apt-get update
+  "${privilege[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+}
+
+# Minimal Ubuntu images do not include the linker needed even by Rust crates.
+command -v cc >/dev/null || install_build_packages build-essential
+
 cargo_command=(cargo)
 rustc_command=(rustc)
 rustc_version=
@@ -145,6 +170,7 @@ if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null ||
   if ! command -v rustup >/dev/null; then
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     if ! command -v rustup >/dev/null; then
+      command -v curl >/dev/null || install_build_packages curl ca-certificates
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
         sh -s -- -y --no-modify-path --default-toolchain none
     fi
