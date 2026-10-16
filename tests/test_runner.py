@@ -40,6 +40,14 @@ elif name == "git":
     print(root / "main" / ".git")
 elif name == "curl":
     print("exec " + shlex.join([sys.executable, str(root / "driver"), "--install-rustup"]))
+elif name == "apt-get":
+    if args[:1] == ["install"]:
+        bindir = root / "bin"
+        for package, tool in [("build-essential", "cc"), ("git", "git"), ("curl", "curl")]:
+            if package in args and not (bindir / tool).exists():
+                (bindir / tool).symlink_to(root / "driver")
+elif name == "sudo" or name == "doas":
+    os.execvp(args[0], args)
 elif name == "rustc" or args == ["--version"]:
     version = {"native": "1.99.1", "bad": "1.99.0"}.get(os.environ["MODE"], "1.98.0")
     print(name + " " + version + " (fixture)")
@@ -92,7 +100,7 @@ class RunnerTests(unittest.TestCase):
         bindir.mkdir()
         for tool in ["bash", "sh", "dirname"]:
             (bindir / tool).symlink_to(shutil.which(tool))
-        for tool in ["cargo", "rustc", "git", "curl"]:
+        for tool in ["cargo", "rustc", "git", "curl", "cc"]:
             (bindir / tool).symlink_to(driver)
         self.env = dict(os.environ, PATH=str(bindir), HOME=str(self.root),
                         CARGO_HOME=str(self.root / "cargo home"), MODE="native",
@@ -146,6 +154,47 @@ class RunnerTests(unittest.TestCase):
 
     def calls(self):
         return [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+
+    def test_missing_ubuntu_build_tools_are_installed_once(self):
+        bindir = self.root / "bin"
+        (bindir / "cc").unlink()
+        for tool in ["apt-get", "sudo", "doas"]:
+            (bindir / tool).symlink_to(self.root / "driver")
+        (bindir / "env").symlink_to(shutil.which("env"))
+        run = self.run_runner(self.bench)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        calls = self.calls()
+        self.assertIn(["apt-get", "update"], calls)
+        install = next(call for call in calls if call[:2] == ["apt-get", "install"])
+        self.assertEqual(install, ["apt-get", "install", "-y", "--no-install-recommends", "build-essential"])
+        (self.root / "calls").unlink()
+        run = self.run_runner(self.bench)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertFalse(any(call[0] in ["apt-get", "sudo", "doas"] for call in self.calls()))
+
+    def test_existing_toolchain_does_not_require_git_or_curl(self):
+        for tool in ["git", "curl"]:
+            (self.root / "bin" / tool).unlink()
+        run = self.run_runner(self.bench)
+        self.assertEqual(run.returncode, 7, run.stderr)
+
+    def test_missing_curl_is_installed_only_for_rustup_bootstrap(self):
+        bindir = self.root / "bin"
+        (bindir / "curl").unlink()
+        for tool in ["apt-get", "sudo", "doas"]:
+            (bindir / tool).symlink_to(self.root / "driver")
+        (bindir / "env").symlink_to(shutil.which("env"))
+        self.env["MODE"] = "bad"
+        run = self.run_runner(self.bench)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertIn(["apt-get", "install", "-y", "--no-install-recommends", "curl", "ca-certificates"], self.calls())
+
+    def test_missing_build_tools_without_package_manager_fail_before_build(self):
+        (self.root / "bin" / "cc").unlink()
+        run = self.run_runner(self.bench)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("Missing build prerequisites: build-essential", run.stderr)
+        self.assertFalse((self.root / "calls").exists())
 
     def test_target_paths_flags_and_exit_status_from_any_directory(self):
         stale = self.bench / "target" / "release" / "twelve-dollar-benchmark"
