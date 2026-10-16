@@ -253,7 +253,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 [[package]]
 name = "hyper"
 version = "1.12.0"
-source = "git+https://github.com/mjc/hyper.git?rev=903ce8f3c54704c148c0967e4374c69707906dc8#903ce8f3c54704c148c0967e4374c69707906dc8"
+source = "git+https://github.com/mjc/hyper.git?rev=aaf16f787d264aa967e357b07a5781f593d5f230#aaf16f787d264aa967e357b07a5781f593d5f230"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -727,8 +727,7 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
+source = "git+https://github.com/mjc/tokio.git?rev=30fa5746845ea20c8908134ee72ac6f43ecc76ac#30fa5746845ea20c8908134ee72ac6f43ecc76ac"
 dependencies = [
  "bytes",
  "libc",

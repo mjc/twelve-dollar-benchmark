@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -24,8 +26,121 @@ pub(super) struct Process {
     pub(super) resident_bytes: u64,
     pub(super) open_descriptors: Option<usize>,
     pub(super) established_sockets: Option<usize>,
+    #[serde(default)]
+    pub(super) descriptor_census: Option<DescriptorCensus>,
     pub(super) descriptor_limits: Value,
     pub(super) errors: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct DescriptorCensus {
+    pub(super) started_at: String,
+    pub(super) finished_at: String,
+    pub(super) cadence_s: Option<f64>,
+    pub(super) next_cadence_s: f64,
+    #[serde(default)]
+    pub(super) pacing: CensusPacing,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(super) struct CensusPacing {
+    pub(super) work_wall_slice_budget_ms: f64,
+    pub(super) target_wall_duty_cycle_percent: f64,
+    pub(super) measured_work_wall_s: f64,
+    pub(super) measured_rest_wall_s: f64,
+    pub(super) observed_wall_duty_cycle_percent: f64,
+    pub(super) rest_count: u64,
+    pub(super) max_work_wall_slice_ms: f64,
+    pub(super) max_overshoot_wall_ms: f64,
+}
+
+pub(super) struct CensusPacer<'a> {
+    stop: &'a mpsc::Receiver<()>,
+    slice_started: Instant,
+    measured_work: Duration,
+    measured_sleep: Duration,
+    max_work_slice: Duration,
+    sleep_count: u64,
+    cancelled: bool,
+}
+
+impl<'a> CensusPacer<'a> {
+    const WORK_SLICE_BUDGET: Duration = Duration::from_millis(1);
+    const REST_MULTIPLIER: u32 = 9;
+
+    pub(super) fn new(stop: &'a mpsc::Receiver<()>) -> Self {
+        Self {
+            stop,
+            slice_started: Instant::now(),
+            measured_work: Duration::ZERO,
+            measured_sleep: Duration::ZERO,
+            max_work_slice: Duration::ZERO,
+            sleep_count: 0,
+            cancelled: false,
+        }
+    }
+
+    pub(super) fn checkpoint(&mut self) -> io::Result<()> {
+        if self.cancelled {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        match self.stop.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                self.cancelled = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let work = self.slice_started.elapsed();
+        if work >= Self::WORK_SLICE_BUDGET {
+            self.measured_work += work;
+            self.max_work_slice = self.max_work_slice.max(work);
+            match self
+                .stop
+                .recv_timeout(work.saturating_mul(Self::REST_MULTIPLIER))
+            {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.cancelled = true;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.measured_sleep += self.slice_started.elapsed() - work;
+                    self.sleep_count += 1;
+                    self.slice_started = Instant::now();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    pub(super) fn finish(mut self) -> CensusPacing {
+        let final_slice = self.slice_started.elapsed();
+        self.measured_work += final_slice;
+        self.max_work_slice = self.max_work_slice.max(final_slice);
+        let work_s = self.measured_work.as_secs_f64();
+        let sleep_s = self.measured_sleep.as_secs_f64();
+        let total_s = work_s + sleep_s;
+        let budget_ms = Self::WORK_SLICE_BUDGET.as_secs_f64() * 1000.0;
+        let max_slice_ms = self.max_work_slice.as_secs_f64() * 1000.0;
+        CensusPacing {
+            work_wall_slice_budget_ms: budget_ms,
+            target_wall_duty_cycle_percent: 100.0 / f64::from(Self::REST_MULTIPLIER + 1),
+            measured_work_wall_s: work_s,
+            measured_rest_wall_s: sleep_s,
+            observed_wall_duty_cycle_percent: if total_s > 0.0 {
+                work_s / total_s * 100.0
+            } else {
+                0.0
+            },
+            rest_count: self.sleep_count,
+            max_work_wall_slice_ms: max_slice_ms,
+            max_overshoot_wall_ms: (max_slice_ms - budget_ms).max(0.0),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -96,7 +211,7 @@ pub(super) fn interfaces(text: &str) -> Result<BTreeMap<String, Interface>> {
     Ok(result)
 }
 
-pub(super) fn socket_inodes() -> Result<HashSet<u64>> {
+pub(super) fn socket_inodes(pacer: &mut CensusPacer<'_>) -> Result<HashSet<u64>> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: no pointer arguments; OwnedFd takes ownership only on success.
     let raw = unsafe {
@@ -111,8 +226,8 @@ pub(super) fn socket_inodes() -> Result<HashSet<u64>> {
     }
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
     let timeout = libc::timeval {
-        tv_sec: 2,
-        tv_usec: 0,
+        tv_sec: 0,
+        tv_usec: 100_000,
     };
     // SAFETY: the option pointer and length describe a live timeval.
     if unsafe {
@@ -132,6 +247,7 @@ pub(super) fn socket_inodes() -> Result<HashSet<u64>> {
     kernel.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK)?;
     let mut inodes = HashSet::new();
     for family in [libc::AF_INET, libc::AF_INET6] {
+        pacer.checkpoint()?;
         // nlmsghdr (16 bytes), inet_diag_req_v2 (8), inet_diag_sockid (48).
         let mut request = [0_u8; 72];
         request[..4].copy_from_slice(&72_u32.to_ne_bytes());
@@ -155,14 +271,21 @@ pub(super) fn socket_inodes() -> Result<HashSet<u64>> {
         {
             return Err(std::io::Error::last_os_error().into());
         }
-        read_socket_dump(socket.as_raw_fd(), &mut inodes)?;
+        pacer.checkpoint()?;
+        read_socket_dump(socket.as_raw_fd(), &mut inodes, pacer)?;
     }
     Ok(inodes)
 }
 
-pub(super) fn read_socket_dump(fd: std::os::fd::RawFd, inodes: &mut HashSet<u64>) -> Result<()> {
+fn read_socket_dump(
+    fd: std::os::fd::RawFd,
+    inodes: &mut HashSet<u64>,
+    pacer: &mut CensusPacer<'_>,
+) -> Result<()> {
     let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    let mut last_receive = Instant::now();
     'dump: loop {
+        pacer.checkpoint()?;
         // SAFETY: buffer is writable for its entire stated length.
         let received = unsafe {
             libc::recv(
@@ -173,12 +296,23 @@ pub(super) fn read_socket_dump(fd: std::os::fd::RawFd, inodes: &mut HashSet<u64>
             )
         };
         if received < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                if last_receive.elapsed() >= Duration::from_secs(2) {
+                    return Err("socket diagnostic dump made no progress for two seconds".into());
+                }
+                continue;
+            }
+            return Err(error.into());
         }
         let received = usize::try_from(received)?;
         if received == 0 || received > buffer.len() {
             return Err("truncated socket diagnostic dump".into());
         }
+        last_receive = Instant::now();
         let mut offset = 0;
         while offset + 16 <= received {
             let header = &buffer[offset..offset + 16];
@@ -200,6 +334,7 @@ pub(super) fn read_socket_dump(fd: std::os::fd::RawFd, inodes: &mut HashSet<u64>
                 _ => {}
             }
             offset += (length + 3) & !3;
+            pacer.checkpoint()?;
         }
     }
     Ok(())
@@ -264,6 +399,7 @@ pub(super) fn process_stat(text: &str) -> Result<(String, u64, u64, u64)> {
 pub(super) fn count_descriptors(
     pid: u32,
     sockets: Option<&HashSet<u64>>,
+    pacer: &mut CensusPacer<'_>,
 ) -> Result<(usize, Option<usize>, Vec<std::io::Error>)> {
     use std::{
         ffi::{CStr, CString},
@@ -311,6 +447,9 @@ pub(super) fn count_descriptors(
     let mut socket_complete = sockets.is_some();
     let mut link = [0_u8; 256];
     loop {
+        // One entry is the bounded work unit. Keep errno reads immediately
+        // adjacent to their syscalls because pacing can change thread-local errno.
+        pacer.checkpoint()?;
         // readdir returns a borrowed dirent valid until the next readdir call.
         // SAFETY: directory is live and exclusively used by this loop.
         unsafe {
@@ -379,33 +518,46 @@ pub(super) fn process(
     ticks: f64,
     page_size: u64,
     sockets: &Result<HashSet<u64>>,
+    pacer: &mut CensusPacer<'_>,
 ) -> Result<Process> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (name, start_ticks, cpu_ticks, resident_pages) = process_stat(&text)?;
+    pacer.checkpoint()?;
+    let mut process = process_fast(pid, ticks, page_size)?;
     let mut errors = Vec::new();
     let sockets = sockets.as_ref().map_err(|error| {
         errors.push(format!("established sockets: {error}"));
     });
-    let same_namespace = fs::read_link(format!("/proc/{pid}/ns/net"))
-        .ok()
-        .zip(fs::read_link("/proc/self/ns/net").ok())
-        .is_some_and(|(process, observer)| process == observer);
+    let same_namespace = same_network_namespace(pid);
     if !same_namespace {
         errors.push("established sockets unavailable: process network namespace differs from observer or cannot be read".into());
     }
-    let (open_descriptors, established_sockets) = match count_descriptors(
+    let descriptor_result = count_descriptors(
         pid,
         sockets.as_ref().ok().copied().filter(|_| same_namespace),
-    ) {
+        pacer,
+    );
+    match descriptor_result {
         Ok((count, established, socket_errors)) => {
             errors.extend(socket_errors.into_iter().map(|error| error.to_string()));
-            (Some(count), established)
+            process.open_descriptors = Some(count);
+            process.established_sockets = established;
         }
-        Err(error) => {
-            errors.push(format!("descriptors: {error}"));
-            (None, None)
-        }
-    };
+        Err(error) => errors.push(format!("descriptors: {error}")),
+    }
+    pacer.checkpoint()?;
+    let after = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, start_ticks, _, _) = process_stat(&after)?;
+    if start_ticks != process.start_ticks {
+        return Err(format!("PID {pid} was reused during descriptor census").into());
+    }
+    pacer.checkpoint()?;
+    process.errors.extend(errors);
+    Ok(process)
+}
+
+pub(super) fn process_fast(pid: u32, ticks: f64, page_size: u64) -> Result<Process> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (name, start_ticks, cpu_ticks, resident_pages) = process_stat(&text)?;
+    let mut errors = Vec::new();
     let descriptor_limits = match fs::read_to_string(format!("/proc/{pid}/limits")) {
         Ok(text) => text
             .lines()
@@ -432,11 +584,19 @@ pub(super) fn process(
             .ok_or("kernel CPU tick counter exceeds floating-point range")?
             / ticks,
         resident_bytes: resident_pages.saturating_mul(page_size),
-        open_descriptors,
-        established_sockets,
+        open_descriptors: None,
+        established_sockets: None,
+        descriptor_census: None,
         descriptor_limits,
         errors,
     })
+}
+
+fn same_network_namespace(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/ns/net"))
+        .ok()
+        .zip(fs::read_link("/proc/self/ns/net").ok())
+        .is_some_and(|(process, observer)| process == observer)
 }
 
 pub(super) fn service_resources(roles: &Roles) -> Value {

@@ -188,17 +188,33 @@ count new transport connections. A keep-alive request does not create another
 connection. Connection setup covers DNS and TCP; an
 attempt can try several resolved addresses.
 
-Linux telemetry records per-interface RX/TX throughput and packets per second,
-application/proxy/generator CPU and memory, open descriptors and their limits,
-and established sockets. It also records the observed ephemeral-port and kernel
-limits. The launcher and each generator raise their soft descriptor limit to at
-least 524,288, or as high as the inherited hard limit allows. A generator fails
-before load if its limit cannot cover its users and process overhead. Source
-addresses must already be assigned to that generator. CPU uses one core as
-100%. The rendered network table uses decimal MB/s and packets/s (pps); JSON
-retains raw bit-per-second counters. Open TCP connections and file descriptors
-are reported separately. FD, memory, and socket peaks are sampled, so shorter
-spikes may be missed.
+Linux telemetry samples per-interface traffic, process CPU and resident memory,
+system memory, and cheap network-namespace TCP counters at `--sample-interval`.
+Exact per-process file-descriptor and established-socket counts use a separate
+census. For known totals below 10,000 monitored descriptors it follows the
+sample interval; at or above 10,000, censuses are at least 10 seconds apart.
+When the total is unavailable, the next census also waits at least 10 seconds.
+A process's exact counts are null between fresh censuses. Each census records
+its start, finish, actual cadence, and next cadence. Exact counts describe the
+completed scan's start-to-finish interval, not an instantaneous point. Socket
+counts are attached only when the process and observer share a network namespace
+and the observer can match socket inodes to that process's descriptors.
+Namespace-wide TCP counts are never substituted for per-process counts. The
+summary includes census metadata for the reported FD and socket peaks. Census
+work uses a cooperative 1 ms wall-work slice followed by nine times the measured
+work as rest, targeting about 10% duty. This is not a CPU quota or hard
+preemption: wall work includes blocking and scheduling delays, and a syscall can
+overshoot the target. Fresh census metadata reports measured work and rest, sleep
+count, maximum slice, and overshoot.
+
+Telemetry also records observed ephemeral-port and kernel limits. The launcher
+and each generator raise their soft descriptor limit to at least 524,288, or as
+high as the inherited hard limit allows. A generator fails before load if its
+limit cannot cover its users and process overhead. Source addresses must already
+be assigned to that generator. CPU uses one core as 100%. The rendered network
+table uses decimal MB/s and packets per second; JSON retains raw bit-per-second
+counters. FD, memory, and socket peaks are sampled, so shorter spikes may be
+missed.
 
 Interface counters include other traffic on the host. Offloads can change packet
 counts, and virtual interfaces can count the same traffic at several points.
@@ -239,7 +255,7 @@ connection setup. Connection setup durations are reported separately.
 
 `duration_s` includes shutdown time.
 
-Pinned Hyper forks retain the benchmark's HTTP/1 and connector optimizations.
+Patched dependencies are pinned to immutable revisions.
 See [patch provenance and upstream revisions](patches/README.md).
 
 ## Code layout

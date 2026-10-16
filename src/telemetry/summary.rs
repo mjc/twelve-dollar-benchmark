@@ -1,4 +1,7 @@
-use super::{Point, Process, Result, host::SystemMemory};
+use super::{
+    Point, Process, Result,
+    host::{DescriptorCensus, SystemMemory},
+};
 use chrono::Utc;
 use num_traits::ToPrimitive;
 use serde_json::{Value, json};
@@ -246,6 +249,8 @@ struct ProcessTotal {
     peak_resident: u64,
     peak_descriptors: Option<usize>,
     peak_sockets: Option<usize>,
+    peak_descriptor_census: Option<DescriptorCensus>,
+    peak_socket_census: Option<DescriptorCensus>,
     errors: BTreeSet<String>,
 }
 
@@ -304,13 +309,24 @@ pub(crate) fn summarize(path: &Path) -> Result<Value> {
                         peak_resident: process.resident_bytes,
                         peak_descriptors: process.open_descriptors,
                         peak_sockets: process.established_sockets,
+                        peak_descriptor_census: process
+                            .open_descriptors
+                            .and(process.descriptor_census.clone()),
+                        peak_socket_census: process
+                            .established_sockets
+                            .and(process.descriptor_census.clone()),
                         errors: BTreeSet::new(),
                     });
                 aggregate.last_at = point.elapsed_s;
                 aggregate.peak_resident = aggregate.peak_resident.max(process.resident_bytes);
-                aggregate.peak_descriptors =
-                    aggregate.peak_descriptors.max(process.open_descriptors);
-                aggregate.peak_sockets = aggregate.peak_sockets.max(process.established_sockets);
+                if process.open_descriptors > aggregate.peak_descriptors {
+                    aggregate.peak_descriptors = process.open_descriptors;
+                    aggregate.peak_descriptor_census = process.descriptor_census.clone();
+                }
+                if process.established_sockets > aggregate.peak_sockets {
+                    aggregate.peak_sockets = process.established_sockets;
+                    aggregate.peak_socket_census = process.descriptor_census.clone();
+                }
                 add_errors(&mut aggregate.errors, process.errors.clone());
                 aggregate.last = process.clone();
             }
@@ -327,7 +343,10 @@ pub(crate) fn summarize(path: &Path) -> Result<Value> {
             json!({"pid": pid, "name": aggregate.last.name, "start_ticks": start_ticks, "observed_duration_s": elapsed,
                 "cpu_seconds": (cpu >= 0.0).then_some(cpu), "cpu_percent_of_one_core": (elapsed > 0.0 && cpu >= 0.0).then(|| cpu / elapsed * 100.0),
                 "peak_resident_bytes": aggregate.peak_resident, "peak_open_descriptors": aggregate.peak_descriptors,
-                "peak_established_sockets": aggregate.peak_sockets, "descriptor_limits": aggregate.last.descriptor_limits, "errors": aggregate.errors})
+                "peak_established_sockets": aggregate.peak_sockets,
+                "peak_open_descriptors_census": aggregate.peak_descriptor_census,
+                "peak_established_sockets_census": aggregate.peak_socket_census,
+                "descriptor_limits": aggregate.last.descriptor_limits, "errors": aggregate.errors})
         }).collect();
         process_report.insert(role, json!({"processes": collected, "unavailable_reason": if collected.is_empty() { Some("no selected accessible process; supply the role's process IDs on the target host") } else {None}}));
     }
