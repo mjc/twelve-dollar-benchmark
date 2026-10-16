@@ -239,7 +239,7 @@ connection setup. Connection setup durations are reported separately.
 
 `duration_s` includes shutdown time.
 
-Pinned Hyper forks retain the benchmark's HTTP/1 and connector optimizations.
+Patched dependencies are pinned to immutable revisions.
 See [patch provenance and upstream revisions](patches/README.md).
 
 ## Code layout
